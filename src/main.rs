@@ -82,6 +82,7 @@ fn setup_tab_context_menu(tab_view: &adw::TabView) {
     unpin.set_attribute_value("hidden-when", Some(&"action-disabled".into()));
     menu.append_item(&unpin);
 
+    menu.append(Some("Close _Other Tabs"), Some("tab.close-others"));
     menu.append(Some("Close _All Tabs"), Some("tab.close-all"));
     menu.append(Some("_Close"), Some("tab.close"));
 
@@ -138,6 +139,19 @@ fn setup_tab_context_menu(tab_view: &adw::TabView) {
         }
     ));
 
+    let close_others = gio::SimpleAction::new("close-others", None);
+    close_others.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        #[strong]
+        target,
+        move |_, _| {
+            if let Some(page) = target.borrow().as_ref() {
+                tab_view.close_other_pages(page);
+            }
+        }
+    ));
+
     let close_all = gio::SimpleAction::new("close-all", None);
     close_all.connect_activate(glib::clone!(
         #[weak]
@@ -177,6 +191,8 @@ fn setup_tab_context_menu(tab_view: &adw::TabView) {
         #[strong]
         unpin_action,
         #[strong]
+        close_others,
+        #[strong]
         close,
         move |view, page| {
             *target.borrow_mut() = page.cloned();
@@ -184,6 +200,7 @@ fn setup_tab_context_menu(tab_view: &adw::TabView) {
             move_to_new_window.set_enabled(page.is_some() && view.n_pages() > 1);
             pin_action.set_enabled(page.is_some() && !pinned);
             unpin_action.set_enabled(pinned);
+            close_others.set_enabled(page.is_some() && view.n_pages() > 1);
             close.set_enabled(page.is_some() && !pinned);
         }
     ));
@@ -191,6 +208,7 @@ fn setup_tab_context_menu(tab_view: &adw::TabView) {
     group.add_action(&move_to_new_window);
     group.add_action(&pin_action);
     group.add_action(&unpin_action);
+    group.add_action(&close_others);
     group.add_action(&close_all);
     group.add_action(&close);
     tab_view.insert_action_group("tab", Some(&group));

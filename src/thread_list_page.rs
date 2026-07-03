@@ -65,11 +65,7 @@ const PLACEHOLDER_THREADS: &[Thread] = &[
     },
 ];
 
-pub fn build_thread_list_page(
-    nav: &adw::NavigationView,
-    inbox_name: &str,
-    inbox_description: &str,
-) -> adw::NavigationPage {
+pub fn build_thread_list_page(inbox_name: &str, inbox_description: &str) -> adw::NavigationPage {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .margin_top(24)
@@ -78,7 +74,6 @@ pub fn build_thread_list_page(
         .margin_end(12)
         .spacing(12)
         .build();
-    content.append(&build_breadcrumbs(nav, inbox_name));
     content.append(&build_title(inbox_name, inbox_description));
     content.append(&build_sort_row());
     content.append(&build_thread_list());
@@ -92,42 +87,6 @@ pub fn build_thread_list_page(
     let scrolled = gtk::ScrolledWindow::builder().child(&clamp).build();
 
     adw::NavigationPage::new(&scrolled, inbox_name)
-}
-
-fn build_breadcrumbs(nav: &adw::NavigationView, inbox_name: &str) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .build();
-
-    let inboxes_button = gtk::Button::builder()
-        .label("public inboxes")
-        .css_classes(["flat", "caption", "dim-label"])
-        .build();
-    inboxes_button.connect_clicked(glib::clone!(
-        #[weak]
-        nav,
-        move |_| {
-            nav.pop();
-        }
-    ));
-    row.append(&inboxes_button);
-
-    row.append(
-        &gtk::Label::builder()
-            .label("/")
-            .css_classes(["dim-label", "caption"])
-            .build(),
-    );
-
-    row.append(
-        &gtk::Label::builder()
-            .label(inbox_name)
-            .css_classes(["heading", "caption"])
-            .build(),
-    );
-
-    row
 }
 
 fn build_title(inbox_name: &str, inbox_description: &str) -> gtk::Box {

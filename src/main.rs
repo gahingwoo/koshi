@@ -35,6 +35,27 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
     toolbar_view.add_top_bar(&tab_bar);
     toolbar_view.set_content(Some(&tab_view));
 
+    let go_back = gio::SimpleAction::new("go-back", None);
+    go_back.set_enabled(false);
+    go_back.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        move |_, _| {
+            if let Some(nav) = selected_nav(&tab_view) {
+                nav.pop();
+            }
+        }
+    ));
+
+    tab_view.connect_selected_page_notify(glib::clone!(
+        #[strong]
+        go_back,
+        move |view| {
+            let can_pop = selected_nav(view).is_some_and(|nav| nav_can_pop(&nav));
+            go_back.set_enabled(can_pop);
+        }
+    ));
+
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Koshi")
@@ -43,6 +64,7 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
         .content(&toolbar_view)
         .build();
 
+    window.add_action(&go_back);
     setup_actions(app, &window, &search_entry);
 
     (window, tab_view)
@@ -189,8 +211,34 @@ fn open_new_tab(tab_view: &adw::TabView) {
             if let Some(page) = nav.visible_page() {
                 tab_page.set_title(&page.title());
             }
+            update_go_back_action(nav);
         }
     ));
+}
+
+fn selected_nav(tab_view: &adw::TabView) -> Option<adw::NavigationView> {
+    tab_view
+        .selected_page()
+        .map(|page| page.child())
+        .and_downcast::<adw::NavigationView>()
+}
+
+fn nav_can_pop(nav: &adw::NavigationView) -> bool {
+    nav.visible_page()
+        .and_then(|page| nav.previous_page(&page))
+        .is_some()
+}
+
+fn update_go_back_action(nav: &adw::NavigationView) {
+    let Some(window) = nav.root().and_downcast::<adw::ApplicationWindow>() else {
+        return;
+    };
+    if let Some(action) = window
+        .lookup_action("go-back")
+        .and_downcast::<gio::SimpleAction>()
+    {
+        action.set_enabled(nav_can_pop(nav));
+    }
 }
 
 fn build_search_entry() -> gtk::SearchEntry {
@@ -243,6 +291,13 @@ fn build_search_overlay(search_entry: &gtk::SearchEntry) -> gtk::Overlay {
 
 fn build_header_bar(search_entry: &gtk::SearchEntry, tab_view: &adw::TabView) -> adw::HeaderBar {
     let header = adw::HeaderBar::new();
+
+    let back_button = gtk::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text("Back")
+        .action_name("win.go-back")
+        .build();
+    header.pack_start(&back_button);
 
     let new_tab_button = gtk::Button::builder()
         .icon_name("tab-new-symbolic")

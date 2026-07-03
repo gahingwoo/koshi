@@ -75,7 +75,6 @@ pub fn build_thread_list_page(inbox_name: &str, inbox_description: &str) -> adw:
         .spacing(12)
         .build();
     content.append(&build_title(inbox_name, inbox_description));
-    content.append(&build_sort_row());
     content.append(&build_thread_list());
 
     let clamp = adw::Clamp::builder()
@@ -102,18 +101,25 @@ fn build_title(inbox_name: &str, inbox_description: &str) -> gtk::Box {
             .css_classes(["title-1"])
             .build(),
     );
-    title_box.append(
+    let description_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    description_row.append(
         &gtk::Label::builder()
             .label(inbox_description)
             .halign(gtk::Align::Start)
+            .hexpand(true)
             .css_classes(["dim-label"])
             .build(),
     );
+    description_row.append(&build_sort_button());
+    title_box.append(&description_row);
 
     title_box
 }
 
-fn build_sort_row() -> gtk::MenuButton {
+fn build_sort_button() -> gtk::MenuButton {
     let sort_action =
         gio::SimpleAction::new_stateful("sort", Some(glib::VariantTy::STRING), &"date".into());
     sort_action.connect_activate(|action, param| {

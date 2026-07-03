@@ -209,8 +209,8 @@ fn build_inbox_page() -> gtk::ScrolledWindow {
 
 fn build_inbox_row(name: &str, description: &str, count: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(name)
-        .subtitle(description)
+        .title(glib::markup_escape_text(name))
+        .subtitle(glib::markup_escape_text(description))
         .activatable(true)
         .build();
     row.add_prefix(&gtk::Image::from_icon_name("mail-unread-symbolic"));

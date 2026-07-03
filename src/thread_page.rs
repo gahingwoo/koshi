@@ -1,0 +1,339 @@
+use adw::prelude::*;
+use gtk::{gio, glib};
+use mailparse::MailHeaderMap;
+
+const RAW_MAIL: &str = include_str!("../data/sample-mail.txt");
+
+struct Mail {
+    subject: String,
+    from: String,
+    to: String,
+    cc: Option<String>,
+    date: String,
+    message_id: Option<String>,
+    body: String,
+}
+
+fn parse_sample_mail() -> Mail {
+    // Skip the mbox "From " separator line, which is not an RFC 5322 header.
+    let raw = if RAW_MAIL.starts_with("From ") {
+        match RAW_MAIL.split_once('\n') {
+            Some((_, rest)) => rest,
+            None => RAW_MAIL,
+        }
+    } else {
+        RAW_MAIL
+    };
+
+    let unknown = || "(unknown)".to_string();
+    let Ok(parsed) = mailparse::parse_mail(raw.as_bytes()) else {
+        return Mail {
+            subject: unknown(),
+            from: unknown(),
+            to: unknown(),
+            cc: None,
+            date: unknown(),
+            message_id: None,
+            body: String::new(),
+        };
+    };
+
+    let header = |name: &str| parsed.headers.get_first_value(name);
+    let body = find_text_body(&parsed).unwrap_or_default();
+
+    Mail {
+        subject: header("Subject").unwrap_or_else(unknown),
+        from: header("From").unwrap_or_else(unknown),
+        to: header("To").unwrap_or_else(unknown),
+        cc: header("Cc"),
+        date: header("Date").unwrap_or_else(unknown),
+        message_id: header("Message-ID"),
+        body,
+    }
+}
+
+fn find_text_body(part: &mailparse::ParsedMail) -> Option<String> {
+    if part.subparts.is_empty() {
+        if part.ctype.mimetype.eq_ignore_ascii_case("text/plain") {
+            return part.get_body().ok();
+        }
+        return None;
+    }
+    part.subparts.iter().find_map(find_text_body)
+}
+
+pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
+    let mail = parse_sample_mail();
+
+    let overlay = adw::ToastOverlay::new();
+
+    let title = gtk::Label::builder()
+        .label(&mail.subject)
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .xalign(0.0)
+        .css_classes(["title-2"])
+        .build();
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(36)
+        .margin_bottom(36)
+        .margin_start(12)
+        .margin_end(12)
+        .spacing(12)
+        .build();
+    content.append(&title);
+    content.append(&build_header_list(&mail));
+    content.append(&build_action_buttons(&mail, nav, &overlay));
+    content.append(&build_body_view(&mail, &overlay));
+
+    let clamp = adw::Clamp::builder()
+        .maximum_size(800)
+        .tightening_threshold(600)
+        .child(&content)
+        .build();
+
+    let scrolled = gtk::ScrolledWindow::builder().child(&clamp).build();
+    overlay.set_child(Some(&scrolled));
+
+    adw::NavigationPage::new(&overlay, &mail.subject)
+}
+
+fn build_header_list(mail: &Mail) -> gtk::ListBox {
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+
+    list.append(&build_header_row("Author", &mail.from));
+    list.append(&build_header_row("To", &mail.to));
+    if let Some(cc) = &mail.cc {
+        list.append(&build_header_row("Cc", cc));
+    }
+    list.append(&build_header_row("Date", &mail.date));
+
+    list
+}
+
+fn build_header_row(name: &str, value: &str) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(name))
+        .subtitle(glib::markup_escape_text(value))
+        .subtitle_lines(0)
+        .activatable(false)
+        .css_classes(["property"])
+        .build();
+    row.set_subtitle_selectable(true);
+    row
+}
+
+fn build_action_buttons(
+    mail: &Mail,
+    nav: &adw::NavigationView,
+    overlay: &adw::ToastOverlay,
+) -> gtk::Box {
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+
+    let open_web = gtk::Button::builder()
+        .icon_name("web-browser-symbolic")
+        .tooltip_text("Open on Web")
+        .css_classes(["flat"])
+        .build();
+    let lore_url = mail.message_id.as_deref().map(|id| {
+        let bare = id.trim().trim_start_matches('<').trim_end_matches('>');
+        format!("https://lore.kernel.org/r/{bare}/")
+    });
+    open_web.set_sensitive(lore_url.is_some());
+    open_web.connect_clicked(move |button| {
+        if let Some(url) = &lore_url {
+            launch_uri(button, url);
+        }
+    });
+    buttons.append(&open_web);
+
+    let copy_id = gtk::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text("Copy Message-ID")
+        .css_classes(["flat"])
+        .build();
+    let message_id = mail.message_id.clone();
+    copy_id.set_sensitive(message_id.is_some());
+    copy_id.connect_clicked(glib::clone!(
+        #[weak]
+        overlay,
+        move |button| {
+            if let Some(id) = &message_id {
+                button.clipboard().set_text(id);
+                overlay.add_toast(adw::Toast::new("Message-ID copied"));
+            }
+        }
+    ));
+    buttons.append(&copy_id);
+
+    let raw = gtk::Button::builder()
+        .icon_name("text-x-generic-symbolic")
+        .tooltip_text("Raw")
+        .css_classes(["flat"])
+        .build();
+    raw.connect_clicked(glib::clone!(
+        #[weak]
+        nav,
+        move |_| nav.push(&build_raw_page())
+    ));
+    buttons.append(&raw);
+
+    let reply = gtk::Button::builder()
+        .icon_name("mail-reply-sender-symbolic")
+        .tooltip_text("Reply")
+        .css_classes(["flat"])
+        .build();
+    let mailto = build_reply_mailto(mail);
+    reply.connect_clicked(move |button| launch_uri(button, &mailto));
+    buttons.append(&reply);
+
+    buttons
+}
+
+fn build_reply_mailto(mail: &Mail) -> String {
+    let escape = |s: &str| glib::Uri::escape_string(s, None, false);
+
+    let subject = if mail.subject.to_lowercase().starts_with("re:") {
+        mail.subject.clone()
+    } else {
+        format!("Re: {}", mail.subject)
+    };
+
+    let cc = match &mail.cc {
+        Some(cc) => format!("{}, {}", mail.to, cc),
+        None => mail.to.clone(),
+    };
+
+    let mut uri = format!(
+        "mailto:{}?cc={}&subject={}",
+        escape(&mail.from),
+        escape(&cc),
+        escape(&subject),
+    );
+    if let Some(id) = &mail.message_id {
+        uri.push_str("&In-Reply-To=");
+        uri.push_str(&escape(id));
+    }
+    uri
+}
+
+fn build_raw_page() -> adw::NavigationPage {
+    let view = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .left_margin(12)
+        .right_margin(12)
+        .top_margin(12)
+        .bottom_margin(12)
+        .build();
+    view.buffer().set_text(RAW_MAIL);
+
+    let scrolled = gtk::ScrolledWindow::builder().child(&view).build();
+    adw::NavigationPage::new(&scrolled, "Raw")
+}
+
+fn build_body_view(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::TextView {
+    let view = gtk::TextView::builder()
+        .editable(false)
+        .cursor_visible(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .left_margin(12)
+        .right_margin(12)
+        .top_margin(12)
+        .bottom_margin(12)
+        .build();
+    view.buffer().set_text(&mail.body);
+
+    let menu = gio::Menu::new();
+    menu.append(Some("Quote Selection"), Some("mailview.quote-selection"));
+    view.set_extra_menu(Some(&menu));
+
+    let quote = gio::SimpleAction::new("quote-selection", None);
+    quote.set_enabled(false);
+    quote.connect_activate(glib::clone!(
+        #[weak]
+        view,
+        #[weak]
+        overlay,
+        move |_, _| {
+            let buffer = view.buffer();
+            if let Some((start, end)) = buffer.selection_bounds() {
+                let text = buffer.text(&start, &end, false);
+                let quoted: Vec<String> =
+                    text.lines().map(|line| format!("> {line}")).collect();
+                view.clipboard().set_text(&quoted.join("\n"));
+                overlay.add_toast(adw::Toast::new("Quoted text copied"));
+            }
+        }
+    ));
+
+    view.buffer().connect_has_selection_notify(glib::clone!(
+        #[weak]
+        quote,
+        move |buffer| quote.set_enabled(buffer.has_selection())
+    ));
+
+    let group = gio::SimpleActionGroup::new();
+    group.add_action(&quote);
+    view.insert_action_group("mailview", Some(&group));
+
+    view
+}
+
+fn launch_uri(widget: &impl IsA<gtk::Widget>, uri: &str) {
+    let parent = widget.root().and_downcast::<gtk::Window>();
+    gtk::UriLauncher::new(uri).launch(
+        parent.as_ref(),
+        gio::Cancellable::NONE,
+        |result| {
+            if let Err(error) = result {
+                eprintln!("Failed to launch URI: {error}");
+            }
+        },
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sample_mail_headers() {
+        let mail = parse_sample_mail();
+        assert_eq!(mail.from, "Rosen Penev <rosenp@gmail.com>");
+        assert_eq!(mail.to, "linux-scsi@vger.kernel.org");
+        assert_eq!(mail.subject, "[PATCHv2] scsi: st: use kzalloc_array()");
+        assert_eq!(
+            mail.message_id.as_deref(),
+            Some("<20260703215345.253901-1-rosenp@gmail.com>")
+        );
+        // RFC 2047 encoded word must be decoded.
+        let cc = mail.cc.as_deref().unwrap();
+        assert!(cc.contains("Kai Mäkisara"), "Cc not decoded: {cc}");
+        assert!(!mail.body.is_empty());
+        assert!(mail.body.starts_with("Merge allocations"));
+    }
+
+    #[test]
+    fn reply_mailto_is_percent_encoded() {
+        let mail = parse_sample_mail();
+        let uri = build_reply_mailto(&mail);
+        assert!(uri.starts_with("mailto:Rosen%20Penev%20%3Crosenp%40gmail.com%3E?"));
+        assert!(uri.contains("subject=Re%3A%20%5BPATCHv2%5D"));
+        assert!(uri.contains("&In-Reply-To=%3C20260703215345.253901-1-rosenp%40gmail.com%3E"));
+        // Raw header-breaking characters must never appear unencoded.
+        let query = uri.split_once('?').unwrap().1;
+        assert!(!query.contains(['<', '>', ' ']));
+    }
+}

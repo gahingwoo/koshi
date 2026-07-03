@@ -45,7 +45,7 @@ pub fn build_inbox_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         nav,
         move |_, row| {
             let (name, description, _) = PLACEHOLDER_INBOXES[row.index() as usize];
-            nav.push(&build_thread_list_page(name, description));
+            nav.push(&build_thread_list_page(&nav, name, description));
         }
     ));
 

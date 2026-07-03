@@ -1,6 +1,8 @@
 use adw::prelude::*;
 use gtk::{gio, glib};
 
+use crate::thread_page::build_thread_page;
+
 struct Thread {
     subject: &'static str,
     date: &'static str,
@@ -65,7 +67,11 @@ const PLACEHOLDER_THREADS: &[Thread] = &[
     },
 ];
 
-pub fn build_thread_list_page(inbox_name: &str, inbox_description: &str) -> adw::NavigationPage {
+pub fn build_thread_list_page(
+    nav: &adw::NavigationView,
+    inbox_name: &str,
+    inbox_description: &str,
+) -> adw::NavigationPage {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .margin_top(36)
@@ -75,7 +81,7 @@ pub fn build_thread_list_page(inbox_name: &str, inbox_description: &str) -> adw:
         .spacing(12)
         .build();
     content.append(&build_title(inbox_name, inbox_description));
-    content.append(&build_thread_list());
+    content.append(&build_thread_list(nav));
 
     let clamp = adw::Clamp::builder()
         .maximum_size(800)
@@ -153,15 +159,28 @@ fn build_sort_button() -> gtk::MenuButton {
     button
 }
 
-fn build_thread_list() -> gtk::ListBox {
+fn build_thread_list(nav: &adw::NavigationView) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
 
     for thread in PLACEHOLDER_THREADS {
-        list.append(&build_thread_row(thread));
+        list.append(
+            &gtk::ListBoxRow::builder()
+                .activatable(true)
+                .child(&build_thread_row(thread))
+                .build(),
+        );
     }
+
+    list.connect_row_activated(glib::clone!(
+        #[weak]
+        nav,
+        move |_, _| {
+            nav.push(&build_thread_page(&nav));
+        }
+    ));
 
     list
 }

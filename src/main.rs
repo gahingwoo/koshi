@@ -1,5 +1,6 @@
 mod inbox_page;
 mod thread_list_page;
+mod thread_page;
 
 use std::cell::RefCell;
 use std::rc::Rc;

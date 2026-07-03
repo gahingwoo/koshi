@@ -1,5 +1,5 @@
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 use mailparse::MailHeaderMap;
 
 const RAW_MAIL: &str = include_str!("../data/sample-mail.txt");
@@ -137,6 +137,7 @@ fn build_action_buttons(
     let buttons = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
+        .halign(gtk::Align::End)
         .build();
 
     let open_web = gtk::Button::builder()
@@ -255,40 +256,100 @@ fn build_body_view(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::TextView {
         .build();
     view.buffer().set_text(&mail.body);
 
-    let menu = gio::Menu::new();
-    menu.append(Some("Quote Selection"), Some("mailview.quote-selection"));
-    view.set_extra_menu(Some(&menu));
+    let copy_quoted = |prefix: Option<String>| {
+        glib::clone!(
+            #[weak]
+            view,
+            #[weak]
+            overlay,
+            move |_: &gio::SimpleAction, _: Option<&glib::Variant>| {
+                let buffer = view.buffer();
+                if let Some((start, end)) = buffer.selection_bounds() {
+                    let text = buffer.text(&start, &end, false);
+                    let quoted: Vec<String> =
+                        text.lines().map(|line| format!("> {line}")).collect();
+                    let mut result = quoted.join("\n");
+                    if let Some(prefix) = &prefix {
+                        result = format!("{prefix}\n{result}");
+                    }
+                    view.clipboard().set_text(&result);
+                    overlay.add_toast(adw::Toast::new("Quoted text copied"));
+                }
+            }
+        )
+    };
 
     let quote = gio::SimpleAction::new("quote-selection", None);
     quote.set_enabled(false);
-    quote.connect_activate(glib::clone!(
-        #[weak]
-        view,
-        #[weak]
-        overlay,
-        move |_, _| {
-            let buffer = view.buffer();
-            if let Some((start, end)) = buffer.selection_bounds() {
-                let text = buffer.text(&start, &end, false);
-                let quoted: Vec<String> =
-                    text.lines().map(|line| format!("> {line}")).collect();
-                view.clipboard().set_text(&quoted.join("\n"));
-                overlay.add_toast(adw::Toast::new("Quoted text copied"));
-            }
-        }
-    ));
+    quote.connect_activate(copy_quoted(None));
+
+    let quote_with_date = gio::SimpleAction::new("quote-with-date", None);
+    quote_with_date.set_enabled(false);
+    quote_with_date.connect_activate(copy_quoted(Some(format!(
+        "On {}, {} wrote:",
+        mail.date, mail.from
+    ))));
 
     view.buffer().connect_has_selection_notify(glib::clone!(
         #[weak]
         quote,
-        move |buffer| quote.set_enabled(buffer.has_selection())
+        #[weak]
+        quote_with_date,
+        move |buffer| {
+            quote.set_enabled(buffer.has_selection());
+            quote_with_date.set_enabled(buffer.has_selection());
+        }
     ));
 
     let group = gio::SimpleActionGroup::new();
     group.add_action(&quote);
+    group.add_action(&quote_with_date);
     view.insert_action_group("mailview", Some(&group));
 
+    setup_context_menu(&view);
+
     view
+}
+
+// GTK only appends extra-menu items after the built-in ones, so to put the
+// quote items first the context menu is replaced wholesale; Copy and Select
+// All dispatch to the TextView's built-in actions.
+fn setup_context_menu(view: &gtk::TextView) {
+    let quote_section = gio::Menu::new();
+    quote_section.append(Some("_Quote Selection"), Some("mailview.quote-selection"));
+    quote_section.append(Some("Quote With _Date"), Some("mailview.quote-with-date"));
+
+    let edit_section = gio::Menu::new();
+    edit_section.append(Some("_Copy"), Some("clipboard.copy"));
+    edit_section.append(Some("Select _All"), Some("selection.select-all"));
+
+    let menu = gio::Menu::new();
+    menu.append_section(None, &quote_section);
+    menu.append_section(None, &edit_section);
+
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(view);
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk::Align::Start);
+    view.connect_destroy(glib::clone!(
+        #[weak]
+        popover,
+        move |_| popover.unparent()
+    ));
+
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gdk::BUTTON_SECONDARY);
+    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+    gesture.connect_pressed(glib::clone!(
+        #[weak]
+        popover,
+        move |gesture, _, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    ));
+    view.add_controller(gesture);
 }
 
 fn launch_uri(widget: &impl IsA<gtk::Widget>, uri: &str) {

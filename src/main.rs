@@ -1,24 +1,15 @@
+mod inbox_page;
+mod thread_list_page;
+
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-const APP_ID: &str = "moe.nikableh.Koshi";
+use inbox_page::{INBOX_LIST_TITLE, build_inbox_page};
 
-const PLACEHOLDER_INBOXES: &[(&str, &str, &str)] = &[
-    ("all", "Every list archived on lore.kernel.org", "3.1M msgs"),
-    ("live-patching", "Kernel live patching (klp)", "4.2k msgs"),
-    ("kernel-janitors", "Trivial fixes and cleanups", "18k msgs"),
-    ("dpdk-dev", "DPDK data-plane development", "210k msgs"),
-    ("bpf", "BPF core, verifier and tooling", "96k msgs"),
-    ("linux-rtc", "Real-time clock subsystem", "12k msgs"),
-    ("linux-mm", "Memory management", "480k msgs"),
-    ("netdev", "Networking stack", "1.2M msgs"),
-    ("workflows", "Kernel development process & tooling", "9.8k msgs"),
-    ("linux-doc", "Documentation", "40k msgs"),
-];
+const APP_ID: &str = "moe.nikableh.Koshi";
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| load_css());
     app.connect_activate(build_ui);
     app.run()
 }
@@ -26,9 +17,18 @@ fn main() -> glib::ExitCode {
 fn build_ui(app: &adw::Application) {
     let search_entry = build_search_entry();
 
+    let tab_view = adw::TabView::new();
+    let tab_bar = adw::TabBar::builder()
+        .view(&tab_view)
+        .autohide(false)
+        .build();
+
     let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&build_header_bar(&search_entry));
-    toolbar_view.set_content(Some(&build_inbox_page()));
+    toolbar_view.add_top_bar(&build_header_bar(&search_entry, &tab_view));
+    toolbar_view.add_top_bar(&tab_bar);
+    toolbar_view.set_content(Some(&tab_view));
+
+    open_new_tab(&tab_view);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -43,19 +43,23 @@ fn build_ui(app: &adw::Application) {
     window.present();
 }
 
-fn load_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(
-        ".keycap-hint { padding: 1px 6px; border-radius: 6px; \
-         border: 1px solid alpha(currentColor, 0.25); font-size: 0.8em; }",
-    );
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
+fn open_new_tab(tab_view: &adw::TabView) {
+    let nav = adw::NavigationView::new();
+    nav.push(&build_inbox_page(&nav));
+
+    let tab_page = tab_view.append(&nav);
+    tab_page.set_title(INBOX_LIST_TITLE);
+    tab_view.set_selected_page(&tab_page);
+
+    nav.connect_visible_page_notify(glib::clone!(
+        #[weak]
+        tab_page,
+        move |nav| {
+            if let Some(page) = nav.visible_page() {
+                tab_page.set_title(&page.title());
+            }
+        }
+    ));
 }
 
 fn build_search_entry() -> gtk::SearchEntry {
@@ -66,14 +70,13 @@ fn build_search_entry() -> gtk::SearchEntry {
 }
 
 fn build_search_overlay(search_entry: &gtk::SearchEntry) -> gtk::Overlay {
-    let badge = gtk::Label::builder()
-        .label("Ctrl+L")
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Center)
-        .margin_end(8)
-        .can_target(false)
-        .css_classes(["dim-label", "keycap-hint"])
-        .build();
+    let badge = adw::ShortcutLabel::new("<Control>l");
+    badge.set_halign(gtk::Align::End);
+    badge.set_valign(gtk::Align::Center);
+    badge.set_margin_end(8);
+    badge.set_can_target(false);
+    badge.add_css_class("dim-label");
+    badge.add_css_class("caption");
 
     let update_badge = glib::clone!(
         #[weak]
@@ -107,19 +110,18 @@ fn build_search_overlay(search_entry: &gtk::SearchEntry) -> gtk::Overlay {
     overlay
 }
 
-fn build_header_bar(search_entry: &gtk::SearchEntry) -> adw::HeaderBar {
+fn build_header_bar(search_entry: &gtk::SearchEntry, tab_view: &adw::TabView) -> adw::HeaderBar {
     let header = adw::HeaderBar::new();
-
-    let back_button = gtk::Button::builder()
-        .icon_name("go-previous-symbolic")
-        .tooltip_text("Back")
-        .build();
-    header.pack_start(&back_button);
 
     let new_tab_button = gtk::Button::builder()
         .icon_name("tab-new-symbolic")
         .tooltip_text("New Tab")
         .build();
+    new_tab_button.connect_clicked(glib::clone!(
+        #[weak]
+        tab_view,
+        move |_| open_new_tab(&tab_view)
+    ));
     header.pack_start(&new_tab_button);
 
     let clamp = adw::Clamp::builder()
@@ -162,66 +164,6 @@ fn build_account_button() -> gtk::MenuButton {
         .build();
     button.add_css_class("flat");
     button
-}
-
-fn build_inbox_page() -> gtk::ScrolledWindow {
-    let title = gtk::Label::builder()
-        .label("Open a public inbox")
-        .halign(gtk::Align::Start)
-        .css_classes(["title-1"])
-        .build();
-
-    let subtitle = gtk::Label::builder()
-        .label("Every list mirrored on lore.kernel.org. Pick one to open it in this tab.")
-        .halign(gtk::Align::Start)
-        .css_classes(["dim-label"])
-        .build();
-
-    let list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build();
-
-    for &(name, description, count) in PLACEHOLDER_INBOXES {
-        list.append(&build_inbox_row(name, description, count));
-    }
-
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .margin_top(36)
-        .margin_bottom(36)
-        .margin_start(12)
-        .margin_end(12)
-        .spacing(12)
-        .build();
-    content.append(&title);
-    content.append(&subtitle);
-    content.append(&list);
-
-    let clamp = adw::Clamp::builder()
-        .maximum_size(800)
-        .tightening_threshold(600)
-        .child(&content)
-        .build();
-
-    gtk::ScrolledWindow::builder().child(&clamp).build()
-}
-
-fn build_inbox_row(name: &str, description: &str, count: &str) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(glib::markup_escape_text(name))
-        .subtitle(glib::markup_escape_text(description))
-        .activatable(true)
-        .build();
-    row.add_prefix(&gtk::Image::from_icon_name("mail-unread-symbolic"));
-    row.add_suffix(
-        &gtk::Label::builder()
-            .label(count)
-            .css_classes(["dim-label", "numeric"])
-            .build(),
-    );
-    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    row
 }
 
 fn setup_actions(

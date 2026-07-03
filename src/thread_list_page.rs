@@ -106,6 +106,13 @@ fn build_title(inbox_name: &str, inbox_description: &str) -> gtk::Box {
             .css_classes(["title-1"])
             .build(),
     );
+    title_row.append(
+        &gtk::Button::builder()
+            .icon_name("view-refresh-symbolic")
+            .tooltip_text("Refresh")
+            .css_classes(["flat"])
+            .build(),
+    );
     title_row.append(&build_sort_button());
     title_box.append(&title_row);
 

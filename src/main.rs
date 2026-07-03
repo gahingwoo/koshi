@@ -1,6 +1,9 @@
 mod inbox_page;
 mod thread_list_page;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::{gio, glib};
 
@@ -15,20 +18,22 @@ fn main() -> glib::ExitCode {
 }
 
 fn build_ui(app: &adw::Application) {
+    let (window, tab_view) = build_window(app);
+    open_new_tab(&tab_view);
+    window.present();
+}
+
+fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView) {
     let search_entry = build_search_entry();
 
     let tab_view = adw::TabView::new();
-    let tab_bar = adw::TabBar::builder()
-        .view(&tab_view)
-        .autohide(false)
-        .build();
+    let tab_bar = adw::TabBar::builder().view(&tab_view).build();
+    setup_tab_context_menu(&tab_view);
 
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&build_header_bar(&search_entry, &tab_view));
     toolbar_view.add_top_bar(&tab_bar);
     toolbar_view.set_content(Some(&tab_view));
-
-    open_new_tab(&tab_view);
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -40,7 +45,133 @@ fn build_ui(app: &adw::Application) {
 
     setup_actions(app, &window, &search_entry);
 
-    window.present();
+    (window, tab_view)
+}
+
+fn setup_tab_context_menu(tab_view: &adw::TabView) {
+    let menu = gio::Menu::new();
+    menu.append(Some("Move to New _Window"), Some("tab.move-to-new-window"));
+
+    let pin = gio::MenuItem::new(Some("_Pin Tab"), Some("tab.pin"));
+    pin.set_attribute_value("hidden-when", Some(&"action-disabled".into()));
+    menu.append_item(&pin);
+
+    let unpin = gio::MenuItem::new(Some("Un_pin Tab"), Some("tab.unpin"));
+    unpin.set_attribute_value("hidden-when", Some(&"action-disabled".into()));
+    menu.append_item(&unpin);
+
+    menu.append(Some("Close _All Tabs"), Some("tab.close-all"));
+    menu.append(Some("_Close"), Some("tab.close"));
+
+    tab_view.set_menu_model(Some(&menu));
+
+    let target: Rc<RefCell<Option<adw::TabPage>>> = Rc::new(RefCell::new(None));
+    let group = gio::SimpleActionGroup::new();
+
+    let move_to_new_window = gio::SimpleAction::new("move-to-new-window", None);
+    move_to_new_window.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        #[strong]
+        target,
+        move |_, _| {
+            let Some(page) = target.borrow().clone() else {
+                return;
+            };
+            let Some(window) = tab_view.root().and_downcast::<gtk::Window>() else {
+                return;
+            };
+            let Some(app) = window.application().and_downcast::<adw::Application>() else {
+                return;
+            };
+            let (new_window, new_view) = build_window(&app);
+            tab_view.transfer_page(&page, &new_view, 0);
+            new_window.present();
+        }
+    ));
+
+    let pin_action = gio::SimpleAction::new("pin", None);
+    pin_action.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        #[strong]
+        target,
+        move |_, _| {
+            if let Some(page) = target.borrow().as_ref() {
+                tab_view.set_page_pinned(page, true);
+            }
+        }
+    ));
+
+    let unpin_action = gio::SimpleAction::new("unpin", None);
+    unpin_action.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        #[strong]
+        target,
+        move |_, _| {
+            if let Some(page) = target.borrow().as_ref() {
+                tab_view.set_page_pinned(page, false);
+            }
+        }
+    ));
+
+    let close_all = gio::SimpleAction::new("close-all", None);
+    close_all.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        move |_, _| {
+            let pages: Vec<adw::TabPage> =
+                (0..tab_view.n_pages()).map(|i| tab_view.nth_page(i)).collect();
+            for page in pages {
+                if page.is_pinned() {
+                    tab_view.set_page_pinned(&page, false);
+                }
+                tab_view.close_page(&page);
+            }
+        }
+    ));
+
+    let close = gio::SimpleAction::new("close", None);
+    close.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        #[strong]
+        target,
+        move |_, _| {
+            if let Some(page) = target.borrow().as_ref() {
+                tab_view.close_page(page);
+            }
+        }
+    ));
+
+    tab_view.connect_setup_menu(glib::clone!(
+        #[strong]
+        target,
+        #[strong]
+        move_to_new_window,
+        #[strong]
+        pin_action,
+        #[strong]
+        unpin_action,
+        #[strong]
+        close,
+        move |view, page| {
+            *target.borrow_mut() = page.cloned();
+            let pinned = page.is_some_and(|p| p.is_pinned());
+            move_to_new_window.set_enabled(page.is_some() && view.n_pages() > 1);
+            pin_action.set_enabled(page.is_some() && !pinned);
+            unpin_action.set_enabled(pinned);
+            close.set_enabled(page.is_some() && !pinned);
+        }
+    ));
+
+    group.add_action(&move_to_new_window);
+    group.add_action(&pin_action);
+    group.add_action(&unpin_action);
+    group.add_action(&close_all);
+    group.add_action(&close);
+    tab_view.insert_action_group("tab", Some(&group));
 }
 
 fn open_new_tab(tab_view: &adw::TabView) {

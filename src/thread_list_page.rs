@@ -1,5 +1,5 @@
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 
 struct Thread {
     subject: &'static str,
@@ -100,10 +100,6 @@ fn build_breadcrumbs(nav: &adw::NavigationView, inbox_name: &str) -> gtk::Box {
         .spacing(6)
         .build();
 
-    let chevron = gtk::Image::from_icon_name("go-previous-symbolic");
-    chevron.add_css_class("dim-label");
-    row.append(&chevron);
-
     let inboxes_button = gtk::Button::builder()
         .label("public inboxes")
         .css_classes(["flat", "caption", "dim-label"])
@@ -158,48 +154,30 @@ fn build_title(inbox_name: &str, inbox_description: &str) -> gtk::Box {
     title_box
 }
 
-fn build_sort_row() -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .margin_top(12)
+fn build_sort_row() -> gtk::MenuButton {
+    let sort_action =
+        gio::SimpleAction::new_stateful("sort", Some(glib::VariantTy::STRING), &"date".into());
+    sort_action.connect_activate(|action, param| {
+        if let Some(param) = param {
+            action.set_state(param);
+        }
+    });
+    let group = gio::SimpleActionGroup::new();
+    group.add_action(&sort_action);
+
+    let menu = gio::Menu::new();
+    menu.append(Some("Date"), Some("threads.sort::date"));
+    menu.append(Some("Relevance"), Some("threads.sort::relevance"));
+
+    let button = gtk::MenuButton::builder()
+        .icon_name("view-sort-descending-symbolic")
+        .menu_model(&menu)
+        .tooltip_text("Sort")
+        .halign(gtk::Align::End)
+        .css_classes(["flat"])
         .build();
-
-    row.append(
-        &gtk::Label::builder()
-            .label("subjects, threaded")
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .css_classes(["heading"])
-            .build(),
-    );
-
-    row.append(
-        &gtk::Label::builder()
-            .label("sort")
-            .css_classes(["dim-label", "caption"])
-            .build(),
-    );
-    row.append(
-        &gtk::Label::builder()
-            .label("date")
-            .css_classes(["heading", "caption"])
-            .build(),
-    );
-    row.append(
-        &gtk::Label::builder()
-            .label("·")
-            .css_classes(["dim-label", "caption"])
-            .build(),
-    );
-    row.append(
-        &gtk::Label::builder()
-            .label("relevance")
-            .css_classes(["dim-label", "caption"])
-            .build(),
-    );
-
-    row
+    button.insert_action_group("threads", Some(&group));
+    button
 }
 
 fn build_thread_list() -> gtk::ListBox {

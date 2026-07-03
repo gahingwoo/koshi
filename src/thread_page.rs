@@ -90,8 +90,8 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     content.append(&build_body_view(&mail, &overlay));
 
     let clamp = adw::Clamp::builder()
-        .maximum_size(800)
-        .tightening_threshold(600)
+        .maximum_size(1100)
+        .tightening_threshold(800)
         .child(&content)
         .build();
 
@@ -248,7 +248,7 @@ fn build_body_view(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::Box {
         .editable(false)
         .cursor_visible(false)
         .monospace(true)
-        .wrap_mode(gtk::WrapMode::WordChar)
+        .wrap_mode(gtk::WrapMode::None)
         .left_margin(12)
         .right_margin(12)
         .top_margin(12)
@@ -327,8 +327,15 @@ fn build_body_view(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::Box {
     // The popover can't be parented to the TextView itself (it allocates its
     // own children and warns about foreign ones), so everything hangs off a
     // plain Box wrapper instead — including the action group.
+    let hscroll = gtk::ScrolledWindow::builder()
+        .child(&view)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .build();
+
     let wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    wrapper.append(&view);
+    wrapper.append(&hscroll);
 
     let group = gio::SimpleActionGroup::new();
     group.add_action(&quote);

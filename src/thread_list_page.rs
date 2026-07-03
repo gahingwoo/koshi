@@ -68,7 +68,7 @@ const PLACEHOLDER_THREADS: &[Thread] = &[
 pub fn build_thread_list_page(inbox_name: &str, inbox_description: &str) -> adw::NavigationPage {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .margin_top(24)
+        .margin_top(36)
         .margin_bottom(36)
         .margin_start(12)
         .margin_end(12)
@@ -91,30 +91,31 @@ pub fn build_thread_list_page(inbox_name: &str, inbox_description: &str) -> adw:
 fn build_title(inbox_name: &str, inbox_description: &str) -> gtk::Box {
     let title_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
+        .spacing(12)
         .build();
 
-    title_box.append(
-        &gtk::Label::builder()
-            .label(inbox_name)
-            .halign(gtk::Align::Start)
-            .css_classes(["title-1"])
-            .build(),
-    );
-    let description_row = gtk::Box::builder()
+    let title_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
-    description_row.append(
+    title_row.append(
+        &gtk::Label::builder()
+            .label(inbox_name)
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .css_classes(["title-1"])
+            .build(),
+    );
+    title_row.append(&build_sort_button());
+    title_box.append(&title_row);
+
+    title_box.append(
         &gtk::Label::builder()
             .label(inbox_description)
             .halign(gtk::Align::Start)
-            .hexpand(true)
             .css_classes(["dim-label"])
             .build(),
     );
-    description_row.append(&build_sort_button());
-    title_box.append(&description_row);
 
     title_box
 }

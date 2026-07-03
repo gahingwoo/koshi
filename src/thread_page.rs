@@ -243,7 +243,7 @@ fn build_raw_page() -> adw::NavigationPage {
     adw::NavigationPage::new(&scrolled, "Raw")
 }
 
-fn build_body_view(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::TextView {
+fn build_body_view(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::Box {
     let view = gtk::TextView::builder()
         .editable(false)
         .cursor_visible(false)
@@ -290,48 +290,78 @@ fn build_body_view(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::TextView {
         mail.date, mail.from
     ))));
 
+    let copy = gio::SimpleAction::new("copy", None);
+    copy.set_enabled(false);
+    copy.connect_activate(glib::clone!(
+        #[weak]
+        view,
+        move |_, _| {
+            view.buffer().copy_clipboard(&view.clipboard());
+        }
+    ));
+
+    let select_all = gio::SimpleAction::new("select-all", None);
+    select_all.connect_activate(glib::clone!(
+        #[weak]
+        view,
+        move |_, _| {
+            let buffer = view.buffer();
+            buffer.select_range(&buffer.start_iter(), &buffer.end_iter());
+        }
+    ));
+
     view.buffer().connect_has_selection_notify(glib::clone!(
         #[weak]
         quote,
         #[weak]
         quote_with_date,
+        #[weak]
+        copy,
         move |buffer| {
             quote.set_enabled(buffer.has_selection());
             quote_with_date.set_enabled(buffer.has_selection());
+            copy.set_enabled(buffer.has_selection());
         }
     ));
+
+    // The popover can't be parented to the TextView itself (it allocates its
+    // own children and warns about foreign ones), so everything hangs off a
+    // plain Box wrapper instead — including the action group.
+    let wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    wrapper.append(&view);
 
     let group = gio::SimpleActionGroup::new();
     group.add_action(&quote);
     group.add_action(&quote_with_date);
-    view.insert_action_group("mailview", Some(&group));
+    group.add_action(&copy);
+    group.add_action(&select_all);
+    wrapper.insert_action_group("mailview", Some(&group));
 
-    setup_context_menu(&view);
+    setup_context_menu(&view, &wrapper);
 
-    view
+    wrapper
 }
 
 // GTK only appends extra-menu items after the built-in ones, so to put the
-// quote items first the context menu is replaced wholesale; Copy and Select
-// All dispatch to the TextView's built-in actions.
-fn setup_context_menu(view: &gtk::TextView) {
+// quote items first the context menu is replaced wholesale.
+fn setup_context_menu(view: &gtk::TextView, wrapper: &gtk::Box) {
     let quote_section = gio::Menu::new();
     quote_section.append(Some("_Quote Selection"), Some("mailview.quote-selection"));
     quote_section.append(Some("Quote With _Date"), Some("mailview.quote-with-date"));
 
     let edit_section = gio::Menu::new();
-    edit_section.append(Some("_Copy"), Some("clipboard.copy"));
-    edit_section.append(Some("Select _All"), Some("selection.select-all"));
+    edit_section.append(Some("_Copy"), Some("mailview.copy"));
+    edit_section.append(Some("Select _All"), Some("mailview.select-all"));
 
     let menu = gio::Menu::new();
     menu.append_section(None, &quote_section);
     menu.append_section(None, &edit_section);
 
     let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_parent(view);
+    popover.set_parent(wrapper);
     popover.set_has_arrow(false);
     popover.set_halign(gtk::Align::Start);
-    view.connect_destroy(glib::clone!(
+    wrapper.connect_destroy(glib::clone!(
         #[weak]
         popover,
         move |_| popover.unparent()

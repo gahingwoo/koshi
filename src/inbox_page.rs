@@ -1,6 +1,7 @@
 use adw::prelude::*;
 use gtk::glib;
 
+use crate::list_page::build_list_page;
 use crate::thread_list_page::build_thread_list_page;
 
 const PLACEHOLDER_INBOXES: &[(&str, &str, &str)] = &[
@@ -19,18 +20,6 @@ const PLACEHOLDER_INBOXES: &[(&str, &str, &str)] = &[
 pub const INBOX_LIST_TITLE: &str = "Public Inboxes";
 
 pub fn build_inbox_page(nav: &adw::NavigationView) -> adw::NavigationPage {
-    let title = gtk::Label::builder()
-        .label("Open a public inbox")
-        .halign(gtk::Align::Start)
-        .css_classes(["title-1"])
-        .build();
-
-    let subtitle = gtk::Label::builder()
-        .label("Every list mirrored on lore.kernel.org. Pick one to open it in this tab.")
-        .halign(gtk::Align::Start)
-        .css_classes(["dim-label"])
-        .build();
-
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
@@ -49,27 +38,13 @@ pub fn build_inbox_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         }
     ));
 
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .margin_top(36)
-        .margin_bottom(36)
-        .margin_start(12)
-        .margin_end(12)
-        .spacing(12)
-        .build();
-    content.append(&title);
-    content.append(&subtitle);
-    content.append(&list);
-
-    let clamp = adw::Clamp::builder()
-        .maximum_size(800)
-        .tightening_threshold(600)
-        .child(&content)
-        .build();
-
-    let scrolled = gtk::ScrolledWindow::builder().child(&clamp).build();
-
-    adw::NavigationPage::new(&scrolled, INBOX_LIST_TITLE)
+    build_list_page(
+        INBOX_LIST_TITLE,
+        "Open a public inbox",
+        "Every list mirrored on lore.kernel.org. Pick one to open it in this tab.",
+        &[],
+        &list,
+    )
 }
 
 fn build_inbox_row(name: &str, description: &str, count: &str) -> adw::ActionRow {

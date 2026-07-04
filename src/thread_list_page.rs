@@ -1,6 +1,7 @@
 use adw::prelude::*;
 use gtk::{gio, glib};
 
+use crate::list_page::build_list_page;
 use crate::thread_page::build_thread_page;
 
 struct Thread {
@@ -72,65 +73,19 @@ pub fn build_thread_list_page(
     inbox_name: &str,
     inbox_description: &str,
 ) -> adw::NavigationPage {
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .margin_top(36)
-        .margin_bottom(36)
-        .margin_start(12)
-        .margin_end(12)
-        .spacing(12)
-        .build();
-    content.append(&build_title(inbox_name, inbox_description));
-    content.append(&build_thread_list(nav));
-
-    let clamp = adw::Clamp::builder()
-        .maximum_size(800)
-        .tightening_threshold(600)
-        .child(&content)
+    let refresh_button = gtk::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Refresh")
+        .css_classes(["flat"])
         .build();
 
-    let scrolled = gtk::ScrolledWindow::builder().child(&clamp).build();
-
-    adw::NavigationPage::new(&scrolled, inbox_name)
-}
-
-fn build_title(inbox_name: &str, inbox_description: &str) -> gtk::Box {
-    let title_box = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .build();
-
-    let title_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .build();
-    title_row.append(
-        &gtk::Label::builder()
-            .label(inbox_name)
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .css_classes(["title-1"])
-            .build(),
-    );
-    title_row.append(
-        &gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Refresh")
-            .css_classes(["flat"])
-            .build(),
-    );
-    title_row.append(&build_sort_button());
-    title_box.append(&title_row);
-
-    title_box.append(
-        &gtk::Label::builder()
-            .label(inbox_description)
-            .halign(gtk::Align::Start)
-            .css_classes(["dim-label"])
-            .build(),
-    );
-
-    title_box
+    build_list_page(
+        inbox_name,
+        inbox_name,
+        inbox_description,
+        &[refresh_button.upcast(), build_sort_button().upcast()],
+        &build_thread_list(nav),
+    )
 }
 
 fn build_sort_button() -> gtk::MenuButton {

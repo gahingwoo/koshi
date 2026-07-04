@@ -1,4 +1,7 @@
+mod favorites;
+mod favorites_page;
 mod inbox_page;
+mod list_page;
 mod thread_list_page;
 mod thread_page;
 
@@ -8,6 +11,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
+use favorites_page::{FAVORITES_PAGE_NAME, build_favorites_page};
 use inbox_page::{INBOX_LIST_TITLE, build_inbox_page};
 
 const APP_ID: &str = "moe.nikableh.Koshi";
@@ -345,6 +349,27 @@ fn build_header_bar(search_entry: &gtk::SearchEntry, tab_view: &adw::TabView) ->
         move |_| open_new_tab(&tab_view)
     ));
     header.pack_start(&new_tab_button);
+
+    let favorites_button = gtk::Button::builder()
+        .icon_name("starred-symbolic")
+        .tooltip_text("Favourites")
+        .build();
+    favorites_button.connect_clicked(glib::clone!(
+        #[weak]
+        tab_view,
+        move |_| {
+            let Some(nav) = selected_nav(&tab_view) else {
+                return;
+            };
+            let already_there = nav
+                .visible_page()
+                .is_some_and(|page| page.widget_name() == FAVORITES_PAGE_NAME);
+            if !already_there {
+                nav.push(&build_favorites_page(&nav));
+            }
+        }
+    ));
+    header.pack_start(&favorites_button);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(600)

@@ -2,6 +2,8 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use mailparse::MailHeaderMap;
 
+use crate::favorites::{self, Favorite};
+
 const RAW_MAIL: &str = include_str!("../data/sample-mail.txt");
 
 struct Mail {
@@ -157,6 +159,13 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .css_classes(["title-2", "monospace"])
         .build();
 
+    let title_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    title_row.append(&build_star_button(&mail, &overlay));
+    title_row.append(&title);
+
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .margin_top(36)
@@ -165,7 +174,7 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .margin_end(12)
         .spacing(12)
         .build();
-    content.append(&title);
+    content.append(&title_row);
     content.append(&build_header_list(&mail, &overlay));
     content.append(&build_body_view(&mail, nav, &overlay));
 
@@ -179,6 +188,65 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     overlay.set_child(Some(&scrolled));
 
     adw::NavigationPage::new(&overlay, &mail.subject)
+}
+
+/// A star toggle sitting left of the subject, aligned with its first line.
+/// Disabled when the mail has no Message-ID to key the favourite by.
+fn build_star_button(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ToggleButton {
+    let starred = mail
+        .message_id
+        .as_deref()
+        .is_some_and(favorites::is_favorite);
+
+    let button = gtk::ToggleButton::builder()
+        .active(starred)
+        .valign(gtk::Align::Start)
+        .sensitive(mail.message_id.is_some())
+        .css_classes(["flat"])
+        .build();
+
+    let apply = |button: &gtk::ToggleButton, starred: bool| {
+        button.set_icon_name(if starred {
+            "starred-symbolic"
+        } else {
+            "non-starred-symbolic"
+        });
+        button.set_tooltip_text(Some(if starred {
+            "Remove from Favourites"
+        } else {
+            "Add to Favourites"
+        }));
+    };
+    apply(&button, starred);
+
+    let fav = mail.message_id.as_ref().map(|id| Favorite {
+        message_id: id.clone(),
+        subject: mail.subject.clone(),
+        date: mail.date.clone(),
+    });
+    button.connect_toggled(glib::clone!(
+        #[weak]
+        overlay,
+        move |button| {
+            let Some(fav) = &fav else { return };
+            // Drive the store from the button's own state rather than blindly
+            // flipping it: another view of the same mail may have changed the
+            // store since this page was built, and a blind flip would then
+            // do the opposite of what the click asked for.
+            let starred = button.is_active();
+            if favorites::is_favorite(&fav.message_id) != starred {
+                favorites::toggle(fav.clone());
+            }
+            apply(button, starred);
+            overlay.add_toast(adw::Toast::new(if starred {
+                "Added to Favourites"
+            } else {
+                "Removed from Favourites"
+            }));
+        }
+    ));
+
+    button
 }
 
 fn build_header_list(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ListBox {

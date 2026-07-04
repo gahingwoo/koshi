@@ -268,11 +268,11 @@ fn build_address_pill(addr: &str, overlay: &adw::ToastOverlay) -> gtk::Button {
         .label(addr)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .max_width_chars(48)
+        .css_classes(["caption", "monospace"])
         .build();
 
     let button = gtk::Button::builder()
         .child(&label)
-        .css_classes(["caption", "monospace"])
         .valign(gtk::Align::Center)
         .tooltip_text(addr)
         .build();

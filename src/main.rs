@@ -352,7 +352,7 @@ fn build_header_bar(search_entry: &gtk::SearchEntry, tab_view: &adw::TabView) ->
 
     let favorites_button = gtk::Button::builder()
         .icon_name("starred-symbolic")
-        .tooltip_text("Favourites")
+        .tooltip_text("Favorites")
         .build();
     favorites_button.connect_clicked(glib::clone!(
         #[weak]

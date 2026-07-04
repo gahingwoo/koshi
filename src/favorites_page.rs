@@ -5,12 +5,12 @@ use crate::favorites::{self, Favorite};
 use crate::list_page::build_list_page;
 use crate::thread_page::build_thread_page;
 
-pub const FAVORITES_TITLE: &str = "Favourites";
+pub const FAVORITES_TITLE: &str = "Favorites";
 
-/// Widget name marking the favourites page, so it can be recognised without
+/// Widget name marking the favorites page, so it can be recognized without
 /// comparing titles (a mail subject could legitimately equal the title) and
 /// without navigation tags (which must be unique, but the page can appear
-/// twice in one stack via favourites → mail → favourites).
+/// twice in one stack via favorites → mail → favorites).
 pub const FAVORITES_PAGE_NAME: &str = "koshi-favorites-page";
 
 pub fn build_favorites_page(nav: &adw::NavigationView) -> adw::NavigationPage {
@@ -32,7 +32,7 @@ pub fn build_favorites_page(nav: &adw::NavigationView) -> adw::NavigationPage {
             nav,
             move |_, _| {
                 // Only the bundled sample mail exists for now, so every
-                // favourite resolves to it regardless of Message-ID.
+                // favorite resolves to it regardless of Message-ID.
                 nav.push(&build_thread_page(&nav));
             }
         ));
@@ -41,7 +41,7 @@ pub fn build_favorites_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     let page = build_list_page(
         FAVORITES_TITLE,
         FAVORITES_TITLE,
-        "Messages you starred.",
+        "Starred messages",
         &[],
         &list,
     );
@@ -51,7 +51,7 @@ pub fn build_favorites_page(nav: &adw::NavigationView) -> adw::NavigationPage {
 
 fn build_empty_row() -> gtk::ListBoxRow {
     let label = gtk::Label::builder()
-        .label("No favourites yet")
+        .label("No favorites yet")
         .margin_top(12)
         .margin_bottom(12)
         .margin_start(12)

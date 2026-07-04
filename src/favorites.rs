@@ -16,8 +16,8 @@ pub fn is_favorite(message_id: &str) -> bool {
     FAVORITES.with_borrow(|favs| favs.iter().any(|fav| fav.message_id == message_id))
 }
 
-/// Flip the favourite state of `fav` and return the new state
-/// (true = now favourited).
+/// Flip the favorite state of `fav` and return the new state
+/// (true = now favorited).
 pub fn toggle(fav: Favorite) -> bool {
     FAVORITES.with_borrow_mut(|favs| {
         match favs.iter().position(|f| f.message_id == fav.message_id) {

@@ -191,7 +191,7 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
 }
 
 /// A star toggle sitting left of the subject, aligned with its first line.
-/// Disabled when the mail has no Message-ID to key the favourite by.
+/// Disabled when the mail has no Message-ID to key the favorite by.
 fn build_star_button(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ToggleButton {
     let starred = mail
         .message_id
@@ -212,9 +212,9 @@ fn build_star_button(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ToggleBut
             "non-starred-symbolic"
         });
         button.set_tooltip_text(Some(if starred {
-            "Remove from Favourites"
+            "Remove from Favorites"
         } else {
-            "Add to Favourites"
+            "Add to Favorites"
         }));
     };
     apply(&button, starred);
@@ -239,9 +239,9 @@ fn build_star_button(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ToggleBut
             }
             apply(button, starred);
             overlay.add_toast(adw::Toast::new(if starred {
-                "Added to Favourites"
+                "Added to Favorites"
             } else {
-                "Removed from Favourites"
+                "Removed from Favorites"
             }));
         }
     ));

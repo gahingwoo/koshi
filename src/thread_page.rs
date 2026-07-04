@@ -153,6 +153,7 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     let title = gtk::Label::builder()
         .label(&mail.subject)
         .halign(gtk::Align::Start)
+        .hexpand(true)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .xalign(0.0)
@@ -163,8 +164,8 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
-    title_row.append(&build_star_button(&mail, &overlay));
     title_row.append(&title);
+    title_row.append(&build_star_button(&mail, &overlay));
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -190,7 +191,7 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     adw::NavigationPage::new(&overlay, &mail.subject)
 }
 
-/// A star toggle sitting left of the subject, aligned with its first line.
+/// A star toggle sitting right of the subject, aligned with its first line.
 /// Disabled when the mail has no Message-ID to key the favorite by.
 fn build_star_button(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ToggleButton {
     let starred = mail

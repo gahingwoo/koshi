@@ -69,6 +69,50 @@ impl ComposerState {
     }
 }
 
+/// Hide the stock "Insert Emoji" and "Change Direction" items from the
+/// context menu of a composer input. For entries the actions live on the
+/// internal GtkText delegate; the emoji item must be suppressed via
+/// InputHints::NO_EMOJI because GTK re-enables the action whenever the
+/// hints or editability change.
+fn strip_extra_context_items(widget: &impl IsA<gtk::Widget>) {
+    let widget = widget.upcast_ref::<gtk::Widget>();
+    if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
+        entry.set_input_hints(entry.input_hints() | gtk::InputHints::NO_EMOJI);
+        if let Some(text) = entry.first_child().and_downcast::<gtk::Text>() {
+            text.action_set_enabled("misc.toggle-direction", false);
+        }
+    } else if let Some(view) = widget.downcast_ref::<gtk::TextView>() {
+        // GtkTextView has no "Change Direction" item, only the emoji one.
+        view.set_input_hints(view.input_hints() | gtk::InputHints::NO_EMOJI);
+    }
+}
+
+/// Show a revert icon in a subject entry whenever its text differs from the
+/// initial prefilled reply subject; clicking the icon restores it.
+fn setup_subject_revert(entry: &gtk::Entry, initial: &Rc<ReplyContext>) {
+    let initial = initial.clone();
+
+    entry.set_secondary_icon_activatable(true);
+    entry.set_secondary_icon_tooltip_text(Some("Revert Subject"));
+
+    let apply = glib::clone!(
+        #[strong]
+        initial,
+        move |entry: &gtk::Entry| {
+            let modified = entry.text() != initial.subject;
+            entry.set_secondary_icon_name(modified.then_some("edit-undo-symbolic"));
+        }
+    );
+    apply(entry);
+    entry.connect_changed(move |entry| apply(entry));
+
+    entry.connect_icon_release(move |entry, position| {
+        if position == gtk::EntryIconPosition::Secondary {
+            entry.set_text(&initial.subject);
+        }
+    });
+}
+
 /// Prefix `subject` with "Re: " unless it already carries one.
 pub fn reply_subject(subject: &str) -> String {
     if subject.to_lowercase().starts_with("re:") {
@@ -175,6 +219,8 @@ pub fn build_composer(reply: ReplyContext) -> adw::Clamp {
         .placeholder_text("Subject")
         .hexpand(true)
         .build();
+    strip_extra_context_items(&subject_entry);
+    setup_subject_revert(&subject_entry, &state.initial);
 
     let revealer = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -199,6 +245,7 @@ pub fn build_composer(reply: ReplyContext) -> adw::Clamp {
         .editable(false)
         .cursor_visible(false)
         .monospace(true)
+        .wrap_mode(gtk::WrapMode::None)
         .left_margin(8)
         .right_margin(8)
         .top_margin(8)
@@ -215,7 +262,8 @@ pub fn build_composer(reply: ReplyContext) -> adw::Clamp {
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
         .build();
-    stack.add_named(&build_body_editor(&state.body, true), Some("edit"));
+    let (body_editor, body_view) = build_body_editor(&state.body, true);
+    stack.add_named(&body_editor, Some("edit"));
     stack.add_named(&preview_scrolled, Some("preview"));
 
     let preview_toggle = gtk::ToggleButton::builder()
@@ -277,6 +325,13 @@ pub fn build_composer(reply: ReplyContext) -> adw::Clamp {
         .margin_end(12)
         .build();
 
+    // Collapsed <-> expanded composer. The page opens with an empty draft,
+    // so it starts on the compact affordance row; Discard returns to it.
+    let outer_stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .vhomogeneous(false)
+        .build();
+
     let header_strip = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -287,16 +342,50 @@ pub fn build_composer(reply: ReplyContext) -> adw::Clamp {
     header_strip.append(&build_rewrap_button(&state));
     header_strip.append(&preview_toggle);
     header_strip.append(&build_fullscreen_toggle(&state));
-    header_strip.append(&build_discard_button(&state, &details_toggle, &preview_toggle));
+    header_strip.append(&build_discard_button(
+        &state,
+        &details_toggle,
+        &preview_toggle,
+        &outer_stack,
+    ));
 
     root.append(&header_strip);
     root.append(&revealer);
     root.append(&stack);
 
+    let collapsed_content = adw::ButtonContent::builder()
+        .icon_name("mail-reply-sender-symbolic")
+        .label("Reply")
+        .halign(gtk::Align::Start)
+        .build();
+    let collapsed_button = gtk::Button::builder()
+        .child(&collapsed_content)
+        .hexpand(true)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .css_classes(["flat"])
+        .build();
+    collapsed_button.connect_clicked(glib::clone!(
+        #[weak]
+        outer_stack,
+        #[weak]
+        body_view,
+        move |_| {
+            outer_stack.set_visible_child_name("expanded");
+            body_view.grab_focus();
+        }
+    ));
+
+    outer_stack.add_named(&collapsed_button, Some("collapsed"));
+    outer_stack.add_named(&root, Some("expanded"));
+    outer_stack.set_visible_child_name("collapsed");
+
     adw::Clamp::builder()
         .maximum_size(1100)
         .tightening_threshold(800)
-        .child(&root)
+        .child(&outer_stack)
         .build()
 }
 
@@ -321,6 +410,7 @@ fn build_headers_grid(state: &ComposerState) -> gtk::Grid {
             .css_classes(["caption-heading"])
             .build();
         let entry = gtk::Entry::builder().buffer(buffer).hexpand(true).build();
+        strip_extra_context_items(&entry);
         grid.attach(&label, 0, row as i32, 1, 1);
         grid.attach(&entry, 1, row as i32, 1, 1);
     }
@@ -331,20 +421,21 @@ fn build_headers_grid(state: &ComposerState) -> gtk::Grid {
 /// A monospace body editor with a dim 72-column ruler overlaid at the wrap
 /// margin. `compact` limits the height so the sticky bar stays small; the
 /// fullscreen dialog passes false and lets the editor fill the dialog.
-fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> gtk::Overlay {
+fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> (gtk::Overlay, gtk::TextView) {
     let view = gtk::TextView::builder()
         .buffer(buffer)
         .monospace(true)
-        .wrap_mode(gtk::WrapMode::WordChar)
+        .wrap_mode(gtk::WrapMode::None)
         .left_margin(8)
         .right_margin(8)
         .top_margin(8)
         .bottom_margin(8)
         .build();
+    strip_extra_context_items(&view);
 
     let scrolled = gtk::ScrolledWindow::builder()
         .child(&view)
-        .hscrollbar_policy(gtk::PolicyType::Never)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
         .build();
     if compact {
         scrolled.set_min_content_height(90);
@@ -367,19 +458,39 @@ fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> gtk::Overlay {
     overlay.set_measure_overlay(&ruler, false);
     overlay.set_clip_overlay(&ruler, true);
 
-    // Position the ruler once the view is mapped (the pango context carries
-    // the real font by then). Measuring a full 72-char string avoids
-    // accumulating per-char rounding error.
-    view.connect_map(glib::clone!(
+    // Position the ruler at the 72nd column. Measuring a full 72-char string
+    // avoids accumulating per-char rounding error, and the position must
+    // track the horizontal scroll offset: the overlay is fixed in viewport
+    // coordinates while the unwrapped text scrolls underneath it.
+    let position_ruler: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
         ruler,
-        move |view| {
+        #[weak]
+        view,
+        #[weak]
+        scrolled,
+        move || {
             let layout = view.create_pango_layout(Some(&"0".repeat(WRAP_WIDTH)));
-            ruler.set_margin_start(view.left_margin() + layout.pixel_size().0);
+            let offset = view.left_margin() + layout.pixel_size().0
+                - scrolled.hadjustment().value() as i32;
+            ruler.set_visible(offset >= 0);
+            ruler.set_margin_start(offset.max(0));
         }
     ));
+    // On map the pango context carries the real font; the scroll handler
+    // keeps the ruler on column 72 as the text pans under the overlay.
+    view.connect_map(glib::clone!(
+        #[strong]
+        position_ruler,
+        move |_| position_ruler()
+    ));
+    scrolled.hadjustment().connect_value_changed(glib::clone!(
+        #[strong]
+        position_ruler,
+        move |_| position_ruler()
+    ));
 
-    overlay
+    (overlay, view)
 }
 
 fn build_trailer_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::MenuButton {
@@ -414,7 +525,7 @@ fn build_trailer_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::
 
 fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
     let button = gtk::Button::builder()
-        .icon_name("format-justify-fill-symbolic")
+        .icon_name("view-wrapped-symbolic")
         .tooltip_text("Rewrap Lines")
         .css_classes(["flat"])
         .build();
@@ -479,6 +590,8 @@ fn build_fullscreen_dialog(state: &ComposerState) -> adw::Dialog {
         .placeholder_text("Subject")
         .hexpand(true)
         .build();
+    strip_extra_context_items(&subject_entry);
+    setup_subject_revert(&subject_entry, &state.initial);
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -490,7 +603,7 @@ fn build_fullscreen_dialog(state: &ComposerState) -> adw::Dialog {
         .build();
     content.append(&subject_entry);
     content.append(&build_headers_grid(state));
-    content.append(&build_body_editor(&state.body, false));
+    content.append(&build_body_editor(&state.body, false).0);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(1100)
@@ -514,6 +627,7 @@ fn build_discard_button(
     state: &ComposerState,
     details_toggle: &gtk::ToggleButton,
     preview_toggle: &gtk::ToggleButton,
+    outer_stack: &gtk::Stack,
 ) -> gtk::Button {
     let button = gtk::Button::builder()
         .icon_name("user-trash-symbolic")
@@ -528,6 +642,8 @@ fn build_discard_button(
         details_toggle,
         #[weak]
         preview_toggle,
+        #[weak]
+        outer_stack,
         move |button| {
             let dialog = adw::AlertDialog::new(
                 Some("Discard Draft?"),
@@ -546,10 +662,13 @@ fn build_discard_button(
                     details_toggle,
                     #[weak]
                     preview_toggle,
+                    #[weak]
+                    outer_stack,
                     move |_, _| {
                         state.reset();
                         details_toggle.set_active(false);
                         preview_toggle.set_active(false);
+                        outer_stack.set_visible_child_name("collapsed");
                     }
                 ),
             );

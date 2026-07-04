@@ -186,17 +186,22 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .child(&content)
         .build();
 
-    let scrolled = gtk::ScrolledWindow::builder().child(&clamp).build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .child(&clamp)
+        .vexpand(true)
+        .build();
     overlay.set_child(Some(&scrolled));
 
-    // The composer lives in a nested ToolbarView's bottom bar so it stays
-    // visible while the mail body scrolls behind it.
-    let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.set_content(Some(&overlay));
-    toolbar_view.add_bottom_bar(&composer::build_composer(build_reply_context(&mail)));
-    toolbar_view.set_bottom_bar_style(adw::ToolbarStyle::Raised);
+    // The composer sits below the scrolling mail body in a plain box, so it
+    // stays visible without living in a ToolbarView bottom bar (whose
+    // GtkWindowHandle wrapper would turn clicks and drags on the composer
+    // padding into window move/maximize gestures).
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    page.append(&overlay);
+    page.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    page.append(&composer::build_composer(build_reply_context(&mail)));
 
-    adw::NavigationPage::new(&toolbar_view, &mail.subject)
+    adw::NavigationPage::new(&page, &mail.subject)
 }
 
 /// Reply prefill: To = the author, Cc = everyone else on the thread,

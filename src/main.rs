@@ -52,13 +52,14 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
     let tab_bar = adw::TabBar::builder().view(&tab_view).build();
     setup_tab_context_menu(&tab_view);
 
+    let go_back = gio::SimpleAction::new("go-back", None);
+    go_back.set_enabled(false);
+
     let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&build_header_bar(&search_entry, &tab_view));
+    toolbar_view.add_top_bar(&build_header_bar(&search_entry, &tab_view, &go_back));
     toolbar_view.add_top_bar(&tab_bar);
     toolbar_view.set_content(Some(&tab_view));
 
-    let go_back = gio::SimpleAction::new("go-back", None);
-    go_back.set_enabled(false);
     go_back.connect_activate(glib::clone!(
         #[weak]
         tab_view,
@@ -288,54 +289,22 @@ fn build_search_entry() -> gtk::SearchEntry {
         .build()
 }
 
-fn build_search_overlay(search_entry: &gtk::SearchEntry) -> gtk::Overlay {
-    let badge = adw::ShortcutLabel::new("<Control>l");
-    badge.set_halign(gtk::Align::End);
-    badge.set_valign(gtk::Align::Center);
-    badge.set_margin_end(8);
-    badge.set_can_target(false);
-    badge.add_css_class("dim-label");
-    badge.add_css_class("caption");
-
-    let update_badge = glib::clone!(
-        #[weak]
-        search_entry,
-        #[weak]
-        badge,
-        move |focused: bool| {
-            badge.set_visible(!focused && search_entry.text().is_empty());
-        }
-    );
-
-    search_entry.connect_changed(glib::clone!(
-        #[strong]
-        update_badge,
-        move |entry| {
-            update_badge(entry.state_flags().contains(gtk::StateFlags::FOCUS_WITHIN));
-        }
-    ));
-
-    let focus_controller = gtk::EventControllerFocus::new();
-    focus_controller.connect_enter(glib::clone!(
-        #[strong]
-        update_badge,
-        move |_| update_badge(true)
-    ));
-    focus_controller.connect_leave(move |_| update_badge(false));
-    search_entry.add_controller(focus_controller);
-
-    let overlay = gtk::Overlay::builder().child(search_entry).build();
-    overlay.add_overlay(&badge);
-    overlay
-}
-
-fn build_header_bar(search_entry: &gtk::SearchEntry, tab_view: &adw::TabView) -> adw::HeaderBar {
+fn build_header_bar(
+    search_entry: &gtk::SearchEntry,
+    tab_view: &adw::TabView,
+    go_back: &gio::SimpleAction,
+) -> adw::HeaderBar {
     let header = adw::HeaderBar::new();
 
     let back_button = gtk::Button::builder()
         .icon_name("go-previous-symbolic")
         .tooltip_text("Back")
         .action_name("win.go-back")
+        .visible(false)
+        .build();
+    go_back
+        .bind_property("enabled", &back_button, "visible")
+        .sync_create()
         .build();
     header.pack_start(&back_button);
 
@@ -369,18 +338,18 @@ fn build_header_bar(search_entry: &gtk::SearchEntry, tab_view: &adw::TabView) ->
             }
         }
     ));
-    header.pack_start(&favorites_button);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(600)
         .tightening_threshold(400)
         .hexpand(true)
-        .child(&build_search_overlay(search_entry))
+        .child(search_entry)
         .build();
     header.set_title_widget(Some(&clamp));
 
     header.pack_end(&build_primary_menu_button());
     header.pack_end(&build_account_button());
+    header.pack_end(&favorites_button);
 
     header
 }

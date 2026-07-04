@@ -2,6 +2,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use mailparse::MailHeaderMap;
 
+use crate::composer;
 use crate::favorites::{self, Favorite};
 
 const RAW_MAIL: &str = include_str!("../data/sample-mail.txt");
@@ -188,7 +189,38 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     let scrolled = gtk::ScrolledWindow::builder().child(&clamp).build();
     overlay.set_child(Some(&scrolled));
 
-    adw::NavigationPage::new(&overlay, &mail.subject)
+    // The composer lives in a nested ToolbarView's bottom bar so it stays
+    // visible while the mail body scrolls behind it.
+    let toolbar_view = adw::ToolbarView::new();
+    toolbar_view.set_content(Some(&overlay));
+    toolbar_view.add_bottom_bar(&composer::build_composer(build_reply_context(&mail)));
+    toolbar_view.set_bottom_bar_style(adw::ToolbarStyle::Raised);
+
+    adw::NavigationPage::new(&toolbar_view, &mail.subject)
+}
+
+/// Reply prefill: To = the author, Cc = everyone else on the thread,
+/// Re:-prefixed subject and the mail's Message-ID for threading. Parsed
+/// address lists are preferred; raw header values are the fallback.
+fn build_reply_context(mail: &Mail) -> composer::ReplyContext {
+    let mut cc: Vec<String> = Vec::new();
+    if mail.to_addrs.is_empty() {
+        cc.push(mail.to.clone());
+    } else {
+        cc.extend(mail.to_addrs.iter().cloned());
+    }
+    if mail.cc_addrs.is_empty() {
+        cc.extend(mail.cc.clone());
+    } else {
+        cc.extend(mail.cc_addrs.iter().cloned());
+    }
+
+    composer::ReplyContext {
+        to: mail.from.clone(),
+        cc: cc.join(", "),
+        subject: composer::reply_subject(&mail.subject),
+        in_reply_to: mail.message_id.clone().unwrap_or_default(),
+    }
 }
 
 /// A star toggle sitting right of the subject, aligned with its first line.

@@ -1,3 +1,4 @@
+mod composer;
 mod favorites;
 mod favorites_page;
 mod inbox_page;

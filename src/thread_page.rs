@@ -86,8 +86,7 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .build();
     content.append(&title);
     content.append(&build_header_list(&mail));
-    content.append(&build_action_buttons(&mail, nav, &overlay));
-    content.append(&build_body_view(&mail, &overlay));
+    content.append(&build_body_view(&mail, nav, &overlay));
 
     let clamp = adw::Clamp::builder()
         .maximum_size(1100)
@@ -129,75 +128,60 @@ fn build_header_row(name: &str, value: &str) -> adw::ActionRow {
     row
 }
 
-fn build_action_buttons(
+fn build_mail_actions(
     mail: &Mail,
+    view: &gtk::TextView,
     nav: &adw::NavigationView,
     overlay: &adw::ToastOverlay,
-) -> gtk::Box {
-    let buttons = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(6)
-        .halign(gtk::Align::End)
-        .build();
-
-    let open_web = gtk::Button::builder()
-        .icon_name("web-browser-symbolic")
-        .tooltip_text("Open on Web")
-        .css_classes(["flat"])
-        .build();
+) -> [gio::SimpleAction; 4] {
+    let open_web = gio::SimpleAction::new("open-web", None);
     let lore_url = mail.message_id.as_deref().map(|id| {
         let bare = id.trim().trim_start_matches('<').trim_end_matches('>');
         format!("https://lore.kernel.org/r/{bare}/")
     });
-    open_web.set_sensitive(lore_url.is_some());
-    open_web.connect_clicked(move |button| {
-        if let Some(url) = &lore_url {
-            launch_uri(button, url);
+    open_web.set_enabled(lore_url.is_some());
+    open_web.connect_activate(glib::clone!(
+        #[weak]
+        view,
+        move |_, _| {
+            if let Some(url) = &lore_url {
+                launch_uri(&view, url);
+            }
         }
-    });
-    buttons.append(&open_web);
+    ));
 
-    let copy_id = gtk::Button::builder()
-        .icon_name("edit-copy-symbolic")
-        .tooltip_text("Copy Message-ID")
-        .css_classes(["flat"])
-        .build();
+    let copy_id = gio::SimpleAction::new("copy-message-id", None);
     let message_id = mail.message_id.clone();
-    copy_id.set_sensitive(message_id.is_some());
-    copy_id.connect_clicked(glib::clone!(
+    copy_id.set_enabled(message_id.is_some());
+    copy_id.connect_activate(glib::clone!(
+        #[weak]
+        view,
         #[weak]
         overlay,
-        move |button| {
+        move |_, _| {
             if let Some(id) = &message_id {
-                button.clipboard().set_text(id);
+                view.clipboard().set_text(id);
                 overlay.add_toast(adw::Toast::new("Message-ID copied"));
             }
         }
     ));
-    buttons.append(&copy_id);
 
-    let raw = gtk::Button::builder()
-        .icon_name("text-x-generic-symbolic")
-        .tooltip_text("Raw")
-        .css_classes(["flat"])
-        .build();
-    raw.connect_clicked(glib::clone!(
+    let raw = gio::SimpleAction::new("raw", None);
+    raw.connect_activate(glib::clone!(
         #[weak]
         nav,
-        move |_| nav.push(&build_raw_page())
+        move |_, _| nav.push(&build_raw_page())
     ));
-    buttons.append(&raw);
 
-    let reply = gtk::Button::builder()
-        .icon_name("mail-reply-sender-symbolic")
-        .tooltip_text("Reply")
-        .css_classes(["flat"])
-        .build();
+    let reply = gio::SimpleAction::new("reply", None);
     let mailto = build_reply_mailto(mail);
-    reply.connect_clicked(move |button| launch_uri(button, &mailto));
-    buttons.append(&reply);
+    reply.connect_activate(glib::clone!(
+        #[weak]
+        view,
+        move |_, _| launch_uri(&view, &mailto)
+    ));
 
-    buttons
+    [open_web, copy_id, raw, reply]
 }
 
 fn build_reply_mailto(mail: &Mail) -> String {
@@ -243,7 +227,11 @@ fn build_raw_page() -> adw::NavigationPage {
     adw::NavigationPage::new(&scrolled, "Raw")
 }
 
-fn build_body_view(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::Box {
+fn build_body_view(
+    mail: &Mail,
+    nav: &adw::NavigationView,
+    overlay: &adw::ToastOverlay,
+) -> gtk::Box {
     let view = gtk::TextView::builder()
         .editable(false)
         .cursor_visible(false)
@@ -342,6 +330,9 @@ fn build_body_view(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::Box {
     group.add_action(&quote_with_date);
     group.add_action(&copy);
     group.add_action(&select_all);
+    for action in build_mail_actions(mail, &view, nav, overlay) {
+        group.add_action(&action);
+    }
     wrapper.insert_action_group("mailview", Some(&group));
 
     setup_context_menu(&view, &wrapper);
@@ -360,9 +351,16 @@ fn setup_context_menu(view: &gtk::TextView, wrapper: &gtk::Box) {
     edit_section.append(Some("_Copy"), Some("mailview.copy"));
     edit_section.append(Some("Select _All"), Some("mailview.select-all"));
 
+    let mail_section = gio::Menu::new();
+    mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
+    mail_section.append(Some("Copy _Message-ID"), Some("mailview.copy-message-id"));
+    mail_section.append(Some("View _Raw"), Some("mailview.raw"));
+    mail_section.append(Some("_Reply"), Some("mailview.reply"));
+
     let menu = gio::Menu::new();
     menu.append_section(None, &quote_section);
     menu.append_section(None, &edit_section);
+    menu.append_section(None, &mail_section);
 
     let popover = gtk::PopoverMenu::from_model(Some(&menu));
     popover.set_parent(wrapper);

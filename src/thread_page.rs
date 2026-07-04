@@ -73,7 +73,7 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .xalign(0.0)
-        .css_classes(["title-2"])
+        .css_classes(["title-2", "monospace"])
         .build();
 
     let content = gtk::Box::builder()
@@ -119,7 +119,7 @@ fn build_header_list(mail: &Mail) -> gtk::ListBox {
 fn build_header_row(name: &str, value: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(name))
-        .subtitle(glib::markup_escape_text(value))
+        .subtitle(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
         .subtitle_lines(0)
         .activatable(false)
         .css_classes(["property"])

@@ -182,7 +182,7 @@ fn build_thread_list(nav: &adw::NavigationView) -> gtk::ListBox {
 
 fn build_thread_row(thread: &Thread) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(glib::markup_escape_text(thread.subject))
+        .title(format!("<tt>{}</tt>", glib::markup_escape_text(thread.subject)))
         .title_lines(1)
         .activatable(true)
         .build();
@@ -191,10 +191,10 @@ fn build_thread_row(thread: &Thread) -> adw::ActionRow {
         let subtitle = thread
             .children
             .iter()
-            .map(|child| format!("└ {child}"))
+            .map(|child| format!("└ {}", glib::markup_escape_text(child)))
             .collect::<Vec<_>>()
             .join("\n");
-        row.set_subtitle(&glib::markup_escape_text(&subtitle));
+        row.set_subtitle(&format!("<tt>{subtitle}</tt>"));
         row.set_subtitle_lines(0);
     }
 

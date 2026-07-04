@@ -266,10 +266,7 @@ fn build_address_row(
 fn build_address_pill(addr: &str, overlay: &adw::ToastOverlay) -> gtk::Button {
     let label = gtk::Label::builder()
         .use_markup(true)
-        .label(format!(
-            "<tt><span size=\"small\">{}</span></tt>",
-            glib::markup_escape_text(addr)
-        ))
+        .label(format!("<tt>{}</tt>", glib::markup_escape_text(addr)))
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .max_width_chars(48)
         .css_classes(["caption"])

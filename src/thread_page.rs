@@ -8,7 +8,9 @@ struct Mail {
     subject: String,
     from: String,
     to: String,
+    to_addrs: Vec<String>,
     cc: Option<String>,
+    cc_addrs: Vec<String>,
     date: String,
     message_id: Option<String>,
     body: String,
@@ -31,7 +33,9 @@ fn parse_sample_mail() -> Mail {
             subject: unknown(),
             from: unknown(),
             to: unknown(),
+            to_addrs: Vec::new(),
             cc: None,
+            cc_addrs: Vec::new(),
             date: unknown(),
             message_id: None,
             body: String::new(),
@@ -39,17 +43,94 @@ fn parse_sample_mail() -> Mail {
     };
 
     let header = |name: &str| parsed.headers.get_first_value(name);
+    let addrs = |name: &str| {
+        parsed
+            .headers
+            .get_first_header(name)
+            .map(parse_addresses)
+            .unwrap_or_default()
+    };
     let body = find_text_body(&parsed).unwrap_or_default();
 
     Mail {
         subject: header("Subject").unwrap_or_else(unknown),
         from: header("From").unwrap_or_else(unknown),
         to: header("To").unwrap_or_else(unknown),
+        to_addrs: addrs("To"),
         cc: header("Cc"),
+        cc_addrs: addrs("Cc"),
         date: header("Date").unwrap_or_else(unknown),
         message_id: header("Message-ID"),
         body,
     }
+}
+
+/// Parse an address header into clean "Name <addr>" strings. RFC 5322
+/// comments are stripped, and group syntax is flattened to its members.
+fn parse_addresses(header: &mailparse::MailHeader) -> Vec<String> {
+    let list = mailparse::addrparse_header(header).or_else(|_| {
+        // mailparse chokes on nested comments (e.g. MAINTAINERS-style
+        // "(open list:KERNEL HARDENING (not covered...))" entries), so strip
+        // comments ourselves and retry.
+        mailparse::addrparse(&strip_rfc5322_comments(&header.get_value()))
+    });
+
+    let Ok(list) = list else {
+        // Last resort: crude comma split, keeping only address-shaped tokens.
+        return header
+            .get_value()
+            .split(',')
+            .map(str::trim)
+            .filter(|token| token.contains('@'))
+            .map(str::to_string)
+            .collect();
+    };
+
+    let format_single = |info: &mailparse::SingleInfo| match &info.display_name {
+        Some(name) if !name.is_empty() => format!("{} <{}>", name, info.addr),
+        _ => info.addr.clone(),
+    };
+
+    list.iter()
+        .flat_map(|addr| match addr {
+            mailparse::MailAddr::Single(info) => vec![format_single(info)],
+            mailparse::MailAddr::Group(group) => group.addrs.iter().map(format_single).collect(),
+        })
+        .collect()
+}
+
+/// Remove RFC 5322 comments, handling nesting, quoted strings and escapes.
+fn strip_rfc5322_comments(s: &str) -> String {
+    let mut out = String::new();
+    let mut depth = 0u32;
+    let mut in_quotes = false;
+    let mut escape = false;
+    for c in s.chars() {
+        if escape {
+            if depth == 0 {
+                out.push(c);
+            }
+            escape = false;
+            continue;
+        }
+        match c {
+            '\\' => {
+                escape = true;
+                if depth == 0 {
+                    out.push(c);
+                }
+            }
+            '"' if depth == 0 => {
+                in_quotes = !in_quotes;
+                out.push(c);
+            }
+            '(' if !in_quotes => depth += 1,
+            ')' if !in_quotes && depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 fn find_text_body(part: &mailparse::ParsedMail) -> Option<String> {
@@ -85,7 +166,7 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .spacing(12)
         .build();
     content.append(&title);
-    content.append(&build_header_list(&mail));
+    content.append(&build_header_list(&mail, &overlay));
     content.append(&build_body_view(&mail, nav, &overlay));
 
     let clamp = adw::Clamp::builder()
@@ -100,32 +181,110 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     adw::NavigationPage::new(&overlay, &mail.subject)
 }
 
-fn build_header_list(mail: &Mail) -> gtk::ListBox {
+fn build_header_list(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
 
     list.append(&build_header_row("Author", &mail.from));
-    list.append(&build_header_row("To", &mail.to));
+    list.append(&build_address_or_header_row("To", &mail.to, &mail.to_addrs, overlay));
     if let Some(cc) = &mail.cc {
-        list.append(&build_header_row("Cc", cc));
+        list.append(&build_address_or_header_row("Cc", cc, &mail.cc_addrs, overlay));
     }
     list.append(&build_header_row("Date", &mail.date));
 
     list
 }
 
+/// Address rows show parsed pills; if parsing produced nothing but the raw
+/// header exists, fall back to a plain header row so the value isn't lost.
+fn build_address_or_header_row(
+    name: &str,
+    raw: &str,
+    addrs: &[String],
+    overlay: &adw::ToastOverlay,
+) -> gtk::Widget {
+    if addrs.is_empty() {
+        build_header_row(name, raw).upcast()
+    } else {
+        build_address_row(name, addrs, overlay).upcast()
+    }
+}
+
 fn build_header_row(name: &str, value: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(glib::markup_escape_text(name))
+        .title(format!("<b>{}</b>", glib::markup_escape_text(name)))
         .subtitle(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
         .subtitle_lines(0)
         .activatable(false)
-        .css_classes(["property"])
         .build();
     row.set_subtitle_selectable(true);
     row
+}
+
+fn build_address_row(
+    name: &str,
+    addrs: &[String],
+    overlay: &adw::ToastOverlay,
+) -> gtk::ListBoxRow {
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .spacing(6)
+        .build();
+
+    let title = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .use_markup(true)
+        .label(format!("<b>{}</b>", glib::markup_escape_text(name)))
+        .build();
+    content.append(&title);
+
+    let wrap = adw::WrapBox::builder()
+        .child_spacing(6)
+        .line_spacing(6)
+        .build();
+    for addr in addrs {
+        wrap.append(&build_address_pill(addr, overlay));
+    }
+    content.append(&wrap);
+
+    gtk::ListBoxRow::builder()
+        .activatable(false)
+        .selectable(false)
+        .child(&content)
+        .build()
+}
+
+fn build_address_pill(addr: &str, overlay: &adw::ToastOverlay) -> gtk::Button {
+    let label = gtk::Label::builder()
+        .label(addr)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(48)
+        .build();
+
+    let button = gtk::Button::builder()
+        .child(&label)
+        .css_classes(["pill", "caption"])
+        .valign(gtk::Align::Center)
+        .tooltip_text(addr)
+        .build();
+
+    let addr = addr.to_string();
+    button.connect_clicked(glib::clone!(
+        #[weak]
+        overlay,
+        move |button| {
+            button.clipboard().set_text(&addr);
+            overlay.add_toast(adw::Toast::new("Address copied"));
+        }
+    ));
+
+    button
 }
 
 fn build_mail_actions(
@@ -418,6 +577,35 @@ mod tests {
         assert!(cc.contains("Kai Mäkisara"), "Cc not decoded: {cc}");
         assert!(!mail.body.is_empty());
         assert!(mail.body.starts_with("Merge allocations"));
+    }
+
+    #[test]
+    fn parses_address_lists_cleanly() {
+        let mail = parse_sample_mail();
+        assert_eq!(mail.to_addrs, vec!["linux-scsi@vger.kernel.org"]);
+
+        assert_eq!(mail.cc_addrs.len(), 7, "Cc: {:?}", mail.cc_addrs);
+        assert_eq!(mail.cc_addrs[0], "Kai Mäkisara <Kai.Makisara@kolumbus.fi>");
+        // RFC 5322 comments (including the nested-paren MAINTAINERS-style
+        // one) must be stripped from the parsed addresses.
+        for addr in &mail.cc_addrs {
+            assert!(!addr.contains("(open list"), "comment leaked: {addr}");
+            assert!(!addr.contains("__counted_by"), "comment leaked: {addr}");
+        }
+        assert!(mail.cc_addrs.contains(&"linux-kernel@vger.kernel.org".to_string()));
+        assert!(mail.cc_addrs.contains(&"linux-hardening@vger.kernel.org".to_string()));
+    }
+
+    #[test]
+    fn strips_nested_comments() {
+        assert_eq!(
+            strip_rfc5322_comments("a@b.com (foo (bar) baz), c@d.com"),
+            "a@b.com , c@d.com"
+        );
+        assert_eq!(
+            strip_rfc5322_comments(r#""quoted (not comment)" <a@b.com>"#),
+            r#""quoted (not comment)" <a@b.com>"#
+        );
     }
 
     #[test]

@@ -14,8 +14,25 @@ const APP_ID: &str = "moe.nikableh.Koshi";
 
 fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
+    app.connect_startup(|_| load_css());
     app.connect_activate(build_ui);
     app.run()
+}
+
+// The single user-approved custom-CSS exception: compact address chips.
+// Everything else must stay stock Adwaita.
+fn load_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(
+        "button.address-chip { min-height: 0; padding: 5px 8px; border-radius: 9999px; }",
+    );
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 }
 
 fn build_ui(app: &adw::Application) {

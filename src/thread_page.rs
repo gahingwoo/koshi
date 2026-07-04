@@ -207,9 +207,11 @@ fn build_row(
     name: &str,
     value: &impl IsA<gtk::Widget>,
     title_valign: gtk::Align,
-    title_margin_top: i32,
     titles: &gtk::SizeGroup,
 ) -> gtk::ListBoxRow {
+    // Top-aligned titles (wrapping chip rows) get nudged onto the first
+    // value line; centered ones need no offset.
+    let title_margin_top = if title_valign == gtk::Align::Start { 6 } else { 0 };
     let title = gtk::Label::builder()
         .label(name)
         .halign(gtk::Align::Start)
@@ -250,7 +252,7 @@ fn build_text_row(name: &str, value: &str, titles: &gtk::SizeGroup) -> gtk::List
         .xalign(0.0)
         .css_classes(["caption", "dim-label"])
         .build();
-    build_row(name, &label, gtk::Align::Center, 0, titles)
+    build_row(name, &label, gtk::Align::Center, titles)
 }
 
 /// Address rows show parsed pills; if parsing produced nothing but the raw
@@ -274,8 +276,16 @@ fn build_address_row(
         wrap.append(&build_address_pill(addr, overlay));
     }
 
-    // A small top margin baseline-aligns the title with the first chip line.
-    build_row(name, &wrap, gtk::Align::Start, 6, titles)
+    let row = build_row(name, &wrap, gtk::Align::Start, titles);
+    // Nudge the title down so it baseline-aligns with the first chip line.
+    if let Some(title) = wrap
+        .parent()
+        .and_downcast::<gtk::Box>()
+        .and_then(|content| content.first_child())
+    {
+        title.set_margin_top(6);
+    }
+    row
 }
 
 fn build_address_pill(addr: &str, overlay: &adw::ToastOverlay) -> gtk::Button {
@@ -288,6 +298,7 @@ fn build_address_pill(addr: &str, overlay: &adw::ToastOverlay) -> gtk::Button {
     let button = gtk::Button::builder()
         .child(&label)
         .valign(gtk::Align::Center)
+        .css_classes(["address-chip"])
         .build();
 
     let addr = addr.to_string();

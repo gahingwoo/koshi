@@ -214,7 +214,10 @@ fn build_address_or_header_row(
 
 fn build_header_row(name: &str, value: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(format!("<b>{}</b>", glib::markup_escape_text(name)))
+        .title(format!(
+            "<span size=\"small\" weight=\"bold\">{}</span>",
+            glib::markup_escape_text(name)
+        ))
         .subtitle(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
         .subtitle_lines(0)
         .activatable(false)
@@ -239,8 +242,8 @@ fn build_address_row(
 
     let title = gtk::Label::builder()
         .halign(gtk::Align::Start)
-        .use_markup(true)
-        .label(format!("<b>{}</b>", glib::markup_escape_text(name)))
+        .label(name)
+        .css_classes(["caption-heading"])
         .build();
     content.append(&title);
 
@@ -269,7 +272,7 @@ fn build_address_pill(addr: &str, overlay: &adw::ToastOverlay) -> gtk::Button {
 
     let button = gtk::Button::builder()
         .child(&label)
-        .css_classes(["pill", "caption"])
+        .css_classes(["caption", "monospace"])
         .valign(gtk::Align::Center)
         .tooltip_text(addr)
         .build();

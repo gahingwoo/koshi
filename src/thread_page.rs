@@ -187,74 +187,50 @@ fn build_header_list(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ListBox {
         .css_classes(["boxed-list"])
         .build();
 
-    list.append(&build_header_row("Author", &mail.from));
-    list.append(&build_address_or_header_row("To", &mail.to, &mail.to_addrs, overlay));
+    // Gives every field-name label the same width so the values line up in
+    // a single column; wrapped value lines then stay indented at that column.
+    let titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+
+    list.append(&build_text_row("Author", &mail.from, &titles));
+    list.append(&build_address_row("To", &mail.to, &mail.to_addrs, overlay, &titles));
     if let Some(cc) = &mail.cc {
-        list.append(&build_address_or_header_row("Cc", cc, &mail.cc_addrs, overlay));
+        list.append(&build_address_row("Cc", cc, &mail.cc_addrs, overlay, &titles));
     }
-    list.append(&build_header_row("Date", &mail.date));
+    list.append(&build_text_row("Date", &mail.date, &titles));
 
     list
 }
 
-/// Address rows show parsed pills; if parsing produced nothing but the raw
-/// header exists, fall back to a plain header row so the value isn't lost.
-fn build_address_or_header_row(
+/// A non-activatable row laying the field name and its value out on one
+/// line: [title | value], with the title column width shared via `titles`.
+fn build_row(
     name: &str,
-    raw: &str,
-    addrs: &[String],
-    overlay: &adw::ToastOverlay,
-) -> gtk::Widget {
-    if addrs.is_empty() {
-        build_header_row(name, raw).upcast()
-    } else {
-        build_address_row(name, addrs, overlay).upcast()
-    }
-}
-
-fn build_header_row(name: &str, value: &str) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(format!(
-            "<span size=\"small\" weight=\"bold\">{}</span>",
-            glib::markup_escape_text(name)
-        ))
-        .subtitle(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
-        .subtitle_lines(0)
-        .activatable(false)
-        .build();
-    row.set_subtitle_selectable(true);
-    row
-}
-
-fn build_address_row(
-    name: &str,
-    addrs: &[String],
-    overlay: &adw::ToastOverlay,
+    value: &impl IsA<gtk::Widget>,
+    title_valign: gtk::Align,
+    title_margin_top: i32,
+    titles: &gtk::SizeGroup,
 ) -> gtk::ListBoxRow {
+    let title = gtk::Label::builder()
+        .label(name)
+        .halign(gtk::Align::Start)
+        .valign(title_valign)
+        .margin_top(title_margin_top)
+        .xalign(0.0)
+        .css_classes(["caption-heading"])
+        .build();
+    titles.add_widget(&title);
+
     let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
+        .orientation(gtk::Orientation::Horizontal)
         .margin_top(12)
         .margin_bottom(12)
         .margin_start(12)
         .margin_end(12)
-        .spacing(6)
-        .build();
-
-    let title = gtk::Label::builder()
-        .halign(gtk::Align::Start)
-        .label(name)
-        .css_classes(["caption-heading"])
+        .spacing(12)
         .build();
     content.append(&title);
-
-    let wrap = adw::WrapBox::builder()
-        .child_spacing(6)
-        .line_spacing(6)
-        .build();
-    for addr in addrs {
-        wrap.append(&build_address_pill(addr, overlay));
-    }
-    content.append(&wrap);
+    content.append(value);
+    value.set_hexpand(true);
 
     gtk::ListBoxRow::builder()
         .activatable(false)
@@ -263,19 +239,55 @@ fn build_address_row(
         .build()
 }
 
+fn build_text_row(name: &str, value: &str, titles: &gtk::SizeGroup) -> gtk::ListBoxRow {
+    let label = gtk::Label::builder()
+        .use_markup(true)
+        .label(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
+        .selectable(true)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    build_row(name, &label, gtk::Align::Center, 0, titles)
+}
+
+/// Address rows show parsed pills; if parsing produced nothing but the raw
+/// header exists, fall back to a plain text row so the value isn't lost.
+fn build_address_row(
+    name: &str,
+    raw: &str,
+    addrs: &[String],
+    overlay: &adw::ToastOverlay,
+    titles: &gtk::SizeGroup,
+) -> gtk::ListBoxRow {
+    if addrs.is_empty() {
+        return build_text_row(name, raw, titles);
+    }
+
+    let wrap = adw::WrapBox::builder()
+        .child_spacing(6)
+        .line_spacing(6)
+        .build();
+    for addr in addrs {
+        wrap.append(&build_address_pill(addr, overlay));
+    }
+
+    // A small top margin baseline-aligns the title with the first chip line.
+    build_row(name, &wrap, gtk::Align::Start, 6, titles)
+}
+
 fn build_address_pill(addr: &str, overlay: &adw::ToastOverlay) -> gtk::Button {
     let label = gtk::Label::builder()
         .use_markup(true)
         .label(format!("<tt>{}</tt>", glib::markup_escape_text(addr)))
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .max_width_chars(48)
         .css_classes(["caption"])
         .build();
 
     let button = gtk::Button::builder()
         .child(&label)
         .valign(gtk::Align::Center)
-        .tooltip_text(addr)
         .build();
 
     let addr = addr.to_string();

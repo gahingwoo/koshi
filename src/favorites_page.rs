@@ -16,14 +16,20 @@ pub const FAVORITES_PAGE_NAME: &str = "koshi-favorites-page";
 pub fn build_favorites_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     let favorites = favorites::all();
 
-    let list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build();
-
-    if favorites.is_empty() {
-        list.append(&build_empty_row());
+    // HIG placeholder-page pattern: an empty view gets a symbolic
+    // AdwStatusPage instead of an empty list.
+    let page = if favorites.is_empty() {
+        let status = adw::StatusPage::builder()
+            .icon_name("non-starred-symbolic")
+            .title("No Favorites")
+            .description("Star a message to add it here")
+            .build();
+        adw::NavigationPage::new(&status, FAVORITES_TITLE)
     } else {
+        let list = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .css_classes(["boxed-list"])
+            .build();
         for fav in &favorites {
             list.append(&build_favorite_row(fav));
         }
@@ -36,33 +42,17 @@ pub fn build_favorites_page(nav: &adw::NavigationView) -> adw::NavigationPage {
                 nav.push(&build_thread_page(&nav));
             }
         ));
-    }
 
-    let page = build_list_page(
-        FAVORITES_TITLE,
-        FAVORITES_TITLE,
-        "Starred messages",
-        &[],
-        &list,
-    );
+        build_list_page(
+            FAVORITES_TITLE,
+            FAVORITES_TITLE,
+            "Starred messages",
+            &[],
+            &list,
+        )
+    };
     page.set_widget_name(FAVORITES_PAGE_NAME);
     page
-}
-
-fn build_empty_row() -> gtk::ListBoxRow {
-    let label = gtk::Label::builder()
-        .label("No favorites yet")
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .css_classes(["dim-label"])
-        .build();
-    gtk::ListBoxRow::builder()
-        .activatable(false)
-        .selectable(false)
-        .child(&label)
-        .build()
 }
 
 fn build_favorite_row(fav: &Favorite) -> adw::ActionRow {

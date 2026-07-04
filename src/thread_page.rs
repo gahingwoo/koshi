@@ -231,7 +231,7 @@ fn build_body_view(
     mail: &Mail,
     nav: &adw::NavigationView,
     overlay: &adw::ToastOverlay,
-) -> gtk::Box {
+) -> adw::Bin {
     let view = gtk::TextView::builder()
         .editable(false)
         .cursor_visible(false)
@@ -322,8 +322,7 @@ fn build_body_view(
         .propagate_natural_height(true)
         .build();
 
-    let wrapper = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    wrapper.append(&hscroll);
+    let wrapper = adw::Bin::builder().child(&hscroll).build();
 
     let group = gio::SimpleActionGroup::new();
     group.add_action(&quote);
@@ -342,7 +341,7 @@ fn build_body_view(
 
 // GTK only appends extra-menu items after the built-in ones, so to put the
 // quote items first the context menu is replaced wholesale.
-fn setup_context_menu(view: &gtk::TextView, wrapper: &gtk::Box) {
+fn setup_context_menu(view: &gtk::TextView, wrapper: &adw::Bin) {
     let quote_section = gio::Menu::new();
     quote_section.append(Some("_Quote Selection"), Some("mailview.quote-selection"));
     quote_section.append(Some("Quote With _Date"), Some("mailview.quote-with-date"));

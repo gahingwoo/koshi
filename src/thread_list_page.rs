@@ -166,12 +166,7 @@ fn build_thread_list(nav: &adw::NavigationView) -> gtk::ListBox {
         .build();
 
     for thread in PLACEHOLDER_THREADS {
-        list.append(
-            &gtk::ListBoxRow::builder()
-                .activatable(true)
-                .child(&build_thread_row(thread))
-                .build(),
-        );
+        list.append(&build_thread_row(thread));
     }
 
     list.connect_row_activated(glib::clone!(
@@ -185,45 +180,27 @@ fn build_thread_list(nav: &adw::NavigationView) -> gtk::ListBox {
     list
 }
 
-fn build_thread_row(thread: &Thread) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(12)
-        .margin_top(8)
-        .margin_bottom(8)
-        .margin_start(12)
-        .margin_end(12)
+fn build_thread_row(thread: &Thread) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(thread.subject))
+        .title_lines(1)
+        .activatable(true)
         .build();
 
-    let subjects = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(3)
-        .hexpand(true)
-        .build();
-    subjects.append(
-        &gtk::Label::builder()
-            .label(thread.subject)
-            .halign(gtk::Align::Start)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .build(),
-    );
-    for child in thread.children {
-        subjects.append(
-            &gtk::Label::builder()
-                .label(format!("└ {child}"))
-                .halign(gtk::Align::Start)
-                .margin_start(12)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["dim-label"])
-                .build(),
-        );
+    if !thread.children.is_empty() {
+        let subtitle = thread
+            .children
+            .iter()
+            .map(|child| format!("└ {child}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        row.set_subtitle(&glib::markup_escape_text(&subtitle));
+        row.set_subtitle_lines(0);
     }
-    row.append(&subjects);
 
     let timestamp = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
         .build();
     timestamp.append(
         &gtk::Label::builder()
@@ -239,7 +216,7 @@ fn build_thread_row(thread: &Thread) -> gtk::Box {
             .css_classes(["numeric", "caption", "dim-label"])
             .build(),
     );
-    row.append(&timestamp);
+    row.add_suffix(&timestamp);
 
     row
 }

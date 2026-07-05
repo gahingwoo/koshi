@@ -159,6 +159,9 @@ fn build_thread_list(
 ) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
+        // The list sits inside a vexpanding stack; without this it stretches
+        // and the boxed-list shadow outlines the empty space below the rows.
+        .valign(gtk::Align::Start)
         .css_classes(["boxed-list"])
         .build();
 

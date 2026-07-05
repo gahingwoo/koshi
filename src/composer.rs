@@ -12,6 +12,7 @@ const WRAP_WIDTH: usize = 72;
 const TRAILERS: [&str; 4] = ["Reviewed-by", "Acked-by", "Tested-by", "Signed-off-by"];
 
 /// Prefill data for a reply, derived from the mail being viewed.
+#[derive(Clone)]
 pub struct ReplyContext {
     pub to: String,
     pub cc: String,
@@ -28,7 +29,9 @@ struct ComposerState {
     cc: gtk::EntryBuffer,
     in_reply_to: gtk::EntryBuffer,
     body: gtk::TextBuffer,
-    initial: Rc<ReplyContext>,
+    // The context the composer resets against; a cell because a per-mail
+    // Reply button can retarget the whole composer at another message.
+    initial: Rc<RefCell<ReplyContext>>,
 }
 
 impl ComposerState {
@@ -41,7 +44,7 @@ impl ComposerState {
             cc: gtk::EntryBuffer::new(Some(&reply.cc)),
             in_reply_to: gtk::EntryBuffer::new(Some(&reply.in_reply_to)),
             body,
-            initial: Rc::new(reply),
+            initial: Rc::new(RefCell::new(reply)),
         }
     }
 
@@ -61,11 +64,29 @@ impl ComposerState {
     }
 
     fn reset(&self) {
-        self.subject.set_text(&self.initial.subject);
-        self.to.set_text(&self.initial.to);
-        self.cc.set_text(&self.initial.cc);
-        self.in_reply_to.set_text(&self.initial.in_reply_to);
+        let initial = self.initial.borrow();
+        self.subject.set_text(&initial.subject);
+        self.to.set_text(&initial.to);
+        self.cc.set_text(&initial.cc);
+        self.in_reply_to.set_text(&initial.in_reply_to);
         self.body.set_text("");
+    }
+
+    /// Swap in a new reply target: the header fields follow the new context
+    /// (and the subject revert icon and Discard now reset against it), but
+    /// any body text already typed is deliberately kept.
+    fn retarget(&self, reply: ReplyContext) {
+        // The context goes in first so the entry change handlers (the
+        // subject revert icon) compare against the new target, and the
+        // subject is cleared before being set so a change always fires
+        // even when the old draft already carried the new subject.
+        self.initial.replace(reply);
+        let initial = self.initial.borrow();
+        self.subject.set_text("");
+        self.subject.set_text(&initial.subject);
+        self.to.set_text(&initial.to);
+        self.cc.set_text(&initial.cc);
+        self.in_reply_to.set_text(&initial.in_reply_to);
     }
 }
 
@@ -88,8 +109,8 @@ fn strip_extra_context_items(widget: &impl IsA<gtk::Widget>) {
 }
 
 /// Show a revert icon in a subject entry whenever its text differs from the
-/// initial prefilled reply subject; clicking the icon restores it.
-fn setup_subject_revert(entry: &gtk::Entry, initial: &Rc<ReplyContext>) {
+/// prefilled reply subject; clicking the icon restores it.
+fn setup_subject_revert(entry: &gtk::Entry, initial: &Rc<RefCell<ReplyContext>>) {
     let initial = initial.clone();
 
     entry.set_secondary_icon_activatable(true);
@@ -99,7 +120,7 @@ fn setup_subject_revert(entry: &gtk::Entry, initial: &Rc<ReplyContext>) {
         #[strong]
         initial,
         move |entry: &gtk::Entry| {
-            let modified = entry.text() != initial.subject;
+            let modified = entry.text() != initial.borrow().subject;
             entry.set_secondary_icon_name(modified.then_some("edit-undo-symbolic"));
         }
     );
@@ -108,7 +129,8 @@ fn setup_subject_revert(entry: &gtk::Entry, initial: &Rc<ReplyContext>) {
 
     entry.connect_icon_release(move |entry, position| {
         if position == gtk::EntryIconPosition::Secondary {
-            entry.set_text(&initial.subject);
+            let subject = initial.borrow().subject.clone();
+            entry.set_text(&subject);
         }
     });
 }
@@ -209,9 +231,39 @@ fn assemble_raw(to: &str, cc: &str, subject: &str, in_reply_to: &str, body: &str
     raw
 }
 
+/// A handle to a built composer: the clamped widget to insert into the
+/// page, plus the hooks a per-mail Reply button needs to retarget the
+/// draft at another message in the thread.
+#[derive(Clone)]
+pub struct Composer {
+    widget: adw::Clamp,
+    state: ComposerState,
+    expander: adw::ExpanderRow,
+    body_view: gtk::TextView,
+    preview_toggle: gtk::ToggleButton,
+}
+
+impl Composer {
+    pub fn widget(&self) -> &adw::Clamp {
+        &self.widget
+    }
+
+    /// Point the composer at `reply`: headers and the reset baseline follow
+    /// the new context, typed body text is kept, and the expanded editor is
+    /// shown and focused.
+    pub fn start_reply(&self, reply: ReplyContext) {
+        self.state.retarget(reply);
+        self.expander.set_expanded(true);
+        // Leave an active Raw Preview: replying means editing, and the
+        // focus grab below only lands once the editor page is mapped.
+        self.preview_toggle.set_active(false);
+        self.body_view.grab_focus();
+    }
+}
+
 /// Build the sticky reply composer, clamped to the same width as the mail
 /// page content so the two columns align.
-pub fn build_composer(reply: ReplyContext) -> adw::Clamp {
+pub fn build_composer(reply: ReplyContext) -> Composer {
     let state = ComposerState::new(reply);
 
     let subject_entry = gtk::Entry::builder()
@@ -222,9 +274,13 @@ pub fn build_composer(reply: ReplyContext) -> adw::Clamp {
     strip_extra_context_items(&subject_entry);
     setup_subject_revert(&subject_entry, &state.initial);
 
+    // One title column shared by the Subject label and the headers grid,
+    // so all four entries start at the same x when Details is open.
+    let titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+
     let revealer = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideDown)
-        .child(&build_headers_grid(&state))
+        .child(&build_headers_grid(&state, &titles))
         .build();
 
     let details_toggle = gtk::ToggleButton::builder()
@@ -254,8 +310,8 @@ pub fn build_composer(reply: ReplyContext) -> adw::Clamp {
     let preview_scrolled = gtk::ScrolledWindow::builder()
         .child(&preview_view)
         .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .min_content_height(90)
-        .max_content_height(200)
+        .min_content_height(300)
+        .max_content_height(560)
         .propagate_natural_height(true)
         .build();
 
@@ -325,73 +381,105 @@ pub fn build_composer(reply: ReplyContext) -> adw::Clamp {
         .margin_end(12)
         .build();
 
-    // Collapsed <-> expanded composer. The page opens with an empty draft,
-    // so it starts on the compact affordance row; Discard returns to it.
-    let outer_stack = gtk::Stack::builder()
-        .transition_type(gtk::StackTransitionType::Crossfade)
-        .vhomogeneous(false)
-        .build();
+    // The composer collapses into a single "Reply" expander row; expanding
+    // it reveals the editor and Discard folds it back shut. The row lives
+    // in its own boxed-list ListBox because an ExpanderRow needs a list
+    // around it for its .card styling and click handling.
+    let expander = adw::ExpanderRow::builder().title("Reply").build();
+    expander.add_prefix(&gtk::Image::from_icon_name("mail-reply-sender-symbolic"));
 
-    let header_strip = gtk::Box::builder()
+    // The subject row is a one-row grid sharing the headers grid's column
+    // spacing, with its label in the same SizeGroup: the label column and
+    // the entry's left edge then match the To/Cc/In-Reply-To rows exactly.
+    let subject_label = build_field_label("Subject");
+    titles.add_widget(&subject_label);
+    let subject_grid = gtk::Grid::builder().column_spacing(12).build();
+    subject_grid.attach(&subject_label, 0, 0, 1, 1);
+    subject_grid.attach(&subject_entry, 1, 0, 1, 1);
+
+    let toolbar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
+        .margin_start(6)
         .build();
-    header_strip.append(&subject_entry);
-    header_strip.append(&details_toggle);
-    header_strip.append(&build_trailer_button(&state, &root));
-    header_strip.append(&build_rewrap_button(&state));
-    header_strip.append(&preview_toggle);
-    header_strip.append(&build_fullscreen_toggle(&state));
-    header_strip.append(&build_discard_button(
+    toolbar.append(&details_toggle);
+    toolbar.append(&build_trailer_button(&state, &root));
+    toolbar.append(&build_rewrap_button(&state));
+    toolbar.append(&preview_toggle);
+    toolbar.append(&build_fullscreen_toggle(&state));
+    toolbar.append(&build_discard_button(
         &state,
         &details_toggle,
         &preview_toggle,
-        &outer_stack,
+        &expander,
     ));
+    subject_grid.attach(&toolbar, 2, 0, 1, 1);
 
-    root.append(&header_strip);
+    root.append(&subject_grid);
     root.append(&revealer);
     root.append(&stack);
 
-    let collapsed_content = adw::ButtonContent::builder()
-        .icon_name("mail-reply-sender-symbolic")
-        .label("Reply")
-        .halign(gtk::Align::Start)
+    // Wrap the content in an explicit non-activatable row: add_row would
+    // otherwise auto-wrap the box in a default GtkListBoxRow, giving the
+    // whole editor list-row hover and press styling.
+    let content_row = gtk::ListBoxRow::builder()
+        .activatable(false)
+        .selectable(false)
+        .child(&root)
         .build();
-    let collapsed_button = gtk::Button::builder()
-        .child(&collapsed_content)
-        .hexpand(true)
+    expander.add_row(&content_row);
+    // Focus the body whenever the row is expanded by hand, mirroring what
+    // start_reply does for the per-mail Reply buttons.
+    expander.connect_expanded_notify(glib::clone!(
+        #[weak]
+        body_view,
+        move |expander| {
+            if expander.is_expanded() {
+                body_view.grab_focus();
+            }
+        }
+    ));
+
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
         .margin_top(6)
         .margin_bottom(6)
         .margin_start(12)
         .margin_end(12)
-        .css_classes(["flat"])
+        .css_classes(["boxed-list"])
         .build();
-    collapsed_button.connect_clicked(glib::clone!(
-        #[weak]
-        outer_stack,
-        #[weak]
-        body_view,
-        move |_| {
-            outer_stack.set_visible_child_name("expanded");
-            body_view.grab_focus();
-        }
-    ));
+    list.append(&expander);
 
-    outer_stack.add_named(&collapsed_button, Some("collapsed"));
-    outer_stack.add_named(&root, Some("expanded"));
-    outer_stack.set_visible_child_name("collapsed");
-
-    adw::Clamp::builder()
+    let widget = adw::Clamp::builder()
         .maximum_size(1100)
         .tightening_threshold(800)
-        .child(&outer_stack)
+        .child(&list)
+        .build();
+
+    Composer {
+        widget,
+        state,
+        expander,
+        body_view,
+        preview_toggle,
+    }
+}
+
+/// A caption-heading field-name label, shared by the headers grid and the
+/// subject rows so every field title looks the same.
+fn build_field_label(name: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(name)
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .css_classes(["caption-heading"])
         .build()
 }
 
 /// To / Cc / In-Reply-To rows, shared by the revealer and the fullscreen
-/// dialog through the state's EntryBuffers.
-fn build_headers_grid(state: &ComposerState) -> gtk::Grid {
+/// dialog through the state's EntryBuffers. The field labels join `titles`
+/// so the entry column lines up with the caller's subject row.
+fn build_headers_grid(state: &ComposerState, titles: &gtk::SizeGroup) -> gtk::Grid {
     let grid = gtk::Grid::builder()
         .column_spacing(12)
         .row_spacing(6)
@@ -403,12 +491,8 @@ fn build_headers_grid(state: &ComposerState) -> gtk::Grid {
         ("In-Reply-To", &state.in_reply_to),
     ];
     for (row, (name, buffer)) in fields.into_iter().enumerate() {
-        let label = gtk::Label::builder()
-            .label(name)
-            .halign(gtk::Align::Start)
-            .xalign(0.0)
-            .css_classes(["caption-heading"])
-            .build();
+        let label = build_field_label(name);
+        titles.add_widget(&label);
         let entry = gtk::Entry::builder().buffer(buffer).hexpand(true).build();
         strip_extra_context_items(&entry);
         grid.attach(&label, 0, row as i32, 1, 1);
@@ -438,8 +522,8 @@ fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> (gtk::Overlay, 
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .build();
     if compact {
-        scrolled.set_min_content_height(90);
-        scrolled.set_max_content_height(200);
+        scrolled.set_min_content_height(300);
+        scrolled.set_max_content_height(560);
         scrolled.set_propagate_natural_height(true);
     } else {
         scrolled.set_vexpand(true);
@@ -593,6 +677,20 @@ fn build_fullscreen_dialog(state: &ComposerState) -> adw::Dialog {
     strip_extra_context_items(&subject_entry);
     setup_subject_revert(&subject_entry, &state.initial);
 
+    // Same title-column trick as the compact composer: the Subject label
+    // shares a SizeGroup with the grid labels so the entries align. The
+    // row spacing already matches the grid's column spacing (12).
+    let titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    let subject_label = build_field_label("Subject");
+    titles.add_widget(&subject_label);
+
+    let subject_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .build();
+    subject_row.append(&subject_label);
+    subject_row.append(&subject_entry);
+
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -601,8 +699,8 @@ fn build_fullscreen_dialog(state: &ComposerState) -> adw::Dialog {
         .margin_start(12)
         .margin_end(12)
         .build();
-    content.append(&subject_entry);
-    content.append(&build_headers_grid(state));
+    content.append(&subject_row);
+    content.append(&build_headers_grid(state, &titles));
     content.append(&build_body_editor(&state.body, false).0);
 
     let clamp = adw::Clamp::builder()
@@ -627,7 +725,7 @@ fn build_discard_button(
     state: &ComposerState,
     details_toggle: &gtk::ToggleButton,
     preview_toggle: &gtk::ToggleButton,
-    outer_stack: &gtk::Stack,
+    expander: &adw::ExpanderRow,
 ) -> gtk::Button {
     let button = gtk::Button::builder()
         .icon_name("user-trash-symbolic")
@@ -643,7 +741,7 @@ fn build_discard_button(
         #[weak]
         preview_toggle,
         #[weak]
-        outer_stack,
+        expander,
         move |button| {
             let dialog = adw::AlertDialog::new(
                 Some("Discard Draft?"),
@@ -663,12 +761,12 @@ fn build_discard_button(
                     #[weak]
                     preview_toggle,
                     #[weak]
-                    outer_stack,
+                    expander,
                     move |_, _| {
                         state.reset();
                         details_toggle.set_active(false);
                         preview_toggle.set_active(false);
-                        outer_stack.set_visible_child_name("collapsed");
+                        expander.set_expanded(false);
                     }
                 ),
             );

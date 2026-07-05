@@ -5,7 +5,7 @@ use mailparse::MailHeaderMap;
 use crate::composer;
 use crate::favorites::{self, Favorite};
 
-const RAW_MAIL: &str = include_str!("../data/sample-mail.txt");
+const RAW_THREAD: &str = include_str!("../data/sample-thread.mbox");
 
 struct Mail {
     subject: String,
@@ -16,20 +16,64 @@ struct Mail {
     cc_addrs: Vec<String>,
     date: String,
     message_id: Option<String>,
+    in_reply_to: Option<String>,
     body: String,
+    /// The message's raw RFC 5322 text (without the mbox "From " line),
+    /// shown by the per-mail Raw view.
+    raw: String,
 }
 
-fn parse_sample_mail() -> Mail {
-    // Skip the mbox "From " separator line, which is not an RFC 5322 header.
-    let raw = if RAW_MAIL.starts_with("From ") {
-        match RAW_MAIL.split_once('\n') {
-            Some((_, rest)) => rest,
-            None => RAW_MAIL,
-        }
-    } else {
-        RAW_MAIL
-    };
+/// Parse the placeholder mboxrd thread into its messages, in file order.
+/// mboxrd ">From " escaping is undone on the raw message text before MIME
+/// parsing: the mbox writer escapes raw file lines, so unescaping must
+/// happen before any Content-Transfer-Encoding decoding, not after.
+fn parse_thread() -> Vec<Mail> {
+    split_mbox(RAW_THREAD)
+        .iter()
+        .map(|raw| parse_message(&unescape_mboxrd(raw)))
+        .collect()
+}
 
+/// Split an mboxrd file into raw messages on its "From " separator lines.
+/// Body lines starting with "From " are ">"-escaped in mboxrd, so a line
+/// beginning "From " at column zero is always a separator. The separator
+/// lines themselves are dropped; anything before the first one is too.
+fn split_mbox(mbox: &str) -> Vec<String> {
+    let mut messages: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in mbox.lines() {
+        if line.starts_with("From ") {
+            messages.extend(current.take());
+            current = Some(String::new());
+        } else if let Some(message) = current.as_mut() {
+            message.push_str(line);
+            message.push('\n');
+        }
+    }
+    messages.extend(current);
+    messages
+}
+
+/// Undo mboxrd body escaping: any line of one-or-more '>' followed by
+/// "From " loses one leading '>'.
+fn unescape_mboxrd(body: &str) -> String {
+    let mut out = String::new();
+    for line in body.lines() {
+        let quoted = line.trim_start_matches('>');
+        if quoted.starts_with("From ") && quoted.len() < line.len() {
+            out.push_str(&line[1..]);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !body.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn parse_message(raw: &str) -> Mail {
     let unknown = || "(unknown)".to_string();
     let Ok(parsed) = mailparse::parse_mail(raw.as_bytes()) else {
         return Mail {
@@ -41,7 +85,9 @@ fn parse_sample_mail() -> Mail {
             cc_addrs: Vec::new(),
             date: unknown(),
             message_id: None,
+            in_reply_to: None,
             body: String::new(),
+            raw: raw.to_string(),
         };
     };
 
@@ -64,7 +110,9 @@ fn parse_sample_mail() -> Mail {
         cc_addrs: addrs("Cc"),
         date: header("Date").unwrap_or_else(unknown),
         message_id: header("Message-ID"),
-        body,
+        in_reply_to: header("In-Reply-To"),
+        body: format!("{}\n", body.trim_end()),
+        raw: raw.to_string(),
     }
 }
 
@@ -147,26 +195,39 @@ fn find_text_body(part: &mailparse::ParsedMail) -> Option<String> {
 }
 
 pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
-    let mail = parse_sample_mail();
+    let thread = parse_thread();
+    let op = &thread[0];
 
     let overlay = adw::ToastOverlay::new();
+    // The composer opens targeting the OP; each mail's Reply button can
+    // retarget it later.
+    let composer = composer::build_composer(build_reply_context(op));
 
+    // Selectable but not focusable: see build_text_row for why.
     let title = gtk::Label::builder()
-        .label(&mail.subject)
+        .label(&op.subject)
         .halign(gtk::Align::Start)
         .hexpand(true)
+        .selectable(true)
+        .focusable(false)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .xalign(0.0)
         .css_classes(["title-2", "monospace"])
         .build();
 
+    // The OP's Reply button lives up here next to the star rather than in
+    // its header list, aligned with the title's first line like the star.
+    let op_reply = build_reply_button(op, &composer);
+    op_reply.set_valign(gtk::Align::Start);
+
     let title_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
     title_row.append(&title);
-    title_row.append(&build_star_button(&mail, &overlay));
+    title_row.append(&build_star_button(op, &overlay));
+    title_row.append(&op_reply);
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -174,11 +235,16 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .margin_bottom(36)
         .margin_start(12)
         .margin_end(12)
-        .spacing(12)
+        .spacing(24)
         .build();
     content.append(&title_row);
-    content.append(&build_header_list(&mail, &overlay));
-    content.append(&build_body_view(&mail, nav, &overlay));
+    // One title-column width shared by every card, so the header value
+    // columns line up across the whole stack, not just within one message.
+    let titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    for (index, mail) in thread.iter().enumerate() {
+        let is_op = index == 0;
+        content.append(&build_message_section(mail, is_op, nav, &overlay, &composer, &titles));
+    }
 
     let clamp = adw::Clamp::builder()
         .maximum_size(1100)
@@ -199,9 +265,27 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     page.append(&overlay);
     page.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    page.append(&composer::build_composer(build_reply_context(&mail)));
+    page.append(composer.widget());
 
-    adw::NavigationPage::new(&page, &mail.subject)
+    adw::NavigationPage::new(&page, &op.subject)
+}
+
+/// One message of the thread: its header list stacked over its body view.
+fn build_message_section(
+    mail: &Mail,
+    is_op: bool,
+    nav: &adw::NavigationView,
+    overlay: &adw::ToastOverlay,
+    composer: &composer::Composer,
+    titles: &gtk::SizeGroup,
+) -> gtk::Box {
+    let section = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .build();
+    section.append(&build_header_list(mail, is_op, overlay, composer, titles));
+    section.append(&build_body_view(mail, nav, overlay));
+    section
 }
 
 /// Reply prefill: To = the author, Cc = everyone else on the thread,
@@ -287,22 +371,68 @@ fn build_star_button(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ToggleBut
     button
 }
 
-fn build_header_list(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ListBox {
+/// A flat Reply icon button that retargets the composer to `mail`.
+fn build_reply_button(mail: &Mail, composer: &composer::Composer) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .icon_name("mail-reply-sender-symbolic")
+        .tooltip_text("Reply")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    let reply = build_reply_context(mail);
+    button.connect_clicked(glib::clone!(
+        #[strong]
+        composer,
+        move |_| composer.start_reply(reply.clone())
+    ));
+    button
+}
+
+fn build_header_list(
+    mail: &Mail,
+    is_op: bool,
+    overlay: &adw::ToastOverlay,
+    composer: &composer::Composer,
+    // Gives every field-name label the same width so the values line up in
+    // a single column; wrapped value lines then stay indented at that column.
+    titles: &gtk::SizeGroup,
+) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
 
-    // Gives every field-name label the same width so the values line up in
-    // a single column; wrapped value lines then stay indented at that column.
-    let titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
-
-    list.append(&build_text_row("Author", &mail.from, &titles));
-    list.append(&build_address_row("To", &mail.to, &mail.to_addrs, overlay, &titles));
-    if let Some(cc) = &mail.cc {
-        list.append(&build_address_row("Cc", cc, &mail.cc_addrs, overlay, &titles));
+    // A reply's Subject row doubles as its toolbar: the Reply button trails
+    // the hexpanding value label. The OP's subject already heads the page as
+    // its title, so its Subject row is omitted and its Reply button sits in
+    // the title row instead.
+    if !is_op {
+        let subject_row = build_text_row("Subject", &mail.subject, titles);
+        if let Some(content) = subject_row.child().and_downcast::<gtk::Box>() {
+            content.append(&build_reply_button(mail, composer));
+        }
+        list.append(&subject_row);
     }
-    list.append(&build_text_row("Date", &mail.date, &titles));
+
+    // The author stays on one line no matter how long the display name is.
+    list.append(&build_single_line_row("Author", &mail.from, titles));
+    list.append(&build_text_row("Date", &mail.date, titles));
+
+    // The remaining headers are collapsed by default: recipients are almost
+    // always the same as the OP's and the ids only matter for debugging, so
+    // the Message-Id/In-Reply-To/To/Cc rows only show up on request.
+    let details = adw::ExpanderRow::builder().title("Details").build();
+    if let Some(id) = &mail.message_id {
+        details.add_row(&build_text_row("Message-Id", id, titles));
+    }
+    if let Some(id) = &mail.in_reply_to {
+        details.add_row(&build_text_row("In-Reply-To", id, titles));
+    }
+    details.add_row(&build_address_row("To", &mail.to, &mail.to_addrs, overlay, titles));
+    if let Some(cc) = &mail.cc {
+        details.add_row(&build_address_row("Cc", cc, &mail.cc_addrs, overlay, titles));
+    }
+    list.append(&details);
 
     list
 }
@@ -324,7 +454,7 @@ fn build_row(
         .valign(title_valign)
         .margin_top(title_margin_top)
         .xalign(0.0)
-        .css_classes(["caption-heading"])
+        .css_classes(["heading"])
         .build();
     titles.add_widget(&title);
 
@@ -348,15 +478,42 @@ fn build_row(
 }
 
 fn build_text_row(name: &str, value: &str, titles: &gtk::SizeGroup) -> gtk::ListBoxRow {
+    // A wrapping label's natural width is far narrower than its full text,
+    // so it must fill its allocation (halign Fill, the default) — with
+    // halign Start it would shrink to that natural width and wrap long
+    // before running out of row space. xalign keeps the text left-aligned.
+    //
+    // Selectable labels are also made non-focusable: GtkLabel draws a text
+    // caret whenever a selectable label has key focus and its selection is
+    // empty (gtk_label_snapshot), and clicking a selectable label grabs
+    // focus — so a plain click leaves a caret behind. Refusing focus removes
+    // the caret; the click/drag selection gestures never check focus, so
+    // mouse selection and the context-menu Copy keep working.
     let label = gtk::Label::builder()
         .use_markup(true)
         .label(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
         .selectable(true)
+        .focusable(false)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .xalign(0.0)
+        .css_classes(["dim-label"])
+        .build();
+    build_row(name, &label, gtk::Align::Center, titles)
+}
+
+/// Like a text row, but the value never wraps: overlong values (author
+/// display names, long addresses) ellipsize instead of growing the row.
+fn build_single_line_row(name: &str, value: &str, titles: &gtk::SizeGroup) -> gtk::ListBoxRow {
+    let label = gtk::Label::builder()
+        .use_markup(true)
+        .label(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
+        .selectable(true)
+        .focusable(false)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .halign(gtk::Align::Start)
         .xalign(0.0)
-        .css_classes(["caption", "dim-label"])
+        .css_classes(["dim-label"])
         .build();
     build_row(name, &label, gtk::Align::Center, titles)
 }
@@ -424,8 +581,7 @@ fn build_mail_actions(
     mail: &Mail,
     view: &gtk::TextView,
     nav: &adw::NavigationView,
-    overlay: &adw::ToastOverlay,
-) -> [gio::SimpleAction; 4] {
+) -> [gio::SimpleAction; 2] {
     let open_web = gio::SimpleAction::new("open-web", None);
     let lore_url = mail.message_id.as_deref().map(|id| {
         let bare = id.trim().trim_start_matches('<').trim_end_matches('>');
@@ -442,68 +598,18 @@ fn build_mail_actions(
         }
     ));
 
-    let copy_id = gio::SimpleAction::new("copy-message-id", None);
-    let message_id = mail.message_id.clone();
-    copy_id.set_enabled(message_id.is_some());
-    copy_id.connect_activate(glib::clone!(
-        #[weak]
-        view,
-        #[weak]
-        overlay,
-        move |_, _| {
-            if let Some(id) = &message_id {
-                view.clipboard().set_text(id);
-                overlay.add_toast(adw::Toast::new("Message-ID copied"));
-            }
-        }
-    ));
-
     let raw = gio::SimpleAction::new("raw", None);
+    let raw_text = mail.raw.clone();
     raw.connect_activate(glib::clone!(
         #[weak]
         nav,
-        move |_, _| nav.push(&build_raw_page())
+        move |_, _| nav.push(&build_raw_page(&raw_text))
     ));
 
-    let reply = gio::SimpleAction::new("reply", None);
-    let mailto = build_reply_mailto(mail);
-    reply.connect_activate(glib::clone!(
-        #[weak]
-        view,
-        move |_, _| launch_uri(&view, &mailto)
-    ));
-
-    [open_web, copy_id, raw, reply]
+    [open_web, raw]
 }
 
-fn build_reply_mailto(mail: &Mail) -> String {
-    let escape = |s: &str| glib::Uri::escape_string(s, None, false);
-
-    let subject = if mail.subject.to_lowercase().starts_with("re:") {
-        mail.subject.clone()
-    } else {
-        format!("Re: {}", mail.subject)
-    };
-
-    let cc = match &mail.cc {
-        Some(cc) => format!("{}, {}", mail.to, cc),
-        None => mail.to.clone(),
-    };
-
-    let mut uri = format!(
-        "mailto:{}?cc={}&subject={}",
-        escape(&mail.from),
-        escape(&cc),
-        escape(&subject),
-    );
-    if let Some(id) = &mail.message_id {
-        uri.push_str("&In-Reply-To=");
-        uri.push_str(&escape(id));
-    }
-    uri
-}
-
-fn build_raw_page() -> adw::NavigationPage {
+fn build_raw_page(raw: &str) -> adw::NavigationPage {
     let view = gtk::TextView::builder()
         .editable(false)
         .cursor_visible(false)
@@ -513,7 +619,7 @@ fn build_raw_page() -> adw::NavigationPage {
         .top_margin(12)
         .bottom_margin(12)
         .build();
-    view.buffer().set_text(RAW_MAIL);
+    view.buffer().set_text(raw);
 
     let scrolled = gtk::ScrolledWindow::builder().child(&view).build();
     adw::NavigationPage::new(&scrolled, "Raw")
@@ -621,7 +727,7 @@ fn build_body_view(
     group.add_action(&quote_with_date);
     group.add_action(&copy);
     group.add_action(&select_all);
-    for action in build_mail_actions(mail, &view, nav, overlay) {
+    for action in build_mail_actions(mail, &view, nav) {
         group.add_action(&action);
     }
     wrapper.insert_action_group("mailview", Some(&group));
@@ -644,9 +750,7 @@ fn setup_context_menu(view: &gtk::TextView, wrapper: &adw::Bin) {
 
     let mail_section = gio::Menu::new();
     mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
-    mail_section.append(Some("Copy _Message-ID"), Some("mailview.copy-message-id"));
     mail_section.append(Some("View _Raw"), Some("mailview.raw"));
-    mail_section.append(Some("_Reply"), Some("mailview.reply"));
 
     let menu = gio::Menu::new();
     menu.append_section(None, &quote_section);
@@ -696,37 +800,119 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_sample_mail_headers() {
-        let mail = parse_sample_mail();
-        assert_eq!(mail.from, "Rosen Penev <rosenp@gmail.com>");
-        assert_eq!(mail.to, "linux-scsi@vger.kernel.org");
-        assert_eq!(mail.subject, "[PATCHv2] scsi: st: use kzalloc_array()");
+    fn parses_the_whole_thread() {
+        let thread = parse_thread();
+        assert_eq!(thread.len(), 8);
+
+        let op = &thread[0];
+        assert_eq!(op.from, "Linus Walleij <linusw@kernel.org>");
         assert_eq!(
-            mail.message_id.as_deref(),
-            Some("<20260703215345.253901-1-rosenp@gmail.com>")
+            op.subject,
+            "[PATCH] mfd: db8500-prcmu: Fold dbx500 header into db8500"
         );
-        // RFC 2047 encoded word must be decoded.
-        let cc = mail.cc.as_deref().unwrap();
-        assert!(cc.contains("Kai Mäkisara"), "Cc not decoded: {cc}");
-        assert!(!mail.body.is_empty());
-        assert!(mail.body.starts_with("Merge allocations"));
+        assert_eq!(
+            op.message_id.as_deref(),
+            Some("<20260619-mfd-prcmu-merge-headers-v1-1-8ea0ee23b4d6@kernel.org>")
+        );
+        assert!(op.body.starts_with("Move the DBx500 PRCMU definitions"));
+
+        // Every message keeps its own raw text (mbox From-line stripped)
+        // and a non-empty parsed body normalized to exactly one trailing
+        // newline.
+        for mail in &thread {
+            assert!(!mail.body.trim().is_empty(), "empty body for {}", mail.from);
+            assert_eq!(
+                mail.body,
+                format!("{}\n", mail.body.trim_end()),
+                "unnormalized body: {}",
+                mail.from
+            );
+            assert!(!mail.raw.starts_with("From "), "mbox line kept: {}", mail.from);
+            assert!(mail.raw.contains("Subject:"), "raw truncated: {}", mail.from);
+        }
+
+        // Quoted-printable reply bodies must come out decoded.
+        assert_eq!(thread[1].from, "sashiko-bot@kernel.org");
+        assert!(thread[1].body.contains("found 4 potential issue(s)"));
     }
 
     #[test]
-    fn parses_address_lists_cleanly() {
-        let mail = parse_sample_mail();
-        assert_eq!(mail.to_addrs, vec!["linux-scsi@vger.kernel.org"]);
+    fn parses_op_address_lists_cleanly() {
+        let thread = parse_thread();
+        let op = &thread[0];
+        assert_eq!(op.to_addrs.len(), 17, "To: {:?}", op.to_addrs);
+        assert_eq!(op.to_addrs[0], "Russell King <linux@armlinux.org.uk>");
+        assert_eq!(op.cc_addrs.len(), 7, "Cc: {:?}", op.cc_addrs);
+        assert!(op.cc_addrs.contains(&"kernel test robot <lkp@intel.com>".to_string()));
+        assert!(op.cc_addrs.contains(&"linux-clk@vger.kernel.org".to_string()));
+    }
 
-        assert_eq!(mail.cc_addrs.len(), 7, "Cc: {:?}", mail.cc_addrs);
-        assert_eq!(mail.cc_addrs[0], "Kai Mäkisara <Kai.Makisara@kolumbus.fi>");
-        // RFC 5322 comments (including the nested-paren MAINTAINERS-style
-        // one) must be stripped from the parsed addresses.
-        for addr in &mail.cc_addrs {
-            assert!(!addr.contains("(open list"), "comment leaked: {addr}");
-            assert!(!addr.contains("__counted_by"), "comment leaked: {addr}");
+    #[test]
+    fn reply_context_targets_the_clicked_message() {
+        let thread = parse_thread();
+        let reply = build_reply_context(&thread[1]);
+        assert_eq!(reply.to, "sashiko-bot@kernel.org");
+        assert!(reply.cc.contains("Linus Walleij <linusw@kernel.org>"));
+        assert!(reply.cc.contains("linux-watchdog@vger.kernel.org"));
+        assert_eq!(
+            reply.subject,
+            "Re: [PATCH] mfd: db8500-prcmu: Fold dbx500 header into db8500"
+        );
+        assert_eq!(
+            reply.in_reply_to,
+            "<20260619204041.040D71F000E9@smtp.kernel.org>"
+        );
+    }
+
+    #[test]
+    fn parses_in_reply_to_per_message() {
+        let thread = parse_thread();
+        // The OP starts the thread, so it has no In-Reply-To.
+        assert_eq!(thread[0].in_reply_to, None);
+        // Every reply carries one; most point at the OP directly.
+        for mail in &thread[1..] {
+            assert!(mail.in_reply_to.is_some(), "no In-Reply-To: {}", mail.from);
         }
-        assert!(mail.cc_addrs.contains(&"linux-kernel@vger.kernel.org".to_string()));
-        assert!(mail.cc_addrs.contains(&"linux-hardening@vger.kernel.org".to_string()));
+        assert_eq!(
+            thread[1].in_reply_to.as_deref(),
+            Some("<20260619-mfd-prcmu-merge-headers-v1-1-8ea0ee23b4d6@kernel.org>")
+        );
+    }
+
+    #[test]
+    fn splits_on_separator_lines_only() {
+        let mbox = "From a@b Thu Jan  1 00:00:00 1970\nSubject: x\n\n>From escaped\n\
+                    From c@d Thu Jan  1 00:00:00 1970\nSubject: y\n\nbody\n";
+        let messages = split_mbox(mbox);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].starts_with("Subject: x"));
+        assert!(messages[0].contains(">From escaped"));
+        assert!(messages[1].starts_with("Subject: y"));
+    }
+
+    #[test]
+    fn unescapes_mboxrd_from_lines() {
+        let body = ">From here\n>>From nested\n> From untouched\nno From here\n";
+        assert_eq!(
+            unescape_mboxrd(body),
+            "From here\n>From nested\n> From untouched\nno From here\n"
+        );
+        // Trailing-newline shape is preserved.
+        assert_eq!(unescape_mboxrd(">From x"), "From x");
+    }
+
+    #[test]
+    fn unescapes_raw_text_before_transfer_decoding() {
+        // Writer-escaped ">From " must lose its '>' before qp decoding,
+        // while a '>' the qp decoding itself produces ("=3EFrom") was never
+        // escaped by the writer and must survive untouched.
+        let raw = "Subject: qp\nContent-Transfer-Encoding: quoted-printable\n\n\
+                   >From escaped by the writer\n=3EFrom decoded, stays quoted\n";
+        // Compared line-wise: mailparse emits CRLF for decoded qp bodies.
+        let mail = parse_message(&unescape_mboxrd(raw));
+        let mut lines = mail.body.lines();
+        assert_eq!(lines.next(), Some("From escaped by the writer"));
+        assert_eq!(lines.next(), Some(">From decoded, stays quoted"));
     }
 
     #[test]
@@ -739,17 +925,5 @@ mod tests {
             strip_rfc5322_comments(r#""quoted (not comment)" <a@b.com>"#),
             r#""quoted (not comment)" <a@b.com>"#
         );
-    }
-
-    #[test]
-    fn reply_mailto_is_percent_encoded() {
-        let mail = parse_sample_mail();
-        let uri = build_reply_mailto(&mail);
-        assert!(uri.starts_with("mailto:Rosen%20Penev%20%3Crosenp%40gmail.com%3E?"));
-        assert!(uri.contains("subject=Re%3A%20%5BPATCHv2%5D"));
-        assert!(uri.contains("&In-Reply-To=%3C20260703215345.253901-1-rosenp%40gmail.com%3E"));
-        // Raw header-breaking characters must never appear unencoded.
-        let query = uri.split_once('?').unwrap().1;
-        assert!(!query.contains(['<', '>', ' ']));
     }
 }

@@ -1,6 +1,7 @@
 mod composer;
 mod favorites;
 mod favorites_page;
+mod highlight;
 mod inbox_page;
 mod list_page;
 mod thread_list_page;

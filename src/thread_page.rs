@@ -4,6 +4,7 @@ use mailparse::MailHeaderMap;
 
 use crate::composer;
 use crate::favorites::{self, Favorite};
+use crate::highlight;
 
 const RAW_THREAD: &str = include_str!("../data/sample-thread.mbox");
 
@@ -667,6 +668,8 @@ fn build_body_view(
         .bottom_margin(12)
         .build();
     view.buffer().set_text(&mail.body);
+    highlight::attach(&view.buffer());
+    highlight::refresh(&view.buffer());
 
     let insert_quoted = |prefix: Option<String>| {
         glib::clone!(

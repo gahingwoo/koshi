@@ -4,6 +4,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
+use crate::highlight;
+
 /// Placeholder identity until account support exists.
 const IDENTITY: &str = "nika <nika@nikableh.moe>";
 
@@ -397,6 +399,12 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         refresh_preview,
         move |_| refresh_preview()
     ));
+    // The fullscreen dialog shares this buffer, so highlighting attached
+    // here covers it too.
+    highlight::attach(&state.body);
+    highlight::refresh(&state.body);
+    state.body.connect_changed(highlight::refresh);
+
     for buffer in [&state.subject, &state.to, &state.cc, &state.in_reply_to] {
         buffer.connect_text_notify(glib::clone!(
             #[strong]

@@ -1,0 +1,620 @@
+//! Quote-depth and unified-diff highlighting for mail bodies and the
+//! composer. The classifier is pure so it can be unit-tested; the GTK glue
+//! applies its spans as text tags, which keeps us on stock Adwaita (colors
+//! come from tag properties, not CSS).
+
+use adw::prelude::*;
+use gtk::{gdk, glib};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Quote(usize),
+    DiffAdd,
+    DiffRemove,
+    DiffHunk,
+    DiffHeader,
+    DiffMeta,
+}
+
+/// One highlighted range: `start..end` are character offsets within `line`
+/// (TextBuffer iters count characters, not bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub kind: Kind,
+}
+
+/// Diff state machine. Diff mode is only entered on hard evidence (a
+/// "diff --git" header or a "--- "/"+++ " pair), so code-looking prose is
+/// never mis-tagged; anything malformed drops back to `None`.
+enum State {
+    None,
+    /// After a diff header, before the first hunk: meta lines are expected.
+    Preamble,
+    /// Inside a hunk with this many old/new lines still unaccounted for.
+    Hunk { old: u64, new: u64 },
+    /// Hunk counts exhausted: only a new hunk, a new header or a
+    /// "\ No newline..." marker may continue the diff.
+    AfterHunk,
+}
+
+/// What the state machine decided for one line's content.
+enum Outcome {
+    /// The line belongs to the diff; `Some` carries its tag, `None` means a
+    /// context line (kept default-colored on purpose).
+    InDiff(Option<Kind>),
+    NotDiff,
+}
+
+const META_PREFIXES: [&str; 12] = [
+    "index ",
+    "old mode ",
+    "new mode ",
+    "new file mode ",
+    "deleted file mode ",
+    "similarity index ",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+    "Binary files ",
+    "GIT binary patch",
+];
+
+pub fn classify(text: &str) -> Vec<Span> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut spans = Vec::new();
+    let mut state = State::None;
+    let mut state_depth = 0usize;
+
+    for (n, line) in lines.iter().enumerate() {
+        let (depth, prefix) = split_quote(line);
+        // Diff state never survives a quote-depth change: a diff quoted at
+        // one depth cannot continue in text quoted at another.
+        if depth != state_depth {
+            state = State::None;
+            state_depth = depth;
+        }
+        // Strip a trailing '\r' so CRLF bodies (mailparse emits them for
+        // quoted-printable parts) classify the same as LF ones. Span offsets
+        // still use the full line length; tagging the invisible '\r' is
+        // harmless.
+        let content = line[prefix..].strip_suffix('\r').unwrap_or(&line[prefix..]);
+        let next_is_plus = lines.get(n + 1).is_some_and(|next| {
+            let (d, p) = split_quote(next);
+            d == depth && next[p..].starts_with("+++ ")
+        });
+
+        let (next_state, outcome) = step(state, content, next_is_plus, depth > 0);
+        state = next_state;
+
+        let line_chars = line.chars().count();
+        match outcome {
+            Outcome::InDiff(kind) => {
+                push(&mut spans, n, 0, prefix, (depth > 0).then_some(Kind::Quote(depth)));
+                push(&mut spans, n, prefix, line_chars, kind);
+            }
+            Outcome::NotDiff => {
+                let quote = (depth > 0).then_some(Kind::Quote(depth));
+                push(&mut spans, n, 0, line_chars, quote);
+            }
+        }
+    }
+    spans
+}
+
+fn push(spans: &mut Vec<Span>, line: usize, start: usize, end: usize, kind: Option<Kind>) {
+    if let Some(kind) = kind
+        && start < end
+    {
+        spans.push(Span { line, start, end, kind });
+    }
+}
+
+fn step(state: State, content: &str, next_is_plus: bool, quoted: bool) -> (State, Outcome) {
+    if content.starts_with("diff --git ") {
+        return (State::Preamble, Outcome::InDiff(Some(Kind::DiffHeader)));
+    }
+    match state {
+        State::None => {
+            // Quoted excerpts often resume mid-diff (after "[ ... ]" elision
+            // or with no per-excerpt header at all), so a valid hunk header
+            // re-enters diff mode when quoted. Unquoted prose keeps the
+            // stricter rules below so lookalikes stay untagged.
+            if quoted && let Some((old, new)) = parse_hunk(content) {
+                return (hunk_state(old, new), Outcome::InDiff(Some(Kind::DiffHunk)));
+            }
+            // Plain `diff -u` output has no git header; require the
+            // "--- "/"+++ " pair before believing it is a diff.
+            if content.starts_with("--- ") && next_is_plus {
+                (State::Preamble, Outcome::InDiff(Some(Kind::DiffHeader)))
+            } else {
+                (State::None, Outcome::NotDiff)
+            }
+        }
+        State::Preamble => {
+            if let Some((old, new)) = parse_hunk(content) {
+                (hunk_state(old, new), Outcome::InDiff(Some(Kind::DiffHunk)))
+            } else if content.starts_with("--- ") || content.starts_with("+++ ") {
+                (State::Preamble, Outcome::InDiff(Some(Kind::DiffHeader)))
+            } else if META_PREFIXES.iter().any(|p| content.starts_with(p)) {
+                (State::Preamble, Outcome::InDiff(Some(Kind::DiffMeta)))
+            } else {
+                (State::None, Outcome::NotDiff)
+            }
+        }
+        State::Hunk { old, new } => {
+            // Some mail systems strip the lone leading space from blank
+            // context lines, so an empty content line counts as context.
+            if content.starts_with('\\') {
+                (State::Hunk { old, new }, Outcome::InDiff(Some(Kind::DiffMeta)))
+            } else if (content.starts_with(' ') || content.is_empty()) && old > 0 && new > 0 {
+                (hunk_state(old - 1, new - 1), Outcome::InDiff(None))
+            } else if content.starts_with('-') && old > 0 {
+                (hunk_state(old - 1, new), Outcome::InDiff(Some(Kind::DiffRemove)))
+            } else if content.starts_with('+') && new > 0 {
+                (hunk_state(old, new - 1), Outcome::InDiff(Some(Kind::DiffAdd)))
+            } else {
+                // Truncated or trimmed diff: stop here, keep what was tagged.
+                (State::None, Outcome::NotDiff)
+            }
+        }
+        State::AfterHunk => {
+            if let Some((old, new)) = parse_hunk(content) {
+                (hunk_state(old, new), Outcome::InDiff(Some(Kind::DiffHunk)))
+            } else if content.starts_with("--- ") || content.starts_with("+++ ") {
+                (State::Preamble, Outcome::InDiff(Some(Kind::DiffHeader)))
+            } else if content.starts_with('\\') {
+                (State::AfterHunk, Outcome::InDiff(Some(Kind::DiffMeta)))
+            } else {
+                (State::None, Outcome::NotDiff)
+            }
+        }
+    }
+}
+
+fn hunk_state(old: u64, new: u64) -> State {
+    if old == 0 && new == 0 {
+        State::AfterHunk
+    } else {
+        State::Hunk { old, new }
+    }
+}
+
+/// Split off the quote prefix: leading '>'s with optional single spaces
+/// between them ("> > >" and ">>>" are both depth 3), plus one trailing
+/// space. Returns (depth, prefix length); the prefix is all ASCII, so the
+/// length is valid as both a char and a byte offset.
+fn split_quote(line: &str) -> (usize, usize) {
+    let bytes = line.as_bytes();
+    let mut depth = 0;
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b'>' {
+        depth += 1;
+        i += 1;
+        if i + 1 < bytes.len() && bytes[i] == b' ' && bytes[i + 1] == b'>' {
+            i += 1;
+        }
+    }
+    if depth > 0 && i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    (depth, i)
+}
+
+/// Parse `@@ -a[,b] +c[,d] @@...` and return the old/new line counts
+/// (a missing count means 1). Anything may follow the trailing `@@`.
+fn parse_hunk(content: &str) -> Option<(u64, u64)> {
+    let rest = content.strip_prefix("@@ -")?;
+    let (old, rest) = parse_range(rest)?;
+    let rest = rest.strip_prefix(" +")?;
+    let (new, rest) = parse_range(rest)?;
+    rest.strip_prefix(" @@")?;
+    Some((old, new))
+}
+
+fn parse_range(s: &str) -> Option<(u64, &str)> {
+    let (_, rest) = take_number(s)?;
+    match rest.strip_prefix(',') {
+        Some(rest) => take_number(rest),
+        None => Some((1, rest)),
+    }
+}
+
+fn take_number(s: &str) -> Option<(u64, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let n = s[..end].parse().ok()?;
+    Some((n, &s[end..]))
+}
+
+const QUOTE_TAGS: [&str; 3] = ["koshi-quote-1", "koshi-quote-2", "koshi-quote-3"];
+const ADD_TAG: &str = "koshi-diff-add";
+const REMOVE_TAG: &str = "koshi-diff-remove";
+const HUNK_TAG: &str = "koshi-diff-hunk";
+const HEADER_TAG: &str = "koshi-diff-header";
+const META_TAG: &str = "koshi-diff-meta";
+const ALL_TAGS: [&str; 8] = [
+    QUOTE_TAGS[0],
+    QUOTE_TAGS[1],
+    QUOTE_TAGS[2],
+    ADD_TAG,
+    REMOVE_TAG,
+    HUNK_TAG,
+    HEADER_TAG,
+    META_TAG,
+];
+
+/// GNOME palette colors per scheme: quote depth cycle, then add, remove,
+/// hunk, header, meta.
+struct Palette {
+    quote: [&'static str; 3],
+    add: &'static str,
+    remove: &'static str,
+    hunk: &'static str,
+    header: &'static str,
+    meta: &'static str,
+}
+
+const LIGHT: Palette = Palette {
+    quote: ["#1a5fb4", "#26a269", "#813d9c"],
+    add: "#26a269",
+    remove: "#c01c28",
+    hunk: "#1a5fb4",
+    header: "#813d9c",
+    meta: "#5e5c64",
+};
+
+const DARK: Palette = Palette {
+    quote: ["#62a0ea", "#57e389", "#c061cb"],
+    add: "#57e389",
+    remove: "#ed333b",
+    hunk: "#62a0ea",
+    header: "#c061cb",
+    meta: "#9a9996",
+};
+
+fn tag_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Quote(depth) => QUOTE_TAGS[(depth - 1) % 3],
+        Kind::DiffAdd => ADD_TAG,
+        Kind::DiffRemove => REMOVE_TAG,
+        Kind::DiffHunk => HUNK_TAG,
+        Kind::DiffHeader => HEADER_TAG,
+        Kind::DiffMeta => META_TAG,
+    }
+}
+
+/// Create this module's tags in the buffer and keep their colors in sync
+/// with the color scheme. Quote tags are created first so the diff tags,
+/// created later, win the foreground where a diff span overlaps a quote
+/// prefix (tag priority defaults to creation order).
+pub fn attach(buffer: &gtk::TextBuffer) {
+    let table = buffer.tag_table();
+    if table.lookup(QUOTE_TAGS[0]).is_some() {
+        return;
+    }
+    for name in QUOTE_TAGS {
+        buffer.create_tag(Some(name), &[]);
+    }
+    for name in [ADD_TAG, REMOVE_TAG, META_TAG] {
+        buffer.create_tag(Some(name), &[]);
+    }
+    for name in [HUNK_TAG, HEADER_TAG] {
+        buffer.create_tag(Some(name), &[("weight", &700i32)]);
+    }
+
+    let style = adw::StyleManager::default();
+    apply_colors(buffer, style.is_dark());
+    let handler = style.connect_dark_notify(glib::clone!(
+        #[weak]
+        buffer,
+        move |style| apply_colors(&buffer, style.is_dark())
+    ));
+    // Disconnect when the buffer goes away so long sessions do not pile up
+    // dead handlers on the process-wide StyleManager. All GTK code runs on
+    // the main thread, so the local variant is fine.
+    let key = buffer.as_ptr() as usize;
+    buffer.add_weak_ref_notify_local(move || {
+        adw::StyleManager::default().disconnect(handler);
+        SPAN_CACHE.with_borrow_mut(|cache| {
+            cache.remove(&key);
+        });
+    });
+}
+
+fn apply_colors(buffer: &gtk::TextBuffer, dark: bool) {
+    let palette = if dark { &DARK } else { &LIGHT };
+    let colors = [
+        (QUOTE_TAGS[0], palette.quote[0]),
+        (QUOTE_TAGS[1], palette.quote[1]),
+        (QUOTE_TAGS[2], palette.quote[2]),
+        (ADD_TAG, palette.add),
+        (REMOVE_TAG, palette.remove),
+        (HUNK_TAG, palette.hunk),
+        (HEADER_TAG, palette.header),
+        (META_TAG, palette.meta),
+    ];
+    let table = buffer.tag_table();
+    for (name, hex) in colors {
+        if let Some(tag) = table.lookup(name) {
+            let rgba = gdk::RGBA::parse(hex).expect("palette hex is valid");
+            tag.set_property("foreground-rgba", rgba);
+        }
+    }
+}
+
+thread_local! {
+    /// Last spans applied per buffer, keyed by pointer. Entries are removed
+    /// by the weak-ref notify registered in `attach`, so the map only holds
+    /// live buffers.
+    static SPAN_CACHE: std::cell::RefCell<std::collections::HashMap<usize, Vec<Span>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Re-run classification over the whole buffer and retag only the lines
+/// whose spans changed since the last refresh, so a keystroke touches O(1)
+/// lines instead of the whole buffer. Applying tags does not emit
+/// "changed", so this is safe to call from a changed handler.
+///
+/// Addressing uses absolute character offsets computed from the same text
+/// classify saw: `iter_at_offset` has no line-ending semantics, so lines
+/// GtkTextBuffer would split at lone '\r' or U+2029 (which classify does
+/// not) cannot skew the mapping.
+pub fn refresh(buffer: &gtk::TextBuffer) {
+    let (start, end) = buffer.bounds();
+    let text = buffer.text(&start, &end, true);
+    let mut line_starts = vec![0i32];
+    let mut off = 0i32;
+    for ch in text.chars() {
+        off += 1;
+        if ch == '\n' {
+            line_starts.push(off);
+        }
+    }
+    let total_chars = off;
+
+    let spans = classify(&text);
+    let key = buffer.as_ptr() as usize;
+    let old = SPAN_CACHE.with_borrow(|cache| cache.get(&key).cloned()).unwrap_or_default();
+
+    let by_line = |spans: &[Span], lines: usize| {
+        let mut per: Vec<Vec<Span>> = vec![Vec::new(); lines];
+        for span in spans {
+            if span.line < lines {
+                per[span.line].push(*span);
+            }
+        }
+        per
+    };
+    let new_lines = by_line(&spans, line_starts.len());
+    let old_lines = by_line(&old, line_starts.len());
+
+    let table = buffer.tag_table();
+    for (n, (new, old)) in new_lines.iter().zip(&old_lines).enumerate() {
+        if new == old {
+            continue;
+        }
+        let base = line_starts[n];
+        let line_end = line_starts.get(n + 1).copied().unwrap_or(total_chars);
+        let from = buffer.iter_at_offset(base);
+        let to = buffer.iter_at_offset(line_end);
+        for name in ALL_TAGS {
+            if let Some(tag) = table.lookup(name) {
+                buffer.remove_tag(&tag, &from, &to);
+            }
+        }
+        for span in new {
+            let from = buffer.iter_at_offset(base + span.start as i32);
+            let to = buffer.iter_at_offset(base + span.end as i32);
+            buffer.apply_tag_by_name(tag_name(span.kind), &from, &to);
+        }
+    }
+    SPAN_CACHE.with_borrow_mut(|cache| {
+        cache.insert(key, spans);
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds_by_line(text: &str) -> Vec<Vec<Kind>> {
+        let mut lines = vec![Vec::new(); text.split('\n').count()];
+        for span in classify(text) {
+            lines[span.line].push(span.kind);
+        }
+        lines
+    }
+
+    #[test]
+    fn git_patch_body_is_classified_and_wrapper_lines_are_not() {
+        let body = "\
+Fix the frobnicator.
+
+---
+ src/frob.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/frob.c b/src/frob.c
+index 1111111..2222222 100644
+--- a/src/frob.c
++++ b/src/frob.c
+@@ -1,2 +1,2 @@
+ keep
+-old line
++new line
+@@ -10,2 +10,3 @@ int frob(void)
+ keep
++added
+ keep
+
+--
+nika";
+        let lines = kinds_by_line(body);
+        assert!(lines[0].is_empty());
+        assert!(lines[2].is_empty(), "git-email --- separator tagged");
+        assert!(lines[3].is_empty() && lines[4].is_empty(), "diffstat tagged");
+        assert_eq!(lines[6], [Kind::DiffHeader]);
+        assert_eq!(lines[7], [Kind::DiffMeta]);
+        assert_eq!(lines[8], [Kind::DiffHeader]);
+        assert_eq!(lines[9], [Kind::DiffHeader]);
+        assert_eq!(lines[10], [Kind::DiffHunk]);
+        assert!(lines[11].is_empty(), "context line tagged");
+        assert_eq!(lines[12], [Kind::DiffRemove]);
+        assert_eq!(lines[13], [Kind::DiffAdd]);
+        assert_eq!(lines[14], [Kind::DiffHunk]);
+        assert_eq!(lines[16], [Kind::DiffAdd]);
+        assert!(lines[19].is_empty(), "signature marker tagged");
+        assert!(lines[20].is_empty());
+    }
+
+    #[test]
+    fn diff_lookalikes_outside_diff_mode_are_untagged() {
+        let body = "\
+- item one
++ emphasis, mine
+@@ weird @@
+@@ -1,2 +1,2 @@
+a --> b";
+        for (n, kinds) in kinds_by_line(body).iter().enumerate() {
+            assert!(kinds.is_empty(), "line {n} tagged: {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn quote_depth_counts_gt_with_optional_spaces() {
+        let lines = kinds_by_line("> x\n>> x\n> > > x\n>>> x");
+        assert_eq!(lines[0], [Kind::Quote(1)]);
+        assert_eq!(lines[1], [Kind::Quote(2)]);
+        assert_eq!(lines[2], [Kind::Quote(3)]);
+        assert_eq!(lines[3], [Kind::Quote(3)]);
+    }
+
+    #[test]
+    fn quote_span_covers_whole_line_outside_diffs() {
+        let spans = classify("> hello there");
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].end), (0, 13));
+    }
+
+    #[test]
+    fn quoted_diff_splits_prefix_and_payload() {
+        let body = "\
+> diff --git a/f b/f
+> --- a/f
+> +++ b/f
+> @@ -1,2 +1,2 @@
+>  keep
+> -old
+> +added
+>> +not a diff line";
+        let spans: Vec<Span> = classify(body).into_iter().filter(|s| s.line == 6).collect();
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].kind, spans[0].start, spans[0].end), (Kind::Quote(1), 0, 2));
+        assert_eq!((spans[1].kind, spans[1].start, spans[1].end), (Kind::DiffAdd, 2, 8));
+
+        // Depth change resets diff state: the depth-2 line is quote-only.
+        let lines = kinds_by_line(body);
+        assert_eq!(lines[7], [Kind::Quote(2)]);
+    }
+
+    #[test]
+    fn truncated_quoted_hunk_stops_without_tagging_the_reply() {
+        let body = "\
+> diff --git a/f b/f
+> --- a/f
+> +++ b/f
+> @@ -1,5 +1,5 @@
+>  keep
+> -old
+This part looks wrong to me.";
+        let lines = kinds_by_line(body);
+        assert_eq!(lines[5], [Kind::Quote(1), Kind::DiffRemove]);
+        assert!(lines[6].is_empty(), "reply line tagged: {:?}", lines[6]);
+    }
+
+    #[test]
+    fn minus_plus_pair_enters_diff_mode_without_git_header() {
+        let body = "\
+--- a/f
++++ b/f
+@@ -1 +1 @@
+-old
++new";
+        let lines = kinds_by_line(body);
+        assert_eq!(lines[0], [Kind::DiffHeader]);
+        assert_eq!(lines[1], [Kind::DiffHeader]);
+        assert_eq!(lines[2], [Kind::DiffHunk]);
+        assert_eq!(lines[3], [Kind::DiffRemove]);
+        assert_eq!(lines[4], [Kind::DiffAdd]);
+    }
+
+    #[test]
+    fn lone_minus_minus_minus_line_does_not_enter_diff_mode() {
+        let lines = kinds_by_line("--- a/f\nnot a plus line\n@@ -1 +1 @@");
+        for (n, kinds) in lines.iter().enumerate() {
+            assert!(kinds.is_empty(), "line {n} tagged: {kinds:?}");
+        }
+    }
+
+    #[test]
+    fn quoted_hunk_resumes_after_unquoted_elision_line() {
+        let body = "\
+> diff --git a/f b/f
+> --- a/f
+> +++ b/f
+[ ... ]
+> @@ -81,7 +81,7 @@ static void init(void)
+>  keep
+> -old
+> +new";
+        let lines = kinds_by_line(body);
+        assert!(lines[3].is_empty(), "elision line tagged: {:?}", lines[3]);
+        assert_eq!(lines[4], [Kind::Quote(1), Kind::DiffHunk]);
+        assert_eq!(lines[5], [Kind::Quote(1)]);
+        assert_eq!(lines[6], [Kind::Quote(1), Kind::DiffRemove]);
+        assert_eq!(lines[7], [Kind::Quote(1), Kind::DiffAdd]);
+    }
+
+    #[test]
+    fn quoted_excerpt_starting_at_hunk_header_enters_diff_mode() {
+        let body = "\
+Comment first.
+> @@ -1,2 +1,2 @@
+> -old
+> +new";
+        let lines = kinds_by_line(body);
+        assert!(lines[0].is_empty());
+        assert_eq!(lines[1], [Kind::Quote(1), Kind::DiffHunk]);
+        assert_eq!(lines[2], [Kind::Quote(1), Kind::DiffRemove]);
+        assert_eq!(lines[3], [Kind::Quote(1), Kind::DiffAdd]);
+    }
+
+    #[test]
+    fn blank_context_line_with_stripped_space_stays_in_hunk() {
+        let body = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1,3 +1,3 @@
+-old
+
++new";
+        let lines = kinds_by_line(body);
+        assert!(lines[5].is_empty());
+        assert_eq!(lines[6], [Kind::DiffAdd]);
+    }
+
+    #[test]
+    fn crlf_body_classifies_like_lf() {
+        let body = "diff --git a/f b/f\r\n--- a/f\r\n+++ b/f\r\n@@ -1,3 +1,3 @@\r\n-old\r\n\r\n+new\r\n";
+        let lines = kinds_by_line(body);
+        assert_eq!(lines[0], [Kind::DiffHeader]);
+        assert_eq!(lines[3], [Kind::DiffHunk]);
+        assert_eq!(lines[4], [Kind::DiffRemove]);
+        assert!(lines[5].is_empty(), "stripped blank context line tagged: {:?}", lines[5]);
+        assert_eq!(lines[6], [Kind::DiffAdd]);
+    }
+}

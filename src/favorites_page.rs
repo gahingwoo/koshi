@@ -36,10 +36,9 @@ pub fn build_favorites_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         list.connect_row_activated(glib::clone!(
             #[weak]
             nav,
-            move |_, _| {
-                // Only the bundled sample mail exists for now, so every
-                // favorite resolves to it regardless of Message-ID.
-                nav.push(&build_thread_page(&nav));
+            move |_, row| {
+                let fav = &favorites[row.index() as usize];
+                nav.push(&build_thread_page(&nav, &fav.list, &fav.message_id));
             }
         ));
 

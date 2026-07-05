@@ -6,6 +6,8 @@ pub struct Favorite {
     pub message_id: String,
     pub subject: String,
     pub date: String,
+    /// The lore list the mail was opened from, used to fetch it again.
+    pub list: String,
 }
 
 thread_local! {
@@ -46,6 +48,7 @@ mod tests {
             message_id: id.to_string(),
             subject: format!("subject for {id}"),
             date: "Thu, 3 Jul 2026 12:00:00 +0000".to_string(),
+            list: "lkml".to_string(),
         }
     }
 

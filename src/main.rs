@@ -4,6 +4,8 @@ mod favorites_page;
 mod highlight;
 mod inbox_page;
 mod list_page;
+mod lore;
+mod remote_page;
 mod thread_list_page;
 mod thread_page;
 
@@ -15,6 +17,8 @@ use gtk::{gio, glib};
 
 use favorites_page::{FAVORITES_PAGE_NAME, build_favorites_page};
 use inbox_page::{INBOX_LIST_TITLE, build_inbox_page};
+use thread_list_page::{build_search_page, build_thread_list_page};
+use thread_page::build_thread_page;
 
 const APP_ID: &str = "moe.nikableh.Koshi";
 
@@ -105,8 +109,65 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
 
     window.add_action(&go_back);
     setup_actions(app, &window, &search_entry);
+    setup_search(&search_entry, &tab_view);
 
     (window, tab_view)
+}
+
+/// Dispatch the search entry: a lore.kernel.org URL or a Message-ID opens
+/// that thread directly (the `r` pseudo-list resolves an id across every
+/// list); anything else is a lore query over the `all` pseudo-list.
+fn setup_search(search_entry: &gtk::SearchEntry, tab_view: &adw::TabView) {
+    search_entry.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        move |entry| {
+            let text = entry.text().trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            let Some(nav) = selected_nav(&tab_view) else {
+                return;
+            };
+            match parse_lore_url(&text) {
+                Some((list, Some(message_id))) => {
+                    nav.push(&build_thread_page(&nav, &list, &message_id));
+                }
+                Some((list, None)) => {
+                    nav.push(&build_thread_list_page(&nav, &list, ""));
+                }
+                None if looks_like_message_id(&text) => {
+                    let message_id = text.trim_matches(['<', '>']);
+                    nav.push(&build_thread_page(&nav, "r", message_id));
+                }
+                None => nav.push(&build_search_page(&nav, &text)),
+            }
+            entry.set_text("");
+        }
+    ));
+}
+
+/// Split a lore.kernel.org URL into its list and, when it points at a
+/// message, the Message-ID.
+fn parse_lore_url(text: &str) -> Option<(String, Option<String>)> {
+    let rest = text.split("lore.kernel.org/").nth(1)?;
+    let mut segments = rest
+        .split(['/', '?', '#'])
+        .filter(|segment| !segment.is_empty());
+    let list = segments.next()?;
+    let message_id = segments.next().filter(|segment| segment.contains('@'));
+    Some((list.to_string(), message_id.map(str::to_string)))
+}
+
+/// `<id@host>`, or a bare address-shaped token that can't be a lore query.
+fn looks_like_message_id(text: &str) -> bool {
+    if text.starts_with('<') && text.ends_with('>') && text.contains('@') {
+        return true;
+    }
+    !text.contains(char::is_whitespace)
+        && !text.contains(':')
+        && text.contains('@')
+        && text.contains('.')
 }
 
 fn setup_tab_context_menu(tab_view: &adw::TabView) {
@@ -261,12 +322,23 @@ fn open_new_tab(tab_view: &adw::TabView) {
     tab_page.set_title(INBOX_LIST_TITLE);
     tab_view.set_selected_page(&tab_page);
 
+    // The tab title tracks the visible page's title property, not just its
+    // value at navigation time: thread pages start as "Loading…" and retitle
+    // themselves once fetched.
+    let title_binding: Rc<RefCell<Option<glib::Binding>>> = Rc::new(RefCell::new(None));
     nav.connect_visible_page_notify(glib::clone!(
         #[weak]
         tab_page,
         move |nav| {
+            if let Some(binding) = title_binding.take() {
+                binding.unbind();
+            }
             if let Some(page) = nav.visible_page() {
-                tab_page.set_title(&page.title());
+                let binding = page
+                    .bind_property("title", &tab_page, "title")
+                    .sync_create()
+                    .build();
+                title_binding.replace(Some(binding));
             }
             update_go_back_action(nav);
         }
@@ -491,6 +563,40 @@ fn show_about(app: &adw::Application) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn lore_message_urls_yield_list_and_message_id() {
+        assert_eq!(
+            parse_lore_url("https://lore.kernel.org/lkml/20260705200723.66564929@pumpkin/"),
+            Some((
+                "lkml".to_string(),
+                Some("20260705200723.66564929@pumpkin".to_string())
+            ))
+        );
+        assert_eq!(
+            parse_lore_url("lore.kernel.org/r/some-id@example.org/T/#u"),
+            Some(("r".to_string(), Some("some-id@example.org".to_string())))
+        );
+    }
+
+    #[test]
+    fn lore_list_urls_yield_only_the_list() {
+        assert_eq!(
+            parse_lore_url("https://lore.kernel.org/bpf/"),
+            Some(("bpf".to_string(), None))
+        );
+        assert_eq!(parse_lore_url("[PATCH] not a url"), None);
+    }
+
+    #[test]
+    fn message_ids_are_recognized_but_queries_are_not() {
+        assert!(looks_like_message_id("<some-id@example.org>"));
+        assert!(looks_like_message_id("20260705200723.66564929@pumpkin.example"));
+        assert!(!looks_like_message_id("f:torvalds@linux-foundation.org"));
+        assert!(!looks_like_message_id("sched fix regression"));
+    }
+
     #[test]
     fn bundled_rewrap_icon_is_in_the_gresource() {
         gtk::gio::resources_register_include!("koshi.gresource").unwrap();

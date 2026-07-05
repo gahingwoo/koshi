@@ -1,91 +1,128 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::list_page::build_list_page;
+use crate::lore::{self, ThreadSummary};
+use crate::remote_page::RemoteContent;
 use crate::thread_page::build_thread_page;
 
-struct Thread {
-    subject: &'static str,
-    date: &'static str,
-    time: &'static str,
-    children: &'static [&'static str],
+#[derive(Clone)]
+enum Mode {
+    /// Recent thread roots of one list.
+    Recent { list: String },
+    /// Full-text search results (over the `all` pseudo-list).
+    Search { list: String, query: String },
 }
 
-const PLACEHOLDER_THREADS: &[Thread] = &[
-    Thread {
-        subject: "[PATCH] media: mali-c55: Fix unaligned access of AEC histogram zone weights",
-        date: "Jul 3",
-        time: "9:44",
-        children: &[],
-    },
-    Thread {
-        subject: "[PATCH v3] Fix multiple issues in chcr driver:",
-        date: "Jul 3",
-        time: "9:30",
-        children: &[],
-    },
-    Thread {
-        subject: "[PATCH v3] ARM: breakpoint: CFI breakpoints only on demand",
-        date: "Jul 3",
-        time: "9:27",
-        children: &[],
-    },
-    Thread {
-        subject: "[PATCH v4 0/8] crypto: qce - Fix crypto self-test failures",
-        date: "Jul 3",
-        time: "9:23",
-        children: &["[PATCH v4 2/8] crypto: qce - Fix HMAC self-test failures for empty messages"],
-    },
-    Thread {
-        subject: "[PATCH stable] mm/khugepaged: write all dirty file folios when collapsing",
-        date: "Jul 3",
-        time: "9:20",
-        children: &[],
-    },
-    Thread {
-        subject: "[PATCH] perf trace: Refactor augmented_raw_syscalls using bpf_loop",
-        date: "Jul 3",
-        time: "8:59",
-        children: &[],
-    },
-    Thread {
-        subject: "[PATCH] drm/xe: Wait on external BO kernel fences in exec IOCTL",
-        date: "Jul 3",
-        time: "8:45",
-        children: &[],
-    },
-    Thread {
-        subject: "[PATCH] usb: gadget: f_ncm: validate datagram bounds in ncm_unwrap_ntb()",
-        date: "Jul 3",
-        time: "8:37",
-        children: &[],
-    },
-    Thread {
-        subject: "[PATCH net] macsec: don't read an unset MAC header in macsec_encrypt()",
-        date: "Jul 3",
-        time: "8:36",
-        children: &[],
-    },
-];
+impl Mode {
+    fn list(&self) -> &str {
+        match self {
+            Mode::Recent { list } | Mode::Search { list, .. } => list,
+        }
+    }
+
+    async fn fetch(
+        &self,
+        offset: usize,
+        cancellable: &gio::Cancellable,
+    ) -> Result<Vec<ThreadSummary>, lore::Error> {
+        match self {
+            Mode::Recent { list } => lore::fetch_thread_roots(list, offset, cancellable).await,
+            Mode::Search { list, query } => lore::search(list, query, offset, cancellable).await,
+        }
+    }
+}
 
 pub fn build_thread_list_page(
     nav: &adw::NavigationView,
     inbox_name: &str,
     inbox_description: &str,
 ) -> adw::NavigationPage {
+    build_page(
+        nav,
+        Mode::Recent { list: inbox_name.to_string() },
+        inbox_name,
+        inbox_name,
+        inbox_description,
+    )
+}
+
+pub fn build_search_page(nav: &adw::NavigationView, query: &str) -> adw::NavigationPage {
+    build_page(
+        nav,
+        Mode::Search { list: "all".to_string(), query: query.to_string() },
+        &format!("Search: {query}"),
+        "Search results",
+        &format!("Matches for “{query}” across all of lore.kernel.org"),
+    )
+}
+
+fn build_page(
+    nav: &adw::NavigationView,
+    mode: Mode,
+    page_title: &str,
+    heading: &str,
+    description: &str,
+) -> adw::NavigationPage {
+    let remote = RemoteContent::new();
+
     let refresh_button = gtk::Button::builder()
         .icon_name("view-refresh-symbolic")
         .tooltip_text("Refresh")
         .css_classes(["flat"])
         .build();
+    refresh_button.connect_clicked(glib::clone!(
+        #[strong]
+        remote,
+        #[weak]
+        nav,
+        #[strong]
+        mode,
+        move |_| load(remote.clone(), nav, mode.clone())
+    ));
 
-    build_list_page(
-        inbox_name,
-        inbox_name,
-        inbox_description,
+    let page = build_list_page(
+        page_title,
+        heading,
+        description,
         &[refresh_button.upcast(), build_sort_button().upcast()],
-        &build_thread_list(nav),
-    )
+        remote.widget(),
+    );
+
+    load(remote, nav.clone(), mode);
+    page
+}
+
+fn load(remote: RemoteContent, nav: adw::NavigationView, mode: Mode) {
+    remote.show_loading();
+    let cancellable = remote.cancellable();
+    glib::spawn_future_local(async move {
+        match mode.fetch(0, &cancellable).await {
+            Ok(threads) if threads.is_empty() => {
+                let status = adw::StatusPage::builder()
+                    .icon_name("system-search-symbolic")
+                    .title("No Results")
+                    .build();
+                remote.show_content(&status);
+            }
+            Ok(threads) => {
+                remote.show_content(&build_thread_list(&nav, &cancellable, &mode, threads));
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                let weak = remote.downgrade();
+                let nav = nav.downgrade();
+                remote.show_error(&error, move || {
+                    if let (Some(remote), Some(nav)) = (weak.upgrade(), nav.upgrade()) {
+                        load(remote, nav, mode.clone());
+                    }
+                });
+            }
+        }
+    });
 }
 
 fn build_sort_button() -> gtk::MenuButton {
@@ -114,44 +151,99 @@ fn build_sort_button() -> gtk::MenuButton {
     button
 }
 
-fn build_thread_list(nav: &adw::NavigationView) -> gtk::ListBox {
+fn build_thread_list(
+    nav: &adw::NavigationView,
+    cancellable: &gio::Cancellable,
+    mode: &Mode,
+    threads: Vec<ThreadSummary>,
+) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
 
-    for thread in PLACEHOLDER_THREADS {
+    let full_page = threads.len() >= lore::PAGE_SIZE;
+    for thread in &threads {
         list.append(&build_thread_row(thread));
     }
+    if full_page {
+        list.append(&build_load_more_row());
+    }
 
+    let threads = Rc::new(RefCell::new(threads));
+    // The cancellable is captured instead of the whole RemoteContent: this
+    // closure lives inside the stack, and a strong stack reference here would
+    // be a leaky cycle.
     list.connect_row_activated(glib::clone!(
         #[weak]
         nav,
-        move |_, _| {
-            nav.push(&build_thread_page(&nav));
+        #[strong]
+        threads,
+        #[strong]
+        cancellable,
+        #[strong]
+        mode,
+        move |list, row| {
+            let index = row.index() as usize;
+            if index < threads.borrow().len() {
+                let message_id = threads.borrow()[index].message_id.clone();
+                nav.push(&build_thread_page(&nav, mode.list(), &message_id));
+            } else {
+                load_more(list, row, threads.clone(), mode.clone(), cancellable.clone());
+            }
         }
     ));
 
     list
 }
 
-fn build_thread_row(thread: &Thread) -> adw::ActionRow {
+/// Fetch the next page and splice it in where the Load More row sits.
+fn load_more(
+    list: &gtk::ListBox,
+    row: &gtk::ListBoxRow,
+    threads: Rc<RefCell<Vec<ThreadSummary>>>,
+    mode: Mode,
+    cancellable: gio::Cancellable,
+) {
+    if !row.is_sensitive() {
+        return; // already loading
+    }
+    row.set_sensitive(false);
+    let list = list.clone();
+    let row = row.clone();
+    glib::spawn_future_local(async move {
+        let offset = threads.borrow().len();
+        match mode.fetch(offset, &cancellable).await {
+            Ok(more) => {
+                list.remove(&row);
+                let full_page = more.len() >= lore::PAGE_SIZE;
+                for thread in &more {
+                    list.append(&build_thread_row(thread));
+                }
+                threads.borrow_mut().extend(more);
+                if full_page {
+                    list.append(&build_load_more_row());
+                }
+            }
+            Err(error) if error.is_cancelled() => {}
+            // Make the row clickable again; activating it retries.
+            Err(_) => row.set_sensitive(true),
+        }
+    });
+}
+
+fn build_load_more_row() -> adw::ButtonRow {
+    adw::ButtonRow::builder().title("Load More").build()
+}
+
+fn build_thread_row(thread: &ThreadSummary) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(format!("<tt>{}</tt>", glib::markup_escape_text(thread.subject)))
+        .title(format!("<tt>{}</tt>", glib::markup_escape_text(&thread.subject)))
         .title_lines(1)
+        .subtitle(glib::markup_escape_text(&thread.author))
+        .subtitle_lines(1)
         .activatable(true)
         .build();
-
-    if !thread.children.is_empty() {
-        let subtitle = thread
-            .children
-            .iter()
-            .map(|child| format!("└ {}", glib::markup_escape_text(child)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        row.set_subtitle(&format!("<tt>{subtitle}</tt>"));
-        row.set_subtitle_lines(0);
-    }
 
     let timestamp = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -159,14 +251,14 @@ fn build_thread_row(thread: &Thread) -> adw::ActionRow {
         .build();
     timestamp.append(
         &gtk::Label::builder()
-            .label(thread.date)
+            .label(format_date(&thread.updated))
             .halign(gtk::Align::End)
             .css_classes(["numeric", "caption"])
             .build(),
     );
     timestamp.append(
         &gtk::Label::builder()
-            .label(thread.time)
+            .label(thread.updated.format("%H:%M").unwrap_or_default())
             .halign(gtk::Align::End)
             .css_classes(["numeric", "caption", "dim-label"])
             .build(),
@@ -174,4 +266,11 @@ fn build_thread_row(thread: &Thread) -> adw::ActionRow {
     row.add_suffix(&timestamp);
 
     row
+}
+
+/// "Jul 3" for dates in the current year, "Jul 3 2019" otherwise.
+pub fn format_date(date: &glib::DateTime) -> String {
+    let same_year = glib::DateTime::now_local().is_ok_and(|now| now.year() == date.year());
+    let format = if same_year { "%b %-e" } else { "%b %-e %Y" };
+    date.format(format).map(Into::into).unwrap_or_default()
 }

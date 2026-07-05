@@ -5,8 +5,8 @@ use mailparse::MailHeaderMap;
 use crate::composer;
 use crate::favorites::{self, Favorite};
 use crate::highlight;
-
-const RAW_THREAD: &str = include_str!("../data/sample-thread.mbox");
+use crate::lore;
+use crate::remote_page::RemoteContent;
 
 struct Mail {
     subject: String,
@@ -24,12 +24,13 @@ struct Mail {
     raw: String,
 }
 
-/// Parse the placeholder mboxrd thread into its messages, in file order.
-/// mboxrd ">From " escaping is undone on the raw message text before MIME
-/// parsing: the mbox writer escapes raw file lines, so unescaping must
-/// happen before any Content-Transfer-Encoding decoding, not after.
-fn parse_thread() -> Vec<Mail> {
-    split_mbox(RAW_THREAD)
+/// Parse an mboxrd thread into its messages, in file order (lore serves
+/// `t.mbox.gz` already in thread order). mboxrd ">From " escaping is undone
+/// on the raw message text before MIME parsing: the mbox writer escapes raw
+/// file lines, so unescaping must happen before any Content-Transfer-Encoding
+/// decoding, not after.
+fn parse_thread(mbox: &str) -> Vec<Mail> {
+    split_mbox(mbox)
         .iter()
         .map(|raw| parse_message(&unescape_mboxrd(raw)))
         .collect()
@@ -195,8 +196,69 @@ fn find_text_body(part: &mailparse::ParsedMail) -> Option<String> {
     part.subparts.iter().find_map(find_text_body)
 }
 
-pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
-    let thread = parse_thread();
+pub fn build_thread_page(
+    nav: &adw::NavigationView,
+    list: &str,
+    message_id: &str,
+) -> adw::NavigationPage {
+    let remote = RemoteContent::new();
+    let page = adw::NavigationPage::new(remote.widget(), "Loading…");
+    spawn_thread_load(remote, nav.clone(), page.clone(), list.to_string(), message_id.to_string());
+    page
+}
+
+fn spawn_thread_load(
+    remote: RemoteContent,
+    nav: adw::NavigationView,
+    page: adw::NavigationPage,
+    list: String,
+    message_id: String,
+) {
+    remote.show_loading();
+    let cancellable = remote.cancellable();
+    glib::spawn_future_local(async move {
+        match lore::fetch_thread_mbox(&list, &message_id, &cancellable).await {
+            Ok(mbox) => {
+                let thread = parse_thread(&mbox);
+                if thread.is_empty() {
+                    let error = lore::Error::Parse("the thread has no messages".to_string());
+                    show_thread_error(&remote, &error, &nav, &page, list, message_id);
+                } else {
+                    page.set_title(&thread[0].subject);
+                    remote.show_content(&build_thread_content(&nav, &thread, &list));
+                }
+            }
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => show_thread_error(&remote, &error, &nav, &page, list, message_id),
+        }
+    });
+}
+
+fn show_thread_error(
+    remote: &RemoteContent,
+    error: &lore::Error,
+    nav: &adw::NavigationView,
+    page: &adw::NavigationPage,
+    list: String,
+    message_id: String,
+) {
+    let weak = remote.downgrade();
+    let nav = nav.downgrade();
+    let page = page.downgrade();
+    remote.show_error(error, move || {
+        let (Some(remote), Some(nav), Some(page)) = (weak.upgrade(), nav.upgrade(), page.upgrade())
+        else {
+            return;
+        };
+        spawn_thread_load(remote, nav, page, list.clone(), message_id.clone());
+    });
+}
+
+fn build_thread_content(
+    nav: &adw::NavigationView,
+    thread: &[Mail],
+    list: &str,
+) -> gtk::Box {
     let op = &thread[0];
 
     let overlay = adw::ToastOverlay::new();
@@ -227,7 +289,7 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .spacing(6)
         .build();
     title_row.append(&title);
-    title_row.append(&build_star_button(op, &overlay));
+    title_row.append(&build_star_button(op, list, &overlay));
     title_row.append(&op_reply);
 
     let content = gtk::Box::builder()
@@ -289,12 +351,11 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     // stays visible without living in a ToolbarView bottom bar (whose
     // GtkWindowHandle wrapper would turn clicks and drags on the composer
     // padding into window move/maximize gestures).
-    let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    page.append(&overlay);
-    page.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    page.append(composer.widget());
-
-    adw::NavigationPage::new(&page, &op.subject)
+    let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content_box.append(&overlay);
+    content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content_box.append(composer.widget());
+    content_box
 }
 
 /// One message of the thread: its header list stacked over its body view.
@@ -400,7 +461,7 @@ fn build_reply_context(mail: &Mail) -> composer::ReplyContext {
 
 /// A star toggle sitting right of the subject, aligned with its first line.
 /// Disabled when the mail has no Message-ID to key the favorite by.
-fn build_star_button(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ToggleButton {
+fn build_star_button(mail: &Mail, list: &str, overlay: &adw::ToastOverlay) -> gtk::ToggleButton {
     let starred = mail
         .message_id
         .as_deref()
@@ -431,6 +492,7 @@ fn build_star_button(mail: &Mail, overlay: &adw::ToastOverlay) -> gtk::ToggleBut
         message_id: id.clone(),
         subject: mail.subject.clone(),
         date: mail.date.clone(),
+        list: list.to_string(),
     });
     button.connect_toggled(glib::clone!(
         #[weak]
@@ -883,9 +945,12 @@ fn launch_uri(widget: &impl IsA<gtk::Widget>, uri: &str) {
 mod tests {
     use super::*;
 
+    /// A real lore thread bundled as an offline fixture.
+    const RAW_THREAD: &str = include_str!("../data/sample-thread.mbox");
+
     #[test]
     fn parses_the_whole_thread() {
-        let thread = parse_thread();
+        let thread = parse_thread(RAW_THREAD);
         assert_eq!(thread.len(), 8);
 
         let op = &thread[0];
@@ -930,7 +995,7 @@ mod tests {
 
     #[test]
     fn parses_op_address_lists_cleanly() {
-        let thread = parse_thread();
+        let thread = parse_thread(RAW_THREAD);
         let op = &thread[0];
         assert_eq!(op.to_addrs.len(), 17, "To: {:?}", op.to_addrs);
         assert_eq!(op.to_addrs[0], "Russell King <linux@armlinux.org.uk>");
@@ -947,7 +1012,7 @@ mod tests {
 
     #[test]
     fn reply_context_targets_the_clicked_message() {
-        let thread = parse_thread();
+        let thread = parse_thread(RAW_THREAD);
         let reply = build_reply_context(&thread[1]);
         assert_eq!(reply.to, "sashiko-bot@kernel.org");
         assert!(reply.cc.contains("Linus Walleij <linusw@kernel.org>"));
@@ -964,7 +1029,7 @@ mod tests {
 
     #[test]
     fn parses_in_reply_to_per_message() {
-        let thread = parse_thread();
+        let thread = parse_thread(RAW_THREAD);
         // The OP starts the thread, so it has no In-Reply-To.
         assert_eq!(thread[0].in_reply_to, None);
         // Every reply carries one; most point at the OP directly.

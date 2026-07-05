@@ -1,65 +1,89 @@
+use std::rc::Rc;
+
 use adw::prelude::*;
 use gtk::glib;
 
 use crate::list_page::build_list_page;
-use crate::thread_list_page::build_thread_list_page;
-
-const PLACEHOLDER_INBOXES: &[(&str, &str, &str)] = &[
-    ("all", "Every list archived on lore.kernel.org", "3.1M msgs"),
-    ("live-patching", "Kernel live patching (klp)", "4.2k msgs"),
-    ("kernel-janitors", "Trivial fixes and cleanups", "18k msgs"),
-    ("dpdk-dev", "DPDK data-plane development", "210k msgs"),
-    ("bpf", "BPF core, verifier and tooling", "96k msgs"),
-    ("linux-rtc", "Real-time clock subsystem", "12k msgs"),
-    ("linux-mm", "Memory management", "480k msgs"),
-    ("netdev", "Networking stack", "1.2M msgs"),
-    ("workflows", "Kernel development process & tooling", "9.8k msgs"),
-    ("linux-doc", "Documentation", "40k msgs"),
-];
+use crate::lore::{self, Inbox};
+use crate::remote_page::RemoteContent;
+use crate::thread_list_page::{build_thread_list_page, format_date};
 
 pub const INBOX_LIST_TITLE: &str = "Public Inboxes";
 
 pub fn build_inbox_page(nav: &adw::NavigationView) -> adw::NavigationPage {
+    let remote = RemoteContent::new();
+    let page = build_list_page(
+        INBOX_LIST_TITLE,
+        "Open a public inbox",
+        "Every list mirrored on lore.kernel.org. Pick one to open it in this tab.",
+        &[],
+        remote.widget(),
+    );
+    load(remote, nav.clone());
+    page
+}
+
+fn load(remote: RemoteContent, nav: adw::NavigationView) {
+    remote.show_loading();
+    let cancellable = remote.cancellable();
+    glib::spawn_future_local(async move {
+        match lore::fetch_inboxes(&cancellable).await {
+            Ok(inboxes) => remote.show_content(&build_inbox_list(&nav, inboxes)),
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => {
+                let weak = remote.downgrade();
+                let nav = nav.downgrade();
+                remote.show_error(&error, move || {
+                    if let (Some(remote), Some(nav)) = (weak.upgrade(), nav.upgrade()) {
+                        load(remote, nav);
+                    }
+                });
+            }
+        }
+    });
+}
+
+fn build_inbox_list(nav: &adw::NavigationView, inboxes: Vec<Inbox>) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
 
-    for &(name, description, count) in PLACEHOLDER_INBOXES {
-        list.append(&build_inbox_row(name, description, count));
+    for inbox in &inboxes {
+        list.append(&build_inbox_row(inbox));
     }
 
+    let inboxes = Rc::new(inboxes);
     list.connect_row_activated(glib::clone!(
         #[weak]
         nav,
         move |_, row| {
-            let (name, description, _) = PLACEHOLDER_INBOXES[row.index() as usize];
-            nav.push(&build_thread_list_page(&nav, name, description));
+            let inbox = &inboxes[row.index() as usize];
+            nav.push(&build_thread_list_page(&nav, &inbox.slug, &inbox.description));
         }
     ));
 
-    build_list_page(
-        INBOX_LIST_TITLE,
-        "Open a public inbox",
-        "Every list mirrored on lore.kernel.org. Pick one to open it in this tab.",
-        &[],
-        &list,
-    )
+    list
 }
 
-fn build_inbox_row(name: &str, description: &str, count: &str) -> adw::ActionRow {
+fn build_inbox_row(inbox: &Inbox) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(glib::markup_escape_text(name))
-        .subtitle(glib::markup_escape_text(description))
+        .title(glib::markup_escape_text(&inbox.slug))
+        .subtitle(glib::markup_escape_text(&inbox.description))
         .activatable(true)
         .build();
     row.add_prefix(&gtk::Image::from_icon_name("mail-unread-symbolic"));
-    row.add_suffix(
-        &gtk::Label::builder()
-            .label(count)
-            .css_classes(["dim-label", "numeric"])
-            .build(),
-    );
+    // Last-activity stamp from the manifest (the `all` pseudo-inbox has none).
+    if inbox.modified > 0
+        && let Ok(date) = glib::DateTime::from_unix_local(inbox.modified)
+    {
+        row.add_suffix(
+            &gtk::Label::builder()
+                .label(format_date(&date))
+                .css_classes(["dim-label", "numeric"])
+                .build(),
+        );
+    }
     row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     row
 }

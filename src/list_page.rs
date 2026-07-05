@@ -8,7 +8,7 @@ pub fn build_list_page(
     heading: &str,
     description: &str,
     title_buttons: &[gtk::Widget],
-    list: &gtk::ListBox,
+    list: &impl IsA<gtk::Widget>,
 ) -> adw::NavigationPage {
     let title_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)

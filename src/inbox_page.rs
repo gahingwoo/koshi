@@ -156,18 +156,19 @@ fn build_row(slug: &str, description: &str) -> adw::ActionRow {
     row
 }
 
-/// A star toggle flipping the inbox's favorite state. Toggling rebuilds the
-/// whole page content — from an idle, since the rebuild destroys the very
-/// button whose signal handler requested it.
+/// A star button flipping the inbox's favorite state. A plain button rather
+/// than a ToggleButton: the starred/unstarred state already shows through
+/// the icon, and a checked ToggleButton would keep a pressed background.
+/// Clicking rebuilds the whole page content — from an idle, since the
+/// rebuild destroys the very button whose signal handler requested it.
 fn build_star_button(
     fav: FavoriteInbox,
     container: &gtk::Box,
     nav: &adw::NavigationView,
     inboxes: &Rc<Vec<Inbox>>,
-) -> gtk::ToggleButton {
+) -> gtk::Button {
     let starred = favorites::is_favorite_inbox(&fav.slug);
-    let button = gtk::ToggleButton::builder()
-        .active(starred)
+    let button = gtk::Button::builder()
         .icon_name(if starred {
             "starred-symbolic"
         } else {
@@ -182,21 +183,15 @@ fn build_star_button(
         .css_classes(["flat"])
         .build();
 
-    button.connect_toggled(glib::clone!(
+    button.connect_clicked(glib::clone!(
         #[weak]
         container,
         #[weak]
         nav,
         #[strong(rename_to = inboxes)]
         Rc::clone(inboxes),
-        move |button| {
-            // Drive the store from the button's own state rather than blindly
-            // flipping it: another tab's inbox page may have changed the
-            // store since this one was built, and a blind flip would then do
-            // the opposite of what the click asked for.
-            if favorites::is_favorite_inbox(&fav.slug) != button.is_active() {
-                favorites::toggle_inbox(fav.clone());
-            }
+        move |_| {
+            favorites::toggle_inbox(fav.clone());
             glib::idle_add_local_once(glib::clone!(
                 #[weak]
                 container,

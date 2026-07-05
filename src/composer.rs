@@ -259,6 +259,39 @@ impl Composer {
         self.preview_toggle.set_active(false);
         self.body_view.grab_focus();
     }
+
+    /// Insert `quoted` into the body at the last known cursor position and
+    /// reveal the editor with the cursor on the line after the quote.
+    pub fn insert_quote(&self, quoted: &str) {
+        let buffer = &self.state.body;
+        let mut iter = buffer.iter_at_mark(&buffer.get_insert());
+        // Keep the quote on lines of its own: break out of a partially
+        // typed line first, and end with a newline so the cursor lands on
+        // the line after the quote.
+        let mut text = String::new();
+        if !iter.starts_line() {
+            text.push('\n');
+        }
+        text.push_str(quoted);
+        text.push('\n');
+        buffer.insert(&mut iter, &text);
+        buffer.place_cursor(&iter);
+
+        self.expander.set_expanded(true);
+        self.preview_toggle.set_active(false);
+        self.body_view.grab_focus();
+        // Bring the cursor into view once the editor has a real allocation:
+        // the expander may only be expanding now, and scrolling a view that
+        // isn't laid out yet is a no-op.
+        glib::idle_add_local_once(glib::clone!(
+            #[weak(rename_to = view)]
+            self.body_view,
+            move || {
+                let buffer = view.buffer();
+                view.scroll_to_mark(&buffer.get_insert(), 0.0, false, 0.0, 0.0);
+            }
+        ));
+    }
 }
 
 /// Build the sticky reply composer, clamped to the same width as the mail

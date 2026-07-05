@@ -310,7 +310,7 @@ fn build_message_section(
         .spacing(12)
         .build();
     section.append(&build_header_list(mail, is_op, overlay, composer, titles));
-    section.append(&build_body_view(mail, nav, overlay));
+    section.append(&build_body_view(mail, nav, composer));
     section
 }
 
@@ -654,7 +654,7 @@ fn build_raw_page(raw: &str) -> adw::NavigationPage {
 fn build_body_view(
     mail: &Mail,
     nav: &adw::NavigationView,
-    overlay: &adw::ToastOverlay,
+    composer: &composer::Composer,
 ) -> adw::Bin {
     let view = gtk::TextView::builder()
         .editable(false)
@@ -668,12 +668,12 @@ fn build_body_view(
         .build();
     view.buffer().set_text(&mail.body);
 
-    let copy_quoted = |prefix: Option<String>| {
+    let insert_quoted = |prefix: Option<String>| {
         glib::clone!(
             #[weak]
             view,
-            #[weak]
-            overlay,
+            #[strong]
+            composer,
             move |_: &gio::SimpleAction, _: Option<&glib::Variant>| {
                 let buffer = view.buffer();
                 if let Some((start, end)) = buffer.selection_bounds() {
@@ -684,8 +684,7 @@ fn build_body_view(
                     if let Some(prefix) = &prefix {
                         result = format!("{prefix}\n{result}");
                     }
-                    view.clipboard().set_text(&result);
-                    overlay.add_toast(adw::Toast::new("Quoted text copied"));
+                    composer.insert_quote(&result);
                 }
             }
         )
@@ -693,11 +692,11 @@ fn build_body_view(
 
     let quote = gio::SimpleAction::new("quote-selection", None);
     quote.set_enabled(false);
-    quote.connect_activate(copy_quoted(None));
+    quote.connect_activate(insert_quoted(None));
 
     let quote_with_date = gio::SimpleAction::new("quote-with-date", None);
     quote_with_date.set_enabled(false);
-    quote_with_date.connect_activate(copy_quoted(Some(format!(
+    quote_with_date.connect_activate(insert_quoted(Some(format!(
         "On {}, {} wrote:",
         mail.date, mail.from
     ))));

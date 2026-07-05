@@ -373,7 +373,7 @@ fn build_message_section(
         .build();
     section.append(&build_header_list(mail, is_op, overlay, composer, titles));
     section.append(&build_body_view(mail, nav, composer));
-    setup_section_context_menu(mail, &section, nav);
+    setup_section_context_menu(mail, &section, nav, composer);
     section
 }
 
@@ -382,14 +382,20 @@ fn build_message_section(
 // mail actions are reachable from anywhere on the message. The body gesture
 // claims its clicks in the capture phase, so this bubble-phase gesture never
 // fires for them.
-fn setup_section_context_menu(mail: &Mail, section: &gtk::Box, nav: &adw::NavigationView) {
+fn setup_section_context_menu(
+    mail: &Mail,
+    section: &gtk::Box,
+    nav: &adw::NavigationView,
+    composer: &composer::Composer,
+) {
     let group = gio::SimpleActionGroup::new();
-    for action in build_mail_actions(mail, section.upcast_ref(), nav) {
+    for action in build_mail_actions(mail, section.upcast_ref(), nav, composer) {
         group.add_action(&action);
     }
     section.insert_action_group("mail", Some(&group));
 
     let menu = gio::Menu::new();
+    menu.append(Some("_Reply"), Some("mail.reply"));
     menu.append(Some("Open on _Web"), Some("mail.open-web"));
     menu.append(Some("View _Raw"), Some("mail.raw"));
 
@@ -729,7 +735,16 @@ fn build_mail_actions(
     mail: &Mail,
     widget: &gtk::Widget,
     nav: &adw::NavigationView,
-) -> [gio::SimpleAction; 2] {
+    composer: &composer::Composer,
+) -> [gio::SimpleAction; 3] {
+    let reply = gio::SimpleAction::new("reply", None);
+    let reply_context = build_reply_context(mail);
+    reply.connect_activate(glib::clone!(
+        #[strong]
+        composer,
+        move |_, _| composer.start_reply(reply_context.clone())
+    ));
+
     let open_web = gio::SimpleAction::new("open-web", None);
     let lore_url = mail.message_id.as_deref().map(|id| {
         let bare = id.trim().trim_start_matches('<').trim_end_matches('>');
@@ -755,7 +770,7 @@ fn build_mail_actions(
         move |_, _| nav.push(&build_raw_page(&raw_text, &subject))
     ));
 
-    [open_web, raw]
+    [reply, open_web, raw]
 }
 
 fn build_raw_page(raw: &str, subject: &str) -> adw::NavigationPage {
@@ -877,7 +892,7 @@ fn build_body_view(
     group.add_action(&quote_with_date);
     group.add_action(&copy);
     group.add_action(&select_all);
-    for action in build_mail_actions(mail, view.upcast_ref(), nav) {
+    for action in build_mail_actions(mail, view.upcast_ref(), nav, composer) {
         group.add_action(&action);
     }
     wrapper.insert_action_group("mailview", Some(&group));
@@ -899,6 +914,7 @@ fn setup_context_menu(view: &gtk::TextView, wrapper: &adw::Bin) {
     edit_section.append(Some("Select _All"), Some("mailview.select-all"));
 
     let mail_section = gio::Menu::new();
+    mail_section.append(Some("_Reply"), Some("mailview.reply"));
     mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
     mail_section.append(Some("View _Raw"), Some("mailview.raw"));
 

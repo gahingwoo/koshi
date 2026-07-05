@@ -256,6 +256,32 @@ pub fn build_thread_page(nav: &adw::NavigationView) -> adw::NavigationPage {
         .child(&clamp)
         .vexpand(true)
         .build();
+    // The ScrolledWindow wraps the clamp in a GtkViewport whose
+    // scroll-to-focus behavior jumps the page whenever a child grabs focus —
+    // e.g. clicking into a message body to select text. That auto-scroll is
+    // exactly right for keyboard focus (Tab must bring the focused widget
+    // into view), so instead of turning it off wholesale, suppress it only
+    // around pointer clicks: disable on press (capture phase, before the
+    // click's focus grab) and re-enable from an idle once the grab has been
+    // processed.
+    if let Some(viewport) = scrolled.child().and_downcast::<gtk::Viewport>() {
+        let gesture = gtk::GestureClick::builder()
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        gesture.connect_pressed(glib::clone!(
+            #[weak]
+            viewport,
+            move |_, _, _, _| {
+                viewport.set_scroll_to_focus(false);
+                glib::idle_add_local_once(glib::clone!(
+                    #[weak]
+                    viewport,
+                    move || viewport.set_scroll_to_focus(true)
+                ));
+            }
+        ));
+        scrolled.add_controller(gesture);
+    }
     overlay.set_child(Some(&scrolled));
 
     // The composer sits below the scrolling mail body in a plain box, so it

@@ -627,16 +627,17 @@ fn build_mail_actions(
 
     let raw = gio::SimpleAction::new("raw", None);
     let raw_text = mail.raw.clone();
+    let subject = mail.subject.clone();
     raw.connect_activate(glib::clone!(
         #[weak]
         nav,
-        move |_, _| nav.push(&build_raw_page(&raw_text))
+        move |_, _| nav.push(&build_raw_page(&raw_text, &subject))
     ));
 
     [open_web, raw]
 }
 
-fn build_raw_page(raw: &str) -> adw::NavigationPage {
+fn build_raw_page(raw: &str, subject: &str) -> adw::NavigationPage {
     let view = gtk::TextView::builder()
         .editable(false)
         .cursor_visible(false)
@@ -649,7 +650,7 @@ fn build_raw_page(raw: &str) -> adw::NavigationPage {
     view.buffer().set_text(raw);
 
     let scrolled = gtk::ScrolledWindow::builder().child(&view).build();
-    adw::NavigationPage::new(&scrolled, "Raw")
+    adw::NavigationPage::new(&scrolled, &format!("Raw - {subject}"))
 }
 
 fn build_body_view(

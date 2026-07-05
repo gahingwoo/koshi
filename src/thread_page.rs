@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 use mailparse::MailHeaderMap;
@@ -196,19 +198,45 @@ fn find_text_body(part: &mailparse::ParsedMail) -> Option<String> {
     part.subparts.iter().find_map(find_text_body)
 }
 
+pub const THREAD_PAGE_NAME: &str = "koshi-thread-page";
+
 pub fn build_thread_page(
     nav: &adw::NavigationView,
     list: &str,
     message_id: &str,
 ) -> adw::NavigationPage {
     let remote = RemoteContent::new();
-    let page = adw::NavigationPage::new(remote.widget(), "Loading…");
-    spawn_thread_load(remote, nav.clone(), page.clone(), list.to_string(), message_id.to_string());
+    // The overview sidebar arrives with the thread; until then the split
+    // view has no sidebar and toggle_overview is a no-op.
+    let split = adw::OverlaySplitView::builder()
+        .content(remote.widget())
+        .sidebar_position(gtk::PackType::End)
+        .show_sidebar(false)
+        .sidebar_width_fraction(0.66)
+        .min_sidebar_width(360.0)
+        .max_sidebar_width(1400.0)
+        .build();
+    let page = adw::NavigationPage::new(&split, "Loading…");
+    page.set_widget_name(THREAD_PAGE_NAME);
+    spawn_thread_load(remote, split, nav.clone(), page.clone(), list.to_string(), message_id.to_string());
     page
+}
+
+/// Flip the thread-overview sidebar of a thread page built by
+/// build_thread_page. Does nothing until the thread has loaded (there is no
+/// tree to show before that) or on pages that aren't thread pages.
+pub fn toggle_overview(page: &adw::NavigationPage) {
+    let Some(split) = page.child().and_downcast::<adw::OverlaySplitView>() else {
+        return;
+    };
+    if split.sidebar().is_some() {
+        split.set_show_sidebar(!split.shows_sidebar());
+    }
 }
 
 fn spawn_thread_load(
     remote: RemoteContent,
+    split: adw::OverlaySplitView,
     nav: adw::NavigationView,
     page: adw::NavigationPage,
     list: String,
@@ -222,14 +250,16 @@ fn spawn_thread_load(
                 let thread = parse_thread(&mbox);
                 if thread.is_empty() {
                     let error = lore::Error::Parse("the thread has no messages".to_string());
-                    show_thread_error(&remote, &error, &nav, &page, list, message_id);
+                    show_thread_error(&remote, &error, &split, &nav, &page, list, message_id);
                 } else {
                     page.set_title(&thread[0].subject);
-                    remote.show_content(&build_thread_content(&nav, &thread, &list));
+                    let widgets = build_thread_content(&nav, &thread, &list);
+                    remote.show_content(&widgets.content);
+                    split.set_sidebar(Some(&widgets.overview));
                 }
             }
             Err(error) if error.is_cancelled() => {}
-            Err(error) => show_thread_error(&remote, &error, &nav, &page, list, message_id),
+            Err(error) => show_thread_error(&remote, &error, &split, &nav, &page, list, message_id),
         }
     });
 }
@@ -237,28 +267,38 @@ fn spawn_thread_load(
 fn show_thread_error(
     remote: &RemoteContent,
     error: &lore::Error,
+    split: &adw::OverlaySplitView,
     nav: &adw::NavigationView,
     page: &adw::NavigationPage,
     list: String,
     message_id: String,
 ) {
     let weak = remote.downgrade();
+    let split = split.downgrade();
     let nav = nav.downgrade();
     let page = page.downgrade();
     remote.show_error(error, move || {
-        let (Some(remote), Some(nav), Some(page)) = (weak.upgrade(), nav.upgrade(), page.upgrade())
+        let (Some(remote), Some(split), Some(nav), Some(page)) =
+            (weak.upgrade(), split.upgrade(), nav.upgrade(), page.upgrade())
         else {
             return;
         };
-        spawn_thread_load(remote, nav, page, list.clone(), message_id.clone());
+        spawn_thread_load(remote, split, nav, page, list.clone(), message_id.clone());
     });
+}
+
+/// The two widgets a loaded thread produces: the scrolling message stack
+/// (with the composer below it) and the overview sidebar for the split view.
+struct ThreadWidgets {
+    content: gtk::Box,
+    overview: gtk::Widget,
 }
 
 fn build_thread_content(
     nav: &adw::NavigationView,
     thread: &[Mail],
     list: &str,
-) -> gtk::Box {
+) -> ThreadWidgets {
     let op = &thread[0];
 
     let overlay = adw::ToastOverlay::new();
@@ -304,9 +344,12 @@ fn build_thread_content(
     // One title-column width shared by every card, so the header value
     // columns line up across the whole stack, not just within one message.
     let titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    let mut sections: Vec<gtk::Box> = Vec::with_capacity(thread.len());
     for (index, mail) in thread.iter().enumerate() {
         let is_op = index == 0;
-        content.append(&build_message_section(mail, is_op, nav, &overlay, &composer, &titles));
+        let section = build_message_section(mail, is_op, nav, &overlay, &composer, &titles);
+        content.append(&section);
+        sections.push(section);
     }
 
     let clamp = adw::Clamp::builder()
@@ -355,7 +398,231 @@ fn build_thread_content(
     content_box.append(&overlay);
     content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content_box.append(composer.widget());
-    content_box
+
+    ThreadWidgets {
+        content: content_box,
+        overview: build_overview_sidebar(thread, sections, &scrolled),
+    }
+}
+
+/// One row of the overview tree: which message, how deep, and who it
+/// replies to (None for messages that start their own subthread).
+struct TreeRow {
+    index: usize,
+    depth: usize,
+    parent: Option<usize>,
+}
+
+/// Arrange the thread as lore.kernel.org's overview does: depth-first over
+/// the In-Reply-To graph, children in arrival order. A message whose parent
+/// is missing from the thread starts at depth zero; a parent may well appear
+/// later in the mbox than its reply (lore serves cover letters after the
+/// first patch), so linking is by id, not by file position.
+fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
+    let mut position: HashMap<&str, usize> = HashMap::new();
+    for (index, mail) in thread.iter().enumerate() {
+        if let Some(id) = &mail.message_id {
+            position.entry(normalize_message_id(id)).or_insert(index);
+        }
+    }
+
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); thread.len()];
+    let mut roots: Vec<usize> = Vec::new();
+    for (index, mail) in thread.iter().enumerate() {
+        let parent = mail
+            .in_reply_to
+            .as_deref()
+            .map(normalize_message_id)
+            .and_then(|id| position.get(id).copied())
+            .filter(|&parent| parent != index);
+        match parent {
+            Some(parent) => children[parent].push(index),
+            None => roots.push(index),
+        }
+    }
+
+    let mut rows = Vec::with_capacity(thread.len());
+    let mut emitted = vec![false; thread.len()];
+    let mut stack: Vec<TreeRow> = roots
+        .iter()
+        .rev()
+        .map(|&index| TreeRow { index, depth: 0, parent: None })
+        .collect();
+    loop {
+        while let Some(row) = stack.pop() {
+            // The emitted guard makes reference cycles finite: a child that
+            // was already written out is not descended into again.
+            if std::mem::replace(&mut emitted[row.index], true) {
+                continue;
+            }
+            let (index, depth) = (row.index, row.depth);
+            rows.push(row);
+            stack.extend(children[index].iter().rev().map(|&child| TreeRow {
+                index: child,
+                depth: depth + 1,
+                parent: Some(index),
+            }));
+        }
+        // Messages caught in a reference cycle have no root to be reached
+        // from; surface the first stranded one as a root and keep going.
+        match emitted.iter().position(|&done| !done) {
+            Some(index) => stack.push(TreeRow { index, depth: 0, parent: None }),
+            None => return rows,
+        }
+    }
+}
+
+/// The comparable core of a Message-ID or In-Reply-To header: the first
+/// <...> content if any (In-Reply-To may carry several ids or trailing
+/// comments), the trimmed text otherwise.
+fn normalize_message_id(header: &str) -> &str {
+    let bracketed = header
+        .split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>'))
+        .map(|(id, _)| id);
+    bracketed.unwrap_or_else(|| header.trim())
+}
+
+/// Subject with any leading "Re:" chains removed, for telling "same
+/// conversation" apart from "subject actually changed".
+fn strip_reply_prefixes(subject: &str) -> &str {
+    let mut subject = subject.trim();
+    while let Some(rest) = subject
+        .get(..3)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("re:"))
+        .map(|_| subject[3..].trim_start())
+    {
+        subject = rest;
+    }
+    subject
+}
+
+/// The display-name part of a From header, falling back to the whole value.
+fn author_name(from: &str) -> &str {
+    let name = from
+        .split('<')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"')
+        .trim();
+    if name.is_empty() { from.trim() } else { name }
+}
+
+/// The Date header as UTC "YYYY-MM-DD HH:MM", lore-style; unparsable dates
+/// fall through verbatim.
+fn overview_date(date: &str) -> String {
+    mailparse::dateparse(date)
+        .ok()
+        // dateparse yields Ok(0) for text it can't parse at all; a real
+        // epoch-zero Date header is broken enough to show verbatim too.
+        .filter(|&ts| ts != 0)
+        .and_then(|ts| glib::DateTime::from_unix_utc(ts).ok())
+        .and_then(|dt| dt.format("%Y-%m-%d %H:%M").ok())
+        .map(|formatted| formatted.to_string())
+        .unwrap_or_else(|| date.trim().to_string())
+}
+
+/// One overview line, mirroring lore: date, indent, a "`" reply marker,
+/// then the subject (only when it differs from the parent's, ignoring Re:)
+/// and the author.
+fn overview_row_label(mail: &Mail, depth: usize, parent_subject: Option<&str>) -> String {
+    let mut label = format!("{} ", overview_date(&mail.date));
+    if depth > 0 {
+        label.push_str(&"  ".repeat(depth - 1));
+        label.push_str("` ");
+    }
+    let same_subject = parent_subject.is_some_and(|parent| {
+        strip_reply_prefixes(parent).eq_ignore_ascii_case(strip_reply_prefixes(&mail.subject))
+    });
+    if parent_subject.is_none() || same_subject {
+        label.push_str(author_name(&mail.from));
+    } else {
+        label.push_str(mail.subject.trim());
+        label.push(' ');
+        label.push_str(author_name(&mail.from));
+    }
+    label
+}
+
+/// The overview sidebar: a heading over one activatable row per message,
+/// laid out as the lore-style tree; activating a row scrolls the message
+/// stack to that message.
+fn build_overview_sidebar(
+    thread: &[Mail],
+    sections: Vec<gtk::Box>,
+    scrolled: &gtk::ScrolledWindow,
+) -> gtk::Widget {
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["navigation-sidebar"])
+        .build();
+
+    // The list rows are appended in tree order, so their list positions no
+    // longer match message order; this maps row position -> message index.
+    let mut message_of_row: Vec<usize> = Vec::with_capacity(thread.len());
+    for row in thread_tree(thread) {
+        // The first message never shows its subject (it heads the page
+        // already); a later parentless message compares against the OP so a
+        // changed subject still shows up.
+        let parent_subject = row
+            .parent
+            .map(|parent| thread[parent].subject.as_str())
+            .or_else(|| (row.index != 0).then(|| thread[0].subject.as_str()));
+        let text = overview_row_label(&thread[row.index], row.depth, parent_subject);
+
+        let label = gtk::Label::builder()
+            .label(&text)
+            .tooltip_text(&text)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .xalign(0.0)
+            .css_classes(["monospace", "caption"])
+            .build();
+        list.append(&gtk::ListBoxRow::builder().child(&label).build());
+        message_of_row.push(row.index);
+    }
+
+    list.connect_row_activated(glib::clone!(
+        #[weak]
+        scrolled,
+        move |_, row| {
+            let Some(section) = message_of_row
+                .get(row.index() as usize)
+                .and_then(|&index| sections.get(index))
+            else {
+                return;
+            };
+            if let Some(viewport) = scrolled.child().and_downcast::<gtk::Viewport>() {
+                viewport.scroll_to(section, None);
+            }
+        }
+    ));
+
+    let heading = gtk::Label::builder()
+        .label(format!(
+            "Thread Overview — {} message{}",
+            thread.len(),
+            if thread.len() == 1 { "" } else { "s" }
+        ))
+        .xalign(0.0)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .css_classes(["heading"])
+        .build();
+
+    let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar.append(&heading);
+    sidebar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    sidebar.append(
+        &gtk::ScrolledWindow::builder()
+            .child(&list)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .build(),
+    );
+    sidebar.upcast()
 }
 
 /// One message of the thread: its header list stacked over its body view.
@@ -1092,6 +1359,135 @@ mod tests {
         let mut lines = mail.body.lines();
         assert_eq!(lines.next(), Some("From escaped by the writer"));
         assert_eq!(lines.next(), Some(">From decoded, stays quoted"));
+    }
+
+    /// A minimal Mail for tree tests: only the fields the overview reads.
+    fn mail(id: &str, in_reply_to: Option<&str>, subject: &str, from: &str) -> Mail {
+        Mail {
+            subject: subject.to_string(),
+            from: from.to_string(),
+            to: String::new(),
+            to_addrs: Vec::new(),
+            cc: None,
+            cc_addrs: Vec::new(),
+            date: "Mon, 29 Jun 2026 03:51:00 +0000".to_string(),
+            message_id: Some(format!("<{id}>")),
+            in_reply_to: in_reply_to.map(|id| format!("<{id}>")),
+            body: String::new(),
+            raw: String::new(),
+        }
+    }
+
+    #[test]
+    fn tree_nests_replies_depth_first() {
+        // op ─ a ─ c ─ d, and op ─ b: DFS must visit a's subtree before b.
+        let thread = [
+            mail("op@x", None, "[PATCH 0/2] series", "Nika"),
+            mail("a@x", Some("op@x"), "Re: [PATCH 0/2] series", "Miguel"),
+            mail("b@x", Some("op@x"), "[PATCH 1/2] first", "Nika"),
+            mail("c@x", Some("a@x"), "Re: [PATCH 0/2] series", "Nika"),
+            mail("d@x", Some("c@x"), "Re: [PATCH 0/2] series", "Miguel"),
+        ];
+        let rows: Vec<(usize, usize)> = thread_tree(&thread)
+            .iter()
+            .map(|row| (row.index, row.depth))
+            .collect();
+        assert_eq!(rows, [(0, 0), (1, 1), (3, 2), (4, 3), (2, 1)]);
+    }
+
+    #[test]
+    fn tree_roots_orphans_and_survives_cycles() {
+        let thread = [
+            // Replies to itself: must not recurse forever.
+            mail("self@x", Some("self@x"), "loop", "A"),
+            // Parent not in the thread: becomes a root.
+            mail("orphan@x", Some("gone@x"), "orphan", "B"),
+            // A mutual reference cycle: neither is reachable from a root.
+            mail("early@x", Some("late@x"), "early", "C"),
+            mail("late@x", Some("early@x"), "late", "D"),
+        ];
+        let rows = thread_tree(&thread);
+        assert_eq!(rows.len(), thread.len());
+        assert_eq!(
+            rows.iter().filter(|row| row.depth == 0).count(),
+            3,
+            "self-reply, orphan and one cycle member are roots"
+        );
+        // The cycle is cut once: its first message roots it, the other nests.
+        let late = rows.iter().find(|row| row.index == 3).unwrap();
+        assert_eq!((late.parent, late.depth), (Some(2), 1));
+    }
+
+    #[test]
+    fn tree_resolves_parents_that_arrive_later() {
+        // lore's t.mbox can serve a cover letter after the first patch; the
+        // patches must still nest under it.
+        let thread = [
+            mail("p1@x", Some("cover@x"), "[PATCH 1/2] first", "Nika"),
+            mail("cover@x", None, "[PATCH 0/2] series", "Nika"),
+            mail("p2@x", Some("cover@x"), "[PATCH 2/2] second", "Nika"),
+        ];
+        let rows: Vec<(usize, usize)> = thread_tree(&thread)
+            .iter()
+            .map(|row| (row.index, row.depth))
+            .collect();
+        assert_eq!(rows, [(1, 0), (0, 1), (2, 1)]);
+    }
+
+    #[test]
+    fn tree_covers_the_fixture_thread() {
+        let thread = parse_thread(RAW_THREAD);
+        let rows = thread_tree(&thread);
+        assert_eq!(rows.len(), thread.len());
+        // Every message appears exactly once.
+        let mut seen: Vec<usize> = rows.iter().map(|row| row.index).collect();
+        seen.sort();
+        assert_eq!(seen, (0..thread.len()).collect::<Vec<_>>());
+        // The OP heads the tree; every reply sits below some parent.
+        assert_eq!((rows[0].index, rows[0].depth), (0, 0));
+        assert!(rows[1..].iter().all(|row| row.depth > 0));
+    }
+
+    #[test]
+    fn overview_labels_follow_lore_conventions() {
+        let op = mail("op@x", None, "[PATCH 0/2] series", "Nika Krasnova <nika@x>");
+        let same = mail("a@x", Some("op@x"), "Re: [PATCH 0/2] series", "Miguel Ojeda <m@x>");
+        let changed = mail("b@x", Some("op@x"), "[PATCH 1/2] first patch", "Nika Krasnova <nika@x>");
+
+        // The OP row: date and author only.
+        assert_eq!(overview_row_label(&op, 0, None), "2026-06-29 03:51 Nika Krasnova");
+        // Same subject as the parent (modulo Re:): author only, marker indented.
+        assert_eq!(
+            overview_row_label(&same, 1, Some("[PATCH 0/2] series")),
+            "2026-06-29 03:51 ` Miguel Ojeda"
+        );
+        assert_eq!(
+            overview_row_label(&same, 3, Some("[PATCH 0/2] series")),
+            "2026-06-29 03:51     ` Miguel Ojeda"
+        );
+        // Changed subject: shown before the author.
+        assert_eq!(
+            overview_row_label(&changed, 1, Some("[PATCH 0/2] series")),
+            "2026-06-29 03:51 ` [PATCH 1/2] first patch Nika Krasnova"
+        );
+    }
+
+    #[test]
+    fn overview_dates_fall_back_verbatim() {
+        let mut broken = mail("x@x", None, "s", "A");
+        broken.date = "not a date".to_string();
+        assert_eq!(overview_date(&broken.date), "not a date");
+    }
+
+    #[test]
+    fn normalizes_message_id_references() {
+        assert_eq!(normalize_message_id("<a@b>"), "a@b");
+        assert_eq!(normalize_message_id(" <a@b> <c@d>"), "a@b");
+        assert_eq!(normalize_message_id("bare@id "), "bare@id");
+        assert_eq!(strip_reply_prefixes("Re: RE: re:subject"), "subject");
+        assert_eq!(strip_reply_prefixes("Regarding x"), "Regarding x");
+        assert_eq!(author_name("\"Nika K\" <n@x>"), "Nika K");
+        assert_eq!(author_name("n@x"), "n@x");
     }
 
     #[test]

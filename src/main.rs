@@ -18,7 +18,7 @@ use gtk::{gio, glib};
 use favorites_page::{FAVORITES_PAGE_NAME, build_favorites_page};
 use inbox_page::{INBOX_LIST_TITLE, build_inbox_page};
 use thread_list_page::{build_search_page, build_thread_list_page};
-use thread_page::build_thread_page;
+use thread_page::{THREAD_PAGE_NAME, build_thread_page, toggle_overview};
 
 const APP_ID: &str = "moe.nikableh.Koshi";
 
@@ -79,8 +79,25 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
     let go_back = gio::SimpleAction::new("go-back", None);
     go_back.set_enabled(false);
 
+    let thread_overview = gio::SimpleAction::new("toggle-thread-overview", None);
+    thread_overview.set_enabled(false);
+    thread_overview.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        move |_, _| {
+            if let Some(page) = selected_nav(&tab_view).and_then(|nav| nav.visible_page()) {
+                toggle_overview(&page);
+            }
+        }
+    ));
+
     let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&build_header_bar(&search_entry, &tab_view, &go_back));
+    toolbar_view.add_top_bar(&build_header_bar(
+        &search_entry,
+        &tab_view,
+        &go_back,
+        &thread_overview,
+    ));
     toolbar_view.add_top_bar(&tab_bar);
     toolbar_view.set_content(Some(&tab_view));
 
@@ -97,9 +114,12 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
     tab_view.connect_selected_page_notify(glib::clone!(
         #[strong]
         go_back,
+        #[strong]
+        thread_overview,
         move |view| {
-            let can_pop = selected_nav(view).is_some_and(|nav| nav_can_pop(&nav));
-            go_back.set_enabled(can_pop);
+            let nav = selected_nav(view);
+            go_back.set_enabled(nav.as_ref().is_some_and(nav_can_pop));
+            thread_overview.set_enabled(nav.as_ref().is_some_and(nav_shows_thread));
         }
     ));
 
@@ -112,6 +132,7 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
         .build();
 
     window.add_action(&go_back);
+    window.add_action(&thread_overview);
     setup_actions(app, &window, &search_entry);
     setup_search(&search_entry, &tab_view);
 
@@ -362,6 +383,11 @@ fn nav_can_pop(nav: &adw::NavigationView) -> bool {
         .is_some()
 }
 
+fn nav_shows_thread(nav: &adw::NavigationView) -> bool {
+    nav.visible_page()
+        .is_some_and(|page| page.widget_name() == THREAD_PAGE_NAME)
+}
+
 fn update_go_back_action(nav: &adw::NavigationView) {
     let Some(window) = nav.root().and_downcast::<adw::ApplicationWindow>() else {
         return;
@@ -371,6 +397,12 @@ fn update_go_back_action(nav: &adw::NavigationView) {
         .and_downcast::<gio::SimpleAction>()
     {
         action.set_enabled(nav_can_pop(nav));
+    }
+    if let Some(action) = window
+        .lookup_action("toggle-thread-overview")
+        .and_downcast::<gio::SimpleAction>()
+    {
+        action.set_enabled(nav_shows_thread(nav));
     }
 }
 
@@ -385,6 +417,7 @@ fn build_header_bar(
     search_entry: &gtk::SearchEntry,
     tab_view: &adw::TabView,
     go_back: &gio::SimpleAction,
+    thread_overview: &gio::SimpleAction,
 ) -> adw::HeaderBar {
     let header = adw::HeaderBar::new();
 
@@ -439,9 +472,22 @@ fn build_header_bar(
         .build();
     header.set_title_widget(Some(&clamp));
 
+    // Like the back button, only shown where it applies: on a thread page.
+    let overview_button = gtk::Button::builder()
+        .icon_name("sidebar-show-right-symbolic")
+        .tooltip_text("Thread Overview")
+        .action_name("win.toggle-thread-overview")
+        .visible(false)
+        .build();
+    thread_overview
+        .bind_property("enabled", &overview_button, "visible")
+        .sync_create()
+        .build();
+
     header.pack_end(&build_primary_menu_button());
     header.pack_end(&build_account_button());
     header.pack_end(&favorites_button);
+    header.pack_end(&overview_button);
 
     header
 }
@@ -519,6 +565,7 @@ fn setup_actions(
     app.add_action_entries([preferences, shortcuts, about, sign_in, manage_accounts]);
 
     app.set_accels_for_action("win.focus-search", &["<Control>l"]);
+    app.set_accels_for_action("win.toggle-thread-overview", &["F9"]);
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
     app.set_accels_for_action("app.shortcuts", &["<Control>question"]);
 }
@@ -540,6 +587,10 @@ fn show_shortcuts(app: &adw::Application) {
     section.add(adw::ShortcutsItem::from_action(
         "Focus search",
         "win.focus-search",
+    ));
+    section.add(adw::ShortcutsItem::from_action(
+        "Thread overview",
+        "win.toggle-thread-overview",
     ));
     section.add(adw::ShortcutsItem::from_action(
         "Preferences",

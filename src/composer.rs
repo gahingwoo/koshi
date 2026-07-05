@@ -609,7 +609,9 @@ fn build_trailer_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::
 
 fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
     let button = gtk::Button::builder()
-        .icon_name("view-wrapped-symbolic")
+        // Bundled icon: icon-development-kit's arrow-hook-left-horizontal2
+        // flipped vertically (see data/icons/).
+        .icon_name("koshi-rewrap-symbolic")
         .tooltip_text("Rewrap Lines")
         .css_classes(["flat"])
         .build();

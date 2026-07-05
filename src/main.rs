@@ -18,8 +18,14 @@ use inbox_page::{INBOX_LIST_TITLE, build_inbox_page};
 const APP_ID: &str = "moe.nikableh.Koshi";
 
 fn main() -> glib::ExitCode {
+    gio::resources_register_include!("koshi.gresource")
+        .expect("failed to register resources");
+
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| load_css());
+    app.connect_startup(|_| {
+        load_css();
+        register_bundled_icons();
+    });
     app.connect_activate(build_ui);
     app.run()
 }
@@ -37,6 +43,14 @@ fn load_css() {
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+}
+
+// Icons bundled in the gresource (e.g. the mirrored rewrap arrow) are not in
+// the system theme, so the resource icon dir must be on the theme's path.
+fn register_bundled_icons() {
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::IconTheme::for_display(&display).add_resource_path("/moe/nikableh/Koshi/icons");
     }
 }
 
@@ -472,4 +486,20 @@ fn show_about(app: &adw::Application) {
         .version(env!("CARGO_PKG_VERSION"))
         .build();
     about.present(app.active_window().as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bundled_rewrap_icon_is_in_the_gresource() {
+        gtk::gio::resources_register_include!("koshi.gresource").unwrap();
+        let data = gtk::gio::resources_lookup_data(
+            "/moe/nikableh/Koshi/icons/scalable/actions/koshi-rewrap-symbolic.svg",
+            gtk::gio::ResourceLookupFlags::NONE,
+        )
+        .unwrap();
+        let svg = String::from_utf8(data.to_vec()).unwrap();
+        // The bundled asset must stay the x-axis-mirrored variant.
+        assert!(svg.contains("matrix(1 0 0 -1 0 16)"), "flip lost: {svg}");
+    }
 }

@@ -312,7 +312,66 @@ fn build_message_section(
         .build();
     section.append(&build_header_list(mail, is_op, overlay, composer, titles));
     section.append(&build_body_view(mail, nav, composer));
+    setup_section_context_menu(mail, &section, nav);
     section
+}
+
+// The body view's context menu only covers the body text; this one catches
+// right-clicks on the rest of the message card (header rows, padding) so the
+// mail actions are reachable from anywhere on the message. The body gesture
+// claims its clicks in the capture phase, so this bubble-phase gesture never
+// fires for them.
+fn setup_section_context_menu(mail: &Mail, section: &gtk::Box, nav: &adw::NavigationView) {
+    let group = gio::SimpleActionGroup::new();
+    for action in build_mail_actions(mail, section.upcast_ref(), nav) {
+        group.add_action(&action);
+    }
+    section.insert_action_group("mail", Some(&group));
+
+    let menu = gio::Menu::new();
+    menu.append(Some("Open on _Web"), Some("mail.open-web"));
+    menu.append(Some("View _Raw"), Some("mail.raw"));
+
+    // Selectable labels (header values, address pills) pop their own stock
+    // menu on right-click, which would otherwise shadow the mail actions;
+    // append them there as an extra-menu section.
+    add_label_extra_menus(section.upcast_ref(), &menu);
+
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(section);
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk::Align::Start);
+    section.connect_destroy(glib::clone!(
+        #[weak]
+        popover,
+        move |_| popover.unparent()
+    ));
+
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gdk::BUTTON_SECONDARY);
+    gesture.connect_pressed(glib::clone!(
+        #[weak]
+        popover,
+        move |gesture, _, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    ));
+    section.add_controller(gesture);
+}
+
+fn add_label_extra_menus(widget: &gtk::Widget, menu: &gio::Menu) {
+    if let Some(label) = widget.downcast_ref::<gtk::Label>()
+        && label.is_selectable()
+    {
+        label.set_extra_menu(Some(menu));
+    }
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        add_label_extra_menus(&next, menu);
+        child = next.next_sibling();
+    }
 }
 
 /// Reply prefill: To = the author, Cc = everyone else on the thread,
@@ -606,7 +665,7 @@ fn build_address_pill(addr: &str, overlay: &adw::ToastOverlay) -> gtk::Button {
 
 fn build_mail_actions(
     mail: &Mail,
-    view: &gtk::TextView,
+    widget: &gtk::Widget,
     nav: &adw::NavigationView,
 ) -> [gio::SimpleAction; 2] {
     let open_web = gio::SimpleAction::new("open-web", None);
@@ -617,10 +676,10 @@ fn build_mail_actions(
     open_web.set_enabled(lore_url.is_some());
     open_web.connect_activate(glib::clone!(
         #[weak]
-        view,
+        widget,
         move |_, _| {
             if let Some(url) = &lore_url {
-                launch_uri(&view, url);
+                launch_uri(&widget, url);
             }
         }
     ));
@@ -756,7 +815,7 @@ fn build_body_view(
     group.add_action(&quote_with_date);
     group.add_action(&copy);
     group.add_action(&select_all);
-    for action in build_mail_actions(mail, &view, nav) {
+    for action in build_mail_actions(mail, view.upcast_ref(), nav) {
         group.add_action(&action);
     }
     wrapper.insert_action_group("mailview", Some(&group));
@@ -813,15 +872,11 @@ fn setup_context_menu(view: &gtk::TextView, wrapper: &adw::Bin) {
 
 fn launch_uri(widget: &impl IsA<gtk::Widget>, uri: &str) {
     let parent = widget.root().and_downcast::<gtk::Window>();
-    gtk::UriLauncher::new(uri).launch(
-        parent.as_ref(),
-        gio::Cancellable::NONE,
-        |result| {
-            if let Err(error) = result {
-                eprintln!("Failed to launch URI: {error}");
-            }
-        },
-    );
+    gtk::UriLauncher::new(uri).launch(parent.as_ref(), gio::Cancellable::NONE, |result| {
+        if let Err(error) = result {
+            eprintln!("Failed to launch URI: {error}");
+        }
+    });
 }
 
 #[cfg(test)]
@@ -856,8 +911,16 @@ mod tests {
                 "unnormalized body: {}",
                 mail.from
             );
-            assert!(!mail.raw.starts_with("From "), "mbox line kept: {}", mail.from);
-            assert!(mail.raw.contains("Subject:"), "raw truncated: {}", mail.from);
+            assert!(
+                !mail.raw.starts_with("From "),
+                "mbox line kept: {}",
+                mail.from
+            );
+            assert!(
+                mail.raw.contains("Subject:"),
+                "raw truncated: {}",
+                mail.from
+            );
         }
 
         // Quoted-printable reply bodies must come out decoded.
@@ -872,8 +935,14 @@ mod tests {
         assert_eq!(op.to_addrs.len(), 17, "To: {:?}", op.to_addrs);
         assert_eq!(op.to_addrs[0], "Russell King <linux@armlinux.org.uk>");
         assert_eq!(op.cc_addrs.len(), 7, "Cc: {:?}", op.cc_addrs);
-        assert!(op.cc_addrs.contains(&"kernel test robot <lkp@intel.com>".to_string()));
-        assert!(op.cc_addrs.contains(&"linux-clk@vger.kernel.org".to_string()));
+        assert!(
+            op.cc_addrs
+                .contains(&"kernel test robot <lkp@intel.com>".to_string())
+        );
+        assert!(
+            op.cc_addrs
+                .contains(&"linux-clk@vger.kernel.org".to_string())
+        );
     }
 
     #[test]

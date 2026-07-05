@@ -1,8 +1,9 @@
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::favorites::{self, Favorite};
+use crate::favorites::{self, Favorite, FavoriteInbox};
 use crate::list_page::build_list_page;
+use crate::thread_list_page::build_thread_list_page;
 use crate::thread_page::build_thread_page;
 
 pub const FAVORITES_TITLE: &str = "Favorites";
@@ -14,44 +15,100 @@ pub const FAVORITES_TITLE: &str = "Favorites";
 pub const FAVORITES_PAGE_NAME: &str = "koshi-favorites-page";
 
 pub fn build_favorites_page(nav: &adw::NavigationView) -> adw::NavigationPage {
-    let favorites = favorites::all();
+    let inboxes = favorites::all_inboxes();
+    let mails = favorites::all();
 
     // HIG placeholder-page pattern: an empty view gets a symbolic
     // AdwStatusPage instead of an empty list.
-    let page = if favorites.is_empty() {
+    let page = if inboxes.is_empty() && mails.is_empty() {
         let status = adw::StatusPage::builder()
             .icon_name("non-starred-symbolic")
             .title("No Favorites")
-            .description("Star a message to add it here")
+            .description("Star a message or an inbox to add it here")
             .build();
         adw::NavigationPage::new(&status, FAVORITES_TITLE)
     } else {
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
             .build();
-        for fav in &favorites {
-            list.append(&build_favorite_row(fav));
+        if !inboxes.is_empty() {
+            content.append(&build_section_heading("Inboxes"));
+            content.append(&build_inbox_list(nav, inboxes));
         }
-        list.connect_row_activated(glib::clone!(
-            #[weak]
-            nav,
-            move |_, row| {
-                let fav = &favorites[row.index() as usize];
-                nav.push(&build_thread_page(&nav, &fav.list, &fav.message_id));
-            }
-        ));
+        if !mails.is_empty() {
+            content.append(&build_section_heading("Messages"));
+            content.append(&build_mail_list(nav, mails));
+        }
 
         build_list_page(
             FAVORITES_TITLE,
             FAVORITES_TITLE,
-            "Starred messages",
+            "Starred inboxes and messages",
             &[],
-            &list,
+            &content,
         )
     };
     page.set_widget_name(FAVORITES_PAGE_NAME);
     page
+}
+
+fn build_section_heading(label: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(label)
+        .halign(gtk::Align::Start)
+        .css_classes(["heading"])
+        .build()
+}
+
+fn build_inbox_list(nav: &adw::NavigationView, inboxes: Vec<FavoriteInbox>) -> gtk::ListBox {
+    let list = new_boxed_list();
+    for fav in &inboxes {
+        list.append(&build_inbox_row(fav));
+    }
+    list.connect_row_activated(glib::clone!(
+        #[weak]
+        nav,
+        move |_, row| {
+            let fav = &inboxes[row.index() as usize];
+            nav.push(&build_thread_list_page(&nav, &fav.slug, &fav.description));
+        }
+    ));
+    list
+}
+
+fn build_mail_list(nav: &adw::NavigationView, mails: Vec<Favorite>) -> gtk::ListBox {
+    let list = new_boxed_list();
+    for fav in &mails {
+        list.append(&build_favorite_row(fav));
+    }
+    list.connect_row_activated(glib::clone!(
+        #[weak]
+        nav,
+        move |_, row| {
+            let fav = &mails[row.index() as usize];
+            nav.push(&build_thread_page(&nav, &fav.list, &fav.message_id));
+        }
+    ));
+    list
+}
+
+fn new_boxed_list() -> gtk::ListBox {
+    gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build()
+}
+
+fn build_inbox_row(fav: &FavoriteInbox) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&fav.slug))
+        .subtitle(glib::markup_escape_text(&fav.description))
+        .activatable(true)
+        .build();
+    row.add_prefix(&gtk::Image::from_icon_name("mail-unread-symbolic"));
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    row
 }
 
 fn build_favorite_row(fav: &Favorite) -> adw::ActionRow {

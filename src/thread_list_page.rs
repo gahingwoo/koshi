@@ -243,6 +243,7 @@ fn build_thread_row(thread: &ThreadSummary) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(format!("<tt>{}</tt>", glib::markup_escape_text(&thread.subject)))
         .title_lines(1)
+        .tooltip_text(&thread.subject)
         .subtitle(glib::markup_escape_text(&thread.author))
         .subtitle_lines(1)
         .activatable(true)

@@ -115,6 +115,7 @@ fn build_favorite_row(fav: &Favorite) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(format!("<tt>{}</tt>", glib::markup_escape_text(&fav.subject)))
         .title_lines(1)
+        .tooltip_text(&fav.subject)
         .activatable(true)
         .build();
     row.add_suffix(

@@ -6,7 +6,7 @@ use gtk::glib;
 use crate::list_page::build_list_page;
 use crate::lore::{self, Inbox};
 use crate::remote_page::RemoteContent;
-use crate::thread_list_page::{build_thread_list_page, format_date};
+use crate::thread_list_page::build_thread_list_page;
 
 pub const INBOX_LIST_TITLE: &str = "Public Inboxes";
 
@@ -76,17 +76,6 @@ fn build_inbox_row(inbox: &Inbox) -> adw::ActionRow {
         .activatable(true)
         .build();
     row.add_prefix(&gtk::Image::from_icon_name("mail-unread-symbolic"));
-    // Last-activity stamp from the manifest (the `all` pseudo-inbox has none).
-    if inbox.modified > 0
-        && let Ok(date) = glib::DateTime::from_unix_local(inbox.modified)
-    {
-        row.add_suffix(
-            &gtk::Label::builder()
-                .label(format_date(&date))
-                .css_classes(["dim-label", "numeric"])
-                .build(),
-        );
-    }
     row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     row
 }

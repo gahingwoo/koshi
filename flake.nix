@@ -27,8 +27,10 @@
 
           buildInputs = with pkgs; [
             glib
+            glib-networking
             gtk4
             libadwaita
+            libsoup_3
           ];
 
           meta = {
@@ -52,14 +54,18 @@
 
           buildInputs = with pkgs; [
             glib
+            glib-networking
             gtk4
             libadwaita
+            libsoup_3
           ];
 
           # `cargo run` bypasses wrapGAppsHook4, so expose GSettings schemas
-          # manually to avoid runtime aborts about missing schemas.
+          # manually to avoid runtime aborts about missing schemas, and the
+          # glib-networking GIO modules so TLS works.
           shellHook = ''
             export XDG_DATA_DIRS=${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk4}/share/gsettings-schemas/${pkgs.gtk4.name}:$XDG_DATA_DIRS
+            export GIO_EXTRA_MODULES=${pkgs.glib-networking}/lib/gio/modules''${GIO_EXTRA_MODULES:+:$GIO_EXTRA_MODULES}
           '';
         };
       });

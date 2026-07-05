@@ -39,10 +39,10 @@ impl RemoteContent {
             .vexpand(true)
             .build();
 
-        let stack = gtk::Stack::builder()
-            .transition_type(gtk::StackTransitionType::Crossfade)
-            .vexpand(true)
-            .build();
+        // No transition: a GtkStack with one set clips children to its
+        // rectangular bounds, cutting the card shadow of boxed lists down to
+        // odd little arcs in the rounded-corner notches.
+        let stack = gtk::Stack::builder().vexpand(true).build();
         stack.add_named(&spinner, Some("loading"));
 
         let cancellable = gio::Cancellable::new();

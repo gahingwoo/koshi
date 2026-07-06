@@ -30,6 +30,10 @@ fn main() -> glib::ExitCode {
     app.connect_startup(|_| {
         load_css();
         register_bundled_icons();
+        // Use the bundled app icon for window/taskbar decorations. When Koshi
+        // is installed its desktop file points the shell at the same icon; this
+        // covers the uninstalled `cargo run` case and titlebar fallbacks.
+        gtk::Window::set_default_icon_name(APP_ID);
     });
     app.connect_activate(build_ui);
     app.run()

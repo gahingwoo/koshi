@@ -33,6 +33,19 @@
             libsoup_3
           ];
 
+          # Install the desktop entry and hicolor app icons so the shell and
+          # launchers can find Koshi's icon by its application ID.
+          postInstall = ''
+            install -Dm644 data/moe.nikableh.Koshi.desktop \
+              $out/share/applications/moe.nikableh.Koshi.desktop
+            install -Dm644 data/icons/scalable/apps/moe.nikableh.Koshi.svg \
+              $out/share/icons/hicolor/scalable/apps/moe.nikableh.Koshi.svg
+            install -Dm644 data/icons/scalable/apps/moe.nikableh.Koshi.Devel.svg \
+              $out/share/icons/hicolor/scalable/apps/moe.nikableh.Koshi.Devel.svg
+            install -Dm644 data/icons/symbolic/apps/moe.nikableh.Koshi-symbolic.svg \
+              $out/share/icons/hicolor/symbolic/apps/moe.nikableh.Koshi-symbolic.svg
+          '';
+
           meta = {
             description = "Koshi";
             mainProgram = "koshi";

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Koshi
+Comment=Browse and read mailing-list archives
+Exec=koshi
+Icon=moe.nikableh.Koshi
+Terminal=false
+Categories=GNOME;GTK;Network;Email;
+Keywords=mail;email;mailing-list;lore;lkml;archive;
+StartupNotify=true

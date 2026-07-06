@@ -572,20 +572,19 @@ fn overview_row_texts(mail: &Mail) -> (String, String) {
 }
 
 /// Horizontal indent added per reply level, in pixels.
-const OVERVIEW_INDENT: i32 = 22;
+const OVERVIEW_INDENT: i32 = 24;
+/// Width of the fixed left column holding each row's disclosure button.
+const OVERVIEW_DISCLOSURE: i32 = 26;
 /// Cap on drawn indentation, so a pathological reply chain can't push the
 /// row text off the side of the sidebar.
 const OVERVIEW_MAX_DEPTH: usize = 12;
 
-/// Per-row bookkeeping for the overview list: collapse state plus the
-/// widgets whose live positions anchor the connector lines.
+/// Per-row bookkeeping for the overview list: collapse state plus the avatar,
+/// whose live position anchors the connector lines.
 struct OverviewRow {
     row: gtk::ListBoxRow,
-    /// The disclosure button (for a parent) or the equal-width placeholder
-    /// (for a leaf) sitting at this row's indent. Its center is where this
-    /// row's subtree line descends from and where an incoming line meets it.
-    handle: gtk::Widget,
-    /// The avatar; its left edge is where an incoming connector line stops.
+    /// The avatar — the tree node. Its subtree's line descends from under it,
+    /// and an incoming line from its parent stops at its left edge.
     avatar: gtk::Widget,
     /// Row position of the parent, for hiding a collapsed subtree.
     parent_row: Option<usize>,
@@ -607,12 +606,11 @@ fn refresh_overview_visibility(rows: &[OverviewRow]) {
 }
 
 /// Draw the reply tree's connector lines in one pass over an overlay covering
-/// the list. For each parent a single vertical runs from its own center down
-/// to its last visible child's center, with a horizontal branching off into
-/// each child — the classic tree connector. Anchoring to widget *centers*
-/// (read live via compute_bounds) rather than row edges makes the lines join
-/// across the list's inter-row spacing and line up with the real disclosure
-/// buttons, whatever their exact size.
+/// the list. For each parent a single vertical drops from directly under its
+/// avatar down to its last visible child, with a short horizontal reaching
+/// into each child's avatar. Anchoring to the avatars (read live via
+/// compute_bounds) puts the line under the node and joins it across the
+/// list's inter-row spacing.
 fn draw_overview_lines(
     area: &gtk::DrawingArea,
     cr: &gtk::cairo::Context,
@@ -628,7 +626,8 @@ fn draw_overview_lines(
     );
     cr.set_line_width(1.0);
 
-    let center_y = |bounds: &gtk::graphene::Rect| f64::from(bounds.y() + bounds.height() / 2.0);
+    let center_x = |b: &gtk::graphene::Rect| f64::from(b.x() + b.width() / 2.0);
+    let center_y = |b: &gtk::graphene::Rect| f64::from(b.y() + b.height() / 2.0);
 
     for (index, parent) in rows.iter().enumerate() {
         if !parent.row.is_visible() {
@@ -639,34 +638,26 @@ fn draw_overview_lines(
             .copied()
             .filter(|&kid| rows[kid].row.is_visible())
             .collect();
-        let (Some(&last), Some(handle), Some(parent_bounds)) = (
-            kids.last(),
-            parent.handle.compute_bounds(area),
-            parent.row.compute_bounds(area),
-        ) else {
+        let (Some(&last), Some(avatar)) = (kids.last(), parent.avatar.compute_bounds(area)) else {
             continue;
         };
-        let Some(last_bounds) = rows[last].row.compute_bounds(area) else {
+        let Some(last_avatar) = rows[last].avatar.compute_bounds(area) else {
             continue;
         };
 
-        // The trunk: from the parent's center down to its last child's,
-        // running through the parent's disclosure-button column.
-        let x = (f64::from(handle.x() + handle.width() / 2.0)).floor() + 0.5;
-        cr.move_to(x, center_y(&parent_bounds));
-        cr.line_to(x, center_y(&last_bounds));
+        // The trunk drops from under this avatar to the last child's row.
+        let x = center_x(&avatar).floor() + 0.5;
+        cr.move_to(x, f64::from(avatar.y() + avatar.height()));
+        cr.line_to(x, center_y(&last_avatar));
 
-        // A branch into each child, stopping at the child's avatar.
+        // A short elbow into each child's avatar from the left.
         for kid in kids {
-            let (Some(kid_bounds), Some(avatar)) = (
-                rows[kid].row.compute_bounds(area),
-                rows[kid].avatar.compute_bounds(area),
-            ) else {
+            let Some(kid_avatar) = rows[kid].avatar.compute_bounds(area) else {
                 continue;
             };
-            let y = center_y(&kid_bounds).floor() + 0.5;
+            let y = center_y(&kid_avatar).floor() + 0.5;
             cr.move_to(x, y);
-            cr.line_to(f64::from(avatar.x()), y);
+            cr.line_to(f64::from(kid_avatar.x()), y);
         }
     }
     let _ = cr.stroke();
@@ -729,35 +720,32 @@ fn build_overview_sidebar(
             .margin_end(6)
             .build();
 
-        // Reserve this row's indentation as an empty leading column, clamped
-        // so a runaway reply chain can't push the text off the side.
-        let indent = row.depth.min(OVERVIEW_MAX_DEPTH) as i32 * OVERVIEW_INDENT;
-        if indent > 0 {
-            content.append(&gtk::Box::builder().width_request(indent).build());
-        }
-
-        // The handle sits at the indent: a disclosure toggle for a row with
-        // replies, or an equal-width placeholder so every avatar at a given
-        // depth lines up. The connector lines anchor to its center.
+        // The disclosure toggle lives in a fixed column at the very left,
+        // the same for every row; a leaf gets an equal-width blank so the
+        // indented avatars still line up. Keeping it out of the indent lets
+        // the avatars sit close to the left and the lines run under them.
         let button = row.has_children.then(|| {
             gtk::Button::builder()
                 .icon_name("pan-down-symbolic")
                 .tooltip_text("Collapse replies")
                 .valign(gtk::Align::Center)
                 .css_classes(["flat"])
+                .width_request(OVERVIEW_DISCLOSURE)
                 .build()
         });
-        let handle: gtk::Widget = match &button {
-            Some(button) => {
-                content.append(button);
-                button.clone().upcast()
-            }
-            None => {
-                let placeholder = gtk::Box::builder().width_request(34).build();
-                content.append(&placeholder);
-                placeholder.upcast()
-            }
-        };
+        match &button {
+            Some(button) => content.append(button),
+            None => content.append(
+                &gtk::Box::builder().width_request(OVERVIEW_DISCLOSURE).build(),
+            ),
+        }
+
+        // Reply depth is an empty leading column, clamped so a runaway reply
+        // chain can't push the text off the side.
+        let indent = row.depth.min(OVERVIEW_MAX_DEPTH) as i32 * OVERVIEW_INDENT;
+        if indent > 0 {
+            content.append(&gtk::Box::builder().width_request(indent).build());
+        }
 
         content.append(&avatar);
         content.append(&texts);
@@ -774,7 +762,6 @@ fn build_overview_sidebar(
         }
         rows.push(OverviewRow {
             row: row_widget,
-            handle,
             avatar: avatar.upcast(),
             parent_row: row.parent_row,
             expanded: Cell::new(true),

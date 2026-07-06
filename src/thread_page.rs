@@ -438,12 +438,6 @@ struct TreeRow {
     parent_row: Option<usize>,
     /// Whether this message has at least one reply of its own.
     has_children: bool,
-    /// Connector-line state, one entry per gutter column (length == depth).
-    /// Every entry but the last marks an ancestor whose subtree continues
-    /// past this row (draw a straight vertical through that column); the
-    /// last entry is this node's own "a sibling follows below" (draw the
-    /// elbow's downward continuation).
-    trunk: Vec<bool>,
 }
 
 /// Arrange the thread as lore.kernel.org's overview does: depth-first over
@@ -485,13 +479,12 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
         index: usize,
         depth: usize,
         parent_row: Option<usize>,
-        trunk: Vec<bool>,
     }
     let seed = |roots: &[usize]| -> Vec<Pending> {
         roots
             .iter()
             .rev()
-            .map(|&index| Pending { index, depth: 0, parent_row: None, trunk: Vec::new() })
+            .map(|&index| Pending { index, depth: 0, parent_row: None })
             .collect()
     };
 
@@ -508,18 +501,11 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
             let row_pos = rows.len();
             let kids = &children[pending.index];
             let has_children = kids.iter().any(|&kid| !emitted[kid]);
-            let last = kids.len().saturating_sub(1);
-            // A child's gutter is its parent's gutter plus one column: the
-            // parent's own "continues below" flag becomes a pass-through
-            // vertical for the child, and the child adds its own flag.
-            for (order, &kid) in kids.iter().enumerate().rev() {
-                let mut trunk = pending.trunk.clone();
-                trunk.push(order != last);
+            for &kid in kids.iter().rev() {
                 stack.push(Pending {
                     index: kid,
                     depth: pending.depth + 1,
                     parent_row: Some(row_pos),
-                    trunk,
                 });
             }
             rows.push(TreeRow {
@@ -527,18 +513,12 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
                 depth: pending.depth,
                 parent_row: pending.parent_row,
                 has_children,
-                trunk: pending.trunk,
             });
         }
         // Messages caught in a reference cycle have no root to be reached
         // from; surface the first stranded one as a root and keep going.
         match emitted.iter().position(|&done| !done) {
-            Some(index) => stack.push(Pending {
-                index,
-                depth: 0,
-                parent_row: None,
-                trunk: Vec::new(),
-            }),
+            Some(index) => stack.push(Pending { index, depth: 0, parent_row: None }),
             None => return rows,
         }
     }
@@ -594,10 +574,10 @@ fn overview_row_texts(mail: &Mail) -> (String, String) {
     )
 }
 
-/// The width of one indentation column in the overview tree's gutter.
-const OVERVIEW_COLUMN: f64 = 20.0;
-/// Cap on drawn indentation, so a pathological reply chain can't push the
-/// row text off the side of the sidebar.
+/// Pixels of indentation per reply level in the overview tree.
+const OVERVIEW_INDENT: i32 = 20;
+/// Cap on indentation, so a pathological reply chain can't push the row
+/// text off the side of the sidebar.
 const OVERVIEW_MAX_DEPTH: usize = 12;
 
 /// Per-row collapse bookkeeping for the overview list.
@@ -622,56 +602,10 @@ fn refresh_overview_visibility(rows: &[OverviewRow]) {
     }
 }
 
-/// A drawing area rendering one row's slice of the tree: a straight vertical
-/// for each ancestor whose replies continue past this row, and an elbow into
-/// this row from its parent. `trunk` has one bool per column (see TreeRow).
-fn build_tree_gutter(trunk: Vec<bool>) -> gtk::DrawingArea {
-    let area = gtk::DrawingArea::new();
-    area.set_content_width((trunk.len() as f64 * OVERVIEW_COLUMN) as i32);
-    area.set_draw_func(move |area, cr, _width, height| {
-        let height = f64::from(height);
-        let mid = (height / 2.0).floor() + 0.5;
-        let color = area.color();
-        cr.set_source_rgba(
-            f64::from(color.red()),
-            f64::from(color.green()),
-            f64::from(color.blue()),
-            0.5 * f64::from(color.alpha()),
-        );
-        cr.set_line_width(1.0);
-
-        let depth = trunk.len();
-        for (column, &continues) in trunk.iter().enumerate() {
-            // Center of this column, nudged to a half-pixel for a crisp line.
-            let x = (column as f64 * OVERVIEW_COLUMN + OVERVIEW_COLUMN / 2.0).floor() + 0.5;
-            if column + 1 < depth {
-                // An ancestor column: a full-height line if its thread goes on.
-                if continues {
-                    cr.move_to(x, 0.0);
-                    cr.line_to(x, height);
-                }
-            } else {
-                // This row's own column: an elbow down from the parent and
-                // across toward the avatar, continuing below if a sibling
-                // follows (`continues` is this node's own flag here).
-                cr.move_to(x, 0.0);
-                cr.line_to(x, mid);
-                cr.line_to((column as f64 + 1.0) * OVERVIEW_COLUMN, mid);
-                if continues {
-                    cr.move_to(x, mid);
-                    cr.line_to(x, height);
-                }
-            }
-        }
-        let _ = cr.stroke();
-    });
-    area
-}
-
 /// The overview sidebar: a heading over one activatable row per message,
-/// laid out as a collapsible reply tree with connector lines. Activating a
-/// row scrolls the message stack to that message; the disclosure button on
-/// a row with replies hides or shows its subtree.
+/// laid out as a collapsible reply tree, replies indented under their
+/// parent. Activating a row scrolls the message stack to that message; the
+/// disclosure button on a row with replies hides or shows its subtree.
 fn build_overview_sidebar(
     thread: &[Mail],
     sections: Vec<gtk::Box>,
@@ -716,28 +650,17 @@ fn build_overview_sidebar(
         let avatar = adw::Avatar::new(28, Some(author_name(&mail.from)), true);
         avatar.set_valign(gtk::Align::Center);
 
+        // Reply depth is shown by indenting the row, capped so a pathological
+        // chain of replies cannot push the text off the side.
+        let indent = OVERVIEW_INDENT * row.depth.min(OVERVIEW_MAX_DEPTH) as i32;
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
             .margin_top(6)
             .margin_bottom(6)
-            .margin_start(6)
+            .margin_start(6 + indent)
             .margin_end(6)
             .build();
-
-        // Depth is drawn by the gutter's connector lines rather than by a
-        // plain margin, so the reply chain can be traced by eye.
-        if row.depth > 0 {
-            let mut trunk = row.trunk;
-            if row.depth > OVERVIEW_MAX_DEPTH {
-                // Keep this node's own elbow flag (the last entry) when
-                // clamping an absurdly deep chain.
-                let own = trunk[trunk.len() - 1];
-                trunk.truncate(OVERVIEW_MAX_DEPTH - 1);
-                trunk.push(own);
-            }
-            content.append(&build_tree_gutter(trunk));
-        }
 
         // A disclosure toggle for rows with replies; a same-width spacer for
         // the rest, so every avatar at a given depth lines up.

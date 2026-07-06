@@ -572,101 +572,40 @@ fn overview_row_texts(mail: &Mail) -> (String, String) {
 }
 
 /// Horizontal indent added per reply level, in pixels.
-const OVERVIEW_INDENT: i32 = 24;
-/// Width of the fixed left column holding each row's disclosure button.
-const OVERVIEW_DISCLOSURE: i32 = 26;
+const OVERVIEW_INDENT: i32 = 22;
 /// Cap on drawn indentation, so a pathological reply chain can't push the
 /// row text off the side of the sidebar.
 const OVERVIEW_MAX_DEPTH: usize = 12;
 
-/// Per-row bookkeeping for the overview list: collapse state plus the avatar,
-/// whose live position anchors the connector lines.
+/// Per-row bookkeeping for the overview list: which row this is a reply to,
+/// and whether its own replies are currently shown.
 struct OverviewRow {
-    row: gtk::ListBoxRow,
-    /// The avatar — the tree node. Its subtree's line descends from under it,
-    /// and an incoming line from its parent stops at its left edge.
-    avatar: gtk::Widget,
     /// Row position of the parent, for hiding a collapsed subtree.
     parent_row: Option<usize>,
     /// Whether this row's own replies are shown.
     expanded: Cell<bool>,
+    /// Whether this row is shown at all — false once any ancestor collapses.
+    /// The list's filter reads this; recompute it, then invalidate_filter.
+    shown: Cell<bool>,
 }
 
-/// A row is visible only while every ancestor is expanded. Rows sit in
-/// depth-first order, so a parent's visibility is settled before its
-/// children are reached and one forward pass suffices.
+/// A row shows only while every ancestor is expanded. Rows sit in depth-first
+/// order, so a parent's state is settled before its children are reached and
+/// one forward pass suffices.
 fn refresh_overview_visibility(rows: &[OverviewRow]) {
     for row in rows {
-        let visible = match row.parent_row {
+        let shown = match row.parent_row {
             None => true,
-            Some(parent) => rows[parent].row.is_visible() && rows[parent].expanded.get(),
+            Some(parent) => rows[parent].shown.get() && rows[parent].expanded.get(),
         };
-        row.row.set_visible(visible);
+        row.shown.set(shown);
     }
-}
-
-/// Draw the reply tree's connector lines in one pass over an overlay covering
-/// the list. For each parent a single vertical drops from directly under its
-/// avatar down to its last visible child, with a short horizontal reaching
-/// into each child's avatar. Anchoring to the avatars (read live via
-/// compute_bounds) puts the line under the node and joins it across the
-/// list's inter-row spacing.
-fn draw_overview_lines(
-    area: &gtk::DrawingArea,
-    cr: &gtk::cairo::Context,
-    rows: &[OverviewRow],
-    children: &[Vec<usize>],
-) {
-    let color = area.color();
-    cr.set_source_rgba(
-        f64::from(color.red()),
-        f64::from(color.green()),
-        f64::from(color.blue()),
-        0.55 * f64::from(color.alpha()),
-    );
-    cr.set_line_width(1.0);
-
-    let center_x = |b: &gtk::graphene::Rect| f64::from(b.x() + b.width() / 2.0);
-    let center_y = |b: &gtk::graphene::Rect| f64::from(b.y() + b.height() / 2.0);
-
-    for (index, parent) in rows.iter().enumerate() {
-        if !parent.row.is_visible() {
-            continue;
-        }
-        let kids: Vec<usize> = children[index]
-            .iter()
-            .copied()
-            .filter(|&kid| rows[kid].row.is_visible())
-            .collect();
-        let (Some(&last), Some(avatar)) = (kids.last(), parent.avatar.compute_bounds(area)) else {
-            continue;
-        };
-        let Some(last_avatar) = rows[last].avatar.compute_bounds(area) else {
-            continue;
-        };
-
-        // The trunk drops from under this avatar to the last child's row.
-        let x = center_x(&avatar).floor() + 0.5;
-        cr.move_to(x, f64::from(avatar.y() + avatar.height()));
-        cr.line_to(x, center_y(&last_avatar));
-
-        // A short elbow into each child's avatar from the left.
-        for kid in kids {
-            let Some(kid_avatar) = rows[kid].avatar.compute_bounds(area) else {
-                continue;
-            };
-            let y = center_y(&kid_avatar).floor() + 0.5;
-            cr.move_to(x, y);
-            cr.line_to(f64::from(kid_avatar.x()), y);
-        }
-    }
-    let _ = cr.stroke();
 }
 
 /// The overview sidebar: a heading over one activatable row per message,
-/// laid out as a collapsible reply tree with connector lines. Activating a
-/// row scrolls the message stack to that message; the disclosure button on
-/// a row with replies hides or shows its subtree.
+/// laid out as a collapsible reply tree indented by depth. Activating a row
+/// scrolls the message stack to that message; the disclosure button on a row
+/// with replies hides or shows its subtree.
 fn build_overview_sidebar(
     thread: &[Mail],
     sections: Vec<gtk::Box>,
@@ -716,35 +655,25 @@ fn build_overview_sidebar(
             .spacing(6)
             .margin_top(6)
             .margin_bottom(6)
-            .margin_start(6)
             .margin_end(6)
+            // Reply depth is a leading margin, clamped so a runaway reply
+            // chain can't push the text off the side.
+            .margin_start(6 + row.depth.min(OVERVIEW_MAX_DEPTH) as i32 * OVERVIEW_INDENT)
             .build();
 
-        // The disclosure toggle lives in a fixed column at the very left,
-        // the same for every row; a leaf gets an equal-width blank so the
-        // indented avatars still line up. Keeping it out of the indent lets
-        // the avatars sit close to the left and the lines run under them.
+        // A disclosure toggle for a row with replies, or an equal-width
+        // placeholder so every avatar at a given depth still lines up.
         let button = row.has_children.then(|| {
             gtk::Button::builder()
                 .icon_name("pan-down-symbolic")
                 .tooltip_text("Collapse replies")
                 .valign(gtk::Align::Center)
                 .css_classes(["flat"])
-                .width_request(OVERVIEW_DISCLOSURE)
                 .build()
         });
         match &button {
             Some(button) => content.append(button),
-            None => content.append(
-                &gtk::Box::builder().width_request(OVERVIEW_DISCLOSURE).build(),
-            ),
-        }
-
-        // Reply depth is an empty leading column, clamped so a runaway reply
-        // chain can't push the text off the side.
-        let indent = row.depth.min(OVERVIEW_MAX_DEPTH) as i32 * OVERVIEW_INDENT;
-        if indent > 0 {
-            content.append(&gtk::Box::builder().width_request(indent).build());
+            None => content.append(&gtk::Box::builder().width_request(34).build()),
         }
 
         content.append(&avatar);
@@ -761,59 +690,31 @@ fn build_overview_sidebar(
             disclosures.push((row_pos, button));
         }
         rows.push(OverviewRow {
-            row: row_widget,
-            avatar: avatar.upcast(),
             parent_row: row.parent_row,
             expanded: Cell::new(true),
+            shown: Cell::new(true),
         });
         message_of_row.push(row.index);
     }
 
-    // Direct children of each row, for the line drawing (built from the flat
-    // parent_row links now that every row exists).
-    let children: Vec<Vec<usize>> = {
-        let mut children = vec![Vec::new(); rows.len()];
-        for (index, row) in rows.iter().enumerate() {
-            if let Some(parent) = row.parent_row {
-                children[parent].push(index);
-            }
-        }
-        children
-    };
-
-    let rows = Rc::new(rows);
-
-    // The connector lines are drawn once over the whole list by an overlay
-    // drawing area that reads the live row positions, so it must repaint
-    // whenever those change: on scroll, on resize, and on collapse.
     let list_scrolled = gtk::ScrolledWindow::builder()
         .child(&list)
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
         .build();
-    let lines = gtk::DrawingArea::new();
-    // Purely decorative: never a target, so clicks and hover reach the rows.
-    lines.set_can_target(false);
-    lines.set_draw_func(glib::clone!(
+
+    let rows = Rc::new(rows);
+
+    // Collapsing hides a subtree by filtering it out. A filter (rather than
+    // per-row set_visible) is the list's own mechanism for this: it drops the
+    // rows from layout and repaints cleanly, leaving nothing behind.
+    list.set_filter_func(glib::clone!(
         #[strong]
         rows,
-        move |area, cr, _width, _height| draw_overview_lines(area, cr, &rows, &children)
-    ));
-    let overlay = gtk::Overlay::new();
-    overlay.set_vexpand(true);
-    overlay.set_child(Some(&list_scrolled));
-    overlay.add_overlay(&lines);
-
-    let vadjustment = list_scrolled.vadjustment();
-    vadjustment.connect_value_changed(glib::clone!(
-        #[weak]
-        lines,
-        move |_| lines.queue_draw()
-    ));
-    vadjustment.connect_changed(glib::clone!(
-        #[weak]
-        lines,
-        move |_| lines.queue_draw()
+        move |row| {
+            rows.get(row.index() as usize)
+                .is_none_or(|overview| overview.shown.get())
+        }
     ));
 
     for (row_pos, button) in disclosures {
@@ -821,7 +722,7 @@ fn build_overview_sidebar(
             #[strong]
             rows,
             #[weak]
-            lines,
+            list,
             move |button| {
                 let expanded = !rows[row_pos].expanded.get();
                 rows[row_pos].expanded.set(expanded);
@@ -836,7 +737,7 @@ fn build_overview_sidebar(
                     "Expand replies"
                 }));
                 refresh_overview_visibility(&rows);
-                lines.queue_draw();
+                list.invalidate_filter();
             }
         ));
     }
@@ -885,7 +786,7 @@ fn build_overview_sidebar(
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar.append(&header);
     sidebar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    sidebar.append(&overlay);
+    sidebar.append(&list_scrolled);
     sidebar.upcast()
 }
 

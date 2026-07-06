@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -425,12 +427,23 @@ fn build_thread_content(
     }
 }
 
-/// One row of the overview tree: which message, how deep, and who it
-/// replies to (None for messages that start their own subthread).
+/// One row of the overview tree in depth-first display order.
 struct TreeRow {
+    /// Index of the message in the thread slice.
     index: usize,
     depth: usize,
-    parent: Option<usize>,
+    /// Row position (in this Vec, not message index) of the parent, so a
+    /// subtree can be hidden when its parent is collapsed. None for the
+    /// messages that start their own subthread.
+    parent_row: Option<usize>,
+    /// Whether this message has at least one reply of its own.
+    has_children: bool,
+    /// Connector-line state, one entry per gutter column (length == depth).
+    /// Every entry but the last marks an ancestor whose subtree continues
+    /// past this row (draw a straight vertical through that column); the
+    /// last entry is this node's own "a sibling follows below" (draw the
+    /// elbow's downward continuation).
+    trunk: Vec<bool>,
 }
 
 /// Arrange the thread as lore.kernel.org's overview does: depth-first over
@@ -466,32 +479,66 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
         }
     }
 
-    let mut rows = Vec::with_capacity(thread.len());
+    // A pending entry carries everything a row needs before it is emitted;
+    // children are pushed in reverse so they pop back into arrival order.
+    struct Pending {
+        index: usize,
+        depth: usize,
+        parent_row: Option<usize>,
+        trunk: Vec<bool>,
+    }
+    let seed = |roots: &[usize]| -> Vec<Pending> {
+        roots
+            .iter()
+            .rev()
+            .map(|&index| Pending { index, depth: 0, parent_row: None, trunk: Vec::new() })
+            .collect()
+    };
+
+    let mut rows: Vec<TreeRow> = Vec::with_capacity(thread.len());
     let mut emitted = vec![false; thread.len()];
-    let mut stack: Vec<TreeRow> = roots
-        .iter()
-        .rev()
-        .map(|&index| TreeRow { index, depth: 0, parent: None })
-        .collect();
+    let mut stack = seed(&roots);
     loop {
-        while let Some(row) = stack.pop() {
+        while let Some(pending) = stack.pop() {
             // The emitted guard makes reference cycles finite: a child that
             // was already written out is not descended into again.
-            if std::mem::replace(&mut emitted[row.index], true) {
+            if std::mem::replace(&mut emitted[pending.index], true) {
                 continue;
             }
-            let (index, depth) = (row.index, row.depth);
-            rows.push(row);
-            stack.extend(children[index].iter().rev().map(|&child| TreeRow {
-                index: child,
-                depth: depth + 1,
-                parent: Some(index),
-            }));
+            let row_pos = rows.len();
+            let kids = &children[pending.index];
+            let has_children = kids.iter().any(|&kid| !emitted[kid]);
+            let last = kids.len().saturating_sub(1);
+            // A child's gutter is its parent's gutter plus one column: the
+            // parent's own "continues below" flag becomes a pass-through
+            // vertical for the child, and the child adds its own flag.
+            for (order, &kid) in kids.iter().enumerate().rev() {
+                let mut trunk = pending.trunk.clone();
+                trunk.push(order != last);
+                stack.push(Pending {
+                    index: kid,
+                    depth: pending.depth + 1,
+                    parent_row: Some(row_pos),
+                    trunk,
+                });
+            }
+            rows.push(TreeRow {
+                index: pending.index,
+                depth: pending.depth,
+                parent_row: pending.parent_row,
+                has_children,
+                trunk: pending.trunk,
+            });
         }
         // Messages caught in a reference cycle have no root to be reached
         // from; surface the first stranded one as a root and keep going.
         match emitted.iter().position(|&done| !done) {
-            Some(index) => stack.push(TreeRow { index, depth: 0, parent: None }),
+            Some(index) => stack.push(Pending {
+                index,
+                depth: 0,
+                parent_row: None,
+                trunk: Vec::new(),
+            }),
             None => return rows,
         }
     }
@@ -506,20 +553,6 @@ fn normalize_message_id(header: &str) -> &str {
         .and_then(|(_, rest)| rest.split_once('>'))
         .map(|(id, _)| id);
     bracketed.unwrap_or_else(|| header.trim())
-}
-
-/// Subject with any leading "Re:" chains removed, for telling "same
-/// conversation" apart from "subject actually changed".
-fn strip_reply_prefixes(subject: &str) -> &str {
-    let mut subject = subject.trim();
-    while let Some(rest) = subject
-        .get(..3)
-        .filter(|prefix| prefix.eq_ignore_ascii_case("re:"))
-        .map(|_| subject[3..].trim_start())
-    {
-        subject = rest;
-    }
-    subject
 }
 
 /// The display-name part of a From header, falling back to the whole value.
@@ -548,26 +581,97 @@ fn overview_date(date: &str) -> String {
         .unwrap_or_else(|| date.trim().to_string())
 }
 
-/// The overview row's texts, following lore's convention of only naming the
-/// subject when it differs from the parent's (ignoring Re: chains): a
-/// same-subject reply is titled by its author with the date below, while a
-/// subject change is titled by the new subject with author and date below.
-fn overview_row_texts(mail: &Mail, parent_subject: Option<&str>) -> (String, String) {
-    let author = author_name(&mail.from);
-    let date = overview_date(&mail.date);
-    let same_subject = parent_subject.is_some_and(|parent| {
-        strip_reply_prefixes(parent).eq_ignore_ascii_case(strip_reply_prefixes(&mail.subject))
-    });
-    if parent_subject.is_none() || same_subject {
-        (author.to_string(), date)
-    } else {
-        (mail.subject.trim().to_string(), format!("{author} · {date}"))
+/// The overview row's texts: the message's own subject as the title, with
+/// the author and date beneath. Every row shows its subject — the tree's
+/// connector lines carry the "this is a reply to that" relationship, so the
+/// subject never has to be dropped to signal it.
+fn overview_row_texts(mail: &Mail) -> (String, String) {
+    let title = mail.subject.trim();
+    let title = if title.is_empty() { "(no subject)" } else { title };
+    (
+        title.to_string(),
+        format!("{} · {}", author_name(&mail.from), overview_date(&mail.date)),
+    )
+}
+
+/// The width of one indentation column in the overview tree's gutter.
+const OVERVIEW_COLUMN: f64 = 20.0;
+/// Cap on drawn indentation, so a pathological reply chain can't push the
+/// row text off the side of the sidebar.
+const OVERVIEW_MAX_DEPTH: usize = 12;
+
+/// Per-row collapse bookkeeping for the overview list.
+struct OverviewRow {
+    row: gtk::ListBoxRow,
+    /// Row position of the parent, for hiding a collapsed subtree.
+    parent_row: Option<usize>,
+    /// Whether this row's own replies are shown.
+    expanded: Cell<bool>,
+}
+
+/// A row is visible only while every ancestor is expanded. Rows sit in
+/// depth-first order, so a parent's visibility is settled before its
+/// children are reached and one forward pass suffices.
+fn refresh_overview_visibility(rows: &[OverviewRow]) {
+    for row in rows {
+        let visible = match row.parent_row {
+            None => true,
+            Some(parent) => rows[parent].row.is_visible() && rows[parent].expanded.get(),
+        };
+        row.row.set_visible(visible);
     }
 }
 
+/// A drawing area rendering one row's slice of the tree: a straight vertical
+/// for each ancestor whose replies continue past this row, and an elbow into
+/// this row from its parent. `trunk` has one bool per column (see TreeRow).
+fn build_tree_gutter(trunk: Vec<bool>) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::new();
+    area.set_content_width((trunk.len() as f64 * OVERVIEW_COLUMN) as i32);
+    area.set_draw_func(move |area, cr, _width, height| {
+        let height = f64::from(height);
+        let mid = (height / 2.0).floor() + 0.5;
+        let color = area.color();
+        cr.set_source_rgba(
+            f64::from(color.red()),
+            f64::from(color.green()),
+            f64::from(color.blue()),
+            0.5 * f64::from(color.alpha()),
+        );
+        cr.set_line_width(1.0);
+
+        let depth = trunk.len();
+        for (column, &continues) in trunk.iter().enumerate() {
+            // Center of this column, nudged to a half-pixel for a crisp line.
+            let x = (column as f64 * OVERVIEW_COLUMN + OVERVIEW_COLUMN / 2.0).floor() + 0.5;
+            if column + 1 < depth {
+                // An ancestor column: a full-height line if its thread goes on.
+                if continues {
+                    cr.move_to(x, 0.0);
+                    cr.line_to(x, height);
+                }
+            } else {
+                // This row's own column: an elbow down from the parent and
+                // across toward the avatar, continuing below if a sibling
+                // follows (`continues` is this node's own flag here).
+                cr.move_to(x, 0.0);
+                cr.line_to(x, mid);
+                cr.line_to((column as f64 + 1.0) * OVERVIEW_COLUMN, mid);
+                if continues {
+                    cr.move_to(x, mid);
+                    cr.line_to(x, height);
+                }
+            }
+        }
+        let _ = cr.stroke();
+    });
+    area
+}
+
 /// The overview sidebar: a heading over one activatable row per message,
-/// laid out as the lore-style tree; activating a row scrolls the message
-/// stack to that message.
+/// laid out as a collapsible reply tree with connector lines. Activating a
+/// row scrolls the message stack to that message; the disclosure button on
+/// a row with replies hides or shows its subtree.
 fn build_overview_sidebar(
     thread: &[Mail],
     sections: Vec<gtk::Box>,
@@ -581,16 +685,14 @@ fn build_overview_sidebar(
     // The list rows are appended in tree order, so their list positions no
     // longer match message order; this maps row position -> message index.
     let mut message_of_row: Vec<usize> = Vec::with_capacity(thread.len());
+    let mut rows: Vec<OverviewRow> = Vec::with_capacity(thread.len());
+    // Disclosure buttons are wired in a second pass, once every row exists
+    // to share; this keeps each button's row position alongside it.
+    let mut disclosures: Vec<(usize, gtk::Button)> = Vec::new();
+
     for row in thread_tree(thread) {
-        // The first message never shows its subject (it heads the page
-        // already); a later parentless message compares against the OP so a
-        // changed subject still shows up.
-        let parent_subject = row
-            .parent
-            .map(|parent| thread[parent].subject.as_str())
-            .or_else(|| (row.index != 0).then(|| thread[0].subject.as_str()));
         let mail = &thread[row.index];
-        let (title, subtitle) = overview_row_texts(mail, parent_subject);
+        let (title, subtitle) = overview_row_texts(mail);
 
         let title_label = gtk::Label::builder()
             .label(&title)
@@ -614,16 +716,44 @@ fn build_overview_sidebar(
         let avatar = adw::Avatar::new(28, Some(author_name(&mail.from)), true);
         avatar.set_valign(gtk::Align::Center);
 
-        // Reply depth is shown by indenting the row content, capped so a
-        // pathological chain of replies cannot push the text out of view.
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
-            .spacing(9)
+            .spacing(6)
             .margin_top(6)
             .margin_bottom(6)
-            .margin_start(6 + 18 * row.depth.min(8) as i32)
+            .margin_start(6)
             .margin_end(6)
             .build();
+
+        // Depth is drawn by the gutter's connector lines rather than by a
+        // plain margin, so the reply chain can be traced by eye.
+        if row.depth > 0 {
+            let mut trunk = row.trunk;
+            if row.depth > OVERVIEW_MAX_DEPTH {
+                // Keep this node's own elbow flag (the last entry) when
+                // clamping an absurdly deep chain.
+                let own = trunk[trunk.len() - 1];
+                trunk.truncate(OVERVIEW_MAX_DEPTH - 1);
+                trunk.push(own);
+            }
+            content.append(&build_tree_gutter(trunk));
+        }
+
+        // A disclosure toggle for rows with replies; a same-width spacer for
+        // the rest, so every avatar at a given depth lines up.
+        let button = row.has_children.then(|| {
+            gtk::Button::builder()
+                .icon_name("pan-down-symbolic")
+                .tooltip_text("Collapse replies")
+                .valign(gtk::Align::Center)
+                .css_classes(["flat"])
+                .build()
+        });
+        match &button {
+            Some(button) => content.append(button),
+            None => content.append(&gtk::Box::builder().width_request(34).build()),
+        }
+
         content.append(&avatar);
         content.append(&texts);
 
@@ -632,7 +762,40 @@ fn build_overview_sidebar(
             .tooltip_text(&mail.subject)
             .build();
         list.append(&row_widget);
+
+        let row_pos = rows.len();
+        if let Some(button) = button {
+            disclosures.push((row_pos, button));
+        }
+        rows.push(OverviewRow {
+            row: row_widget,
+            parent_row: row.parent_row,
+            expanded: Cell::new(true),
+        });
         message_of_row.push(row.index);
+    }
+
+    let rows = Rc::new(rows);
+    for (row_pos, button) in disclosures {
+        button.connect_clicked(glib::clone!(
+            #[strong]
+            rows,
+            move |button| {
+                let expanded = !rows[row_pos].expanded.get();
+                rows[row_pos].expanded.set(expanded);
+                button.set_icon_name(if expanded {
+                    "pan-down-symbolic"
+                } else {
+                    "pan-end-symbolic"
+                });
+                button.set_tooltip_text(Some(if expanded {
+                    "Collapse replies"
+                } else {
+                    "Expand replies"
+                }));
+                refresh_overview_visibility(&rows);
+            }
+        ));
     }
 
     list.connect_row_activated(glib::clone!(
@@ -1477,9 +1640,10 @@ mod tests {
             3,
             "self-reply, orphan and one cycle member are roots"
         );
-        // The cycle is cut once: its first message roots it, the other nests.
+        // The cycle is cut once: its first message roots it (row 2), the
+        // other nests under it (parent_row is a row position, not an index).
         let late = rows.iter().find(|row| row.index == 3).unwrap();
-        assert_eq!((late.parent, late.depth), (Some(2), 1));
+        assert_eq!((late.parent_row, late.depth), (Some(2), 1));
     }
 
     #[test]
@@ -1491,7 +1655,7 @@ mod tests {
         let mut b = mail("y@y", None, "b", "B");
         b.in_reply_to = Some(String::new());
         let rows = thread_tree(&[a, b]);
-        assert!(rows.iter().all(|row| row.depth == 0 && row.parent.is_none()));
+        assert!(rows.iter().all(|row| row.depth == 0 && row.parent_row.is_none()));
     }
 
     #[test]
@@ -1525,29 +1689,30 @@ mod tests {
     }
 
     #[test]
-    fn overview_rows_title_by_author_unless_the_subject_changed() {
+    fn overview_rows_show_the_subject_and_author() {
         let op = mail("op@x", None, "[PATCH 0/2] series", "Nika Krasnova <nika@x>");
-        let same = mail("a@x", Some("op@x"), "Re: [PATCH 0/2] series", "Miguel Ojeda <m@x>");
-        let changed = mail("b@x", Some("op@x"), "[PATCH 1/2] first patch", "Nika Krasnova <nika@x>");
+        let reply = mail("a@x", Some("op@x"), "Re: [PATCH 0/2] series", "Miguel Ojeda <m@x>");
 
-        // The OP row: author over the date.
+        // Every row is titled by its own subject with author and date below.
         assert_eq!(
-            overview_row_texts(&op, None),
-            ("Nika Krasnova".to_string(), "2026-06-29 03:51".to_string())
-        );
-        // Same subject as the parent (modulo Re:): likewise.
-        assert_eq!(
-            overview_row_texts(&same, Some("[PATCH 0/2] series")),
-            ("Miguel Ojeda".to_string(), "2026-06-29 03:51".to_string())
-        );
-        // Changed subject: the subject takes the title, author joins the date.
-        assert_eq!(
-            overview_row_texts(&changed, Some("[PATCH 0/2] series")),
+            overview_row_texts(&op),
             (
-                "[PATCH 1/2] first patch".to_string(),
+                "[PATCH 0/2] series".to_string(),
                 "Nika Krasnova · 2026-06-29 03:51".to_string()
             )
         );
+        // A reply keeps its own Re:-prefixed subject rather than dropping it.
+        assert_eq!(
+            overview_row_texts(&reply),
+            (
+                "Re: [PATCH 0/2] series".to_string(),
+                "Miguel Ojeda · 2026-06-29 03:51".to_string()
+            )
+        );
+
+        // A genuinely empty subject gets a readable placeholder.
+        let blank = mail("b@x", None, "", "A");
+        assert_eq!(overview_row_texts(&blank).0, "(no subject)");
     }
 
     #[test]
@@ -1562,8 +1727,6 @@ mod tests {
         assert_eq!(normalize_message_id("<a@b>"), "a@b");
         assert_eq!(normalize_message_id(" <a@b> <c@d>"), "a@b");
         assert_eq!(normalize_message_id("bare@id "), "bare@id");
-        assert_eq!(strip_reply_prefixes("Re: RE: re:subject"), "subject");
-        assert_eq!(strip_reply_prefixes("Regarding x"), "Regarding x");
         assert_eq!(author_name("\"Nika K\" <n@x>"), "Nika K");
         assert_eq!(author_name("n@x"), "n@x");
     }

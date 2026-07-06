@@ -208,32 +208,35 @@ pub fn build_thread_page(
     let remote = RemoteContent::new();
     // The overview sidebar arrives with the thread; until then the split
     // view has no sidebar and toggle_overview is a no-op.
+    //
+    // The split view stays collapsed permanently: side-by-side mode resizes
+    // the message stack on every frame of the show/hide animation, and
+    // re-laying-out all the TextViews and wrapped labels per frame stutters
+    // badly (measured as runs of >100ms frames), while the collapsed
+    // overlay slides over the unchanged content at full frame rate.
     let split = adw::OverlaySplitView::builder()
         .content(remote.widget())
         .sidebar_position(gtk::PackType::End)
         .show_sidebar(false)
-        .sidebar_width_fraction(0.66)
+        .collapsed(true)
         .min_sidebar_width(360.0)
-        .max_sidebar_width(1400.0)
         .build();
 
-    // Below this width a side-by-side sidebar would squeeze the messages
-    // into a sliver (its minimum width alone is 360px), so collapse the
-    // split view there: the sidebar then overlays the content instead.
-    let bin = adw::BreakpointBin::builder()
-        .width_request(360)
-        .height_request(200)
-        .child(&split)
-        .build();
-    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-        adw::BreakpointConditionLengthType::MaxWidth,
-        800.0,
-        adw::LengthUnit::Sp,
-    ));
-    narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
-    bin.add_breakpoint(narrow);
+    // A collapsed sidebar ignores sidebar-width-fraction and sizes to
+    // max-sidebar-width, so track the allocated width and keep the max at
+    // two thirds of it. A tick callback sees every size change (allocation
+    // only moves during frame-clock frames) and the compare makes idle
+    // frames free.
+    let last_width = std::cell::Cell::new(0);
+    split.add_tick_callback(move |split, _| {
+        let width = split.width();
+        if width != last_width.replace(width) {
+            split.set_max_sidebar_width(f64::from(width) * 0.66);
+        }
+        glib::ControlFlow::Continue
+    });
 
-    let page = adw::NavigationPage::new(&bin, "Loading…");
+    let page = adw::NavigationPage::new(&split, "Loading…");
     page.set_widget_name(THREAD_PAGE_NAME);
     spawn_thread_load(remote, split, nav.clone(), page.clone(), list.to_string(), message_id.to_string());
     page
@@ -243,12 +246,7 @@ pub fn build_thread_page(
 /// build_thread_page. Does nothing until the thread has loaded (there is no
 /// tree to show before that) or on pages that aren't thread pages.
 pub fn toggle_overview(page: &adw::NavigationPage) {
-    let Some(split) = page
-        .child()
-        .and_downcast::<adw::BreakpointBin>()
-        .and_then(|bin| bin.child())
-        .and_downcast::<adw::OverlaySplitView>()
-    else {
+    let Some(split) = page.child().and_downcast::<adw::OverlaySplitView>() else {
         return;
     };
     if split.sidebar().is_some() {

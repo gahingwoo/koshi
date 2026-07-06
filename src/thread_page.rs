@@ -550,26 +550,21 @@ fn overview_date(date: &str) -> String {
         .unwrap_or_else(|| date.trim().to_string())
 }
 
-/// One overview line, mirroring lore: date, indent, a "`" reply marker,
-/// then the subject (only when it differs from the parent's, ignoring Re:)
-/// and the author.
-fn overview_row_label(mail: &Mail, depth: usize, parent_subject: Option<&str>) -> String {
-    let mut label = format!("{} ", overview_date(&mail.date));
-    if depth > 0 {
-        label.push_str(&"  ".repeat(depth - 1));
-        label.push_str("` ");
-    }
+/// The overview row's texts, following lore's convention of only naming the
+/// subject when it differs from the parent's (ignoring Re: chains): a
+/// same-subject reply is titled by its author with the date below, while a
+/// subject change is titled by the new subject with author and date below.
+fn overview_row_texts(mail: &Mail, parent_subject: Option<&str>) -> (String, String) {
+    let author = author_name(&mail.from);
+    let date = overview_date(&mail.date);
     let same_subject = parent_subject.is_some_and(|parent| {
         strip_reply_prefixes(parent).eq_ignore_ascii_case(strip_reply_prefixes(&mail.subject))
     });
     if parent_subject.is_none() || same_subject {
-        label.push_str(author_name(&mail.from));
+        (author.to_string(), date)
     } else {
-        label.push_str(mail.subject.trim());
-        label.push(' ');
-        label.push_str(author_name(&mail.from));
+        (mail.subject.trim().to_string(), format!("{author} · {date}"))
     }
-    label
 }
 
 /// The overview sidebar: a heading over one activatable row per message,
@@ -596,16 +591,49 @@ fn build_overview_sidebar(
             .parent
             .map(|parent| thread[parent].subject.as_str())
             .or_else(|| (row.index != 0).then(|| thread[0].subject.as_str()));
-        let text = overview_row_label(&thread[row.index], row.depth, parent_subject);
+        let mail = &thread[row.index];
+        let (title, subtitle) = overview_row_texts(mail, parent_subject);
 
-        let label = gtk::Label::builder()
-            .label(&text)
-            .tooltip_text(&text)
+        let title_label = gtk::Label::builder()
+            .label(&title)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .xalign(0.0)
-            .css_classes(["monospace", "caption"])
             .build();
-        list.append(&gtk::ListBoxRow::builder().child(&label).build());
+        let subtitle_label = gtk::Label::builder()
+            .label(&subtitle)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .xalign(0.0)
+            .css_classes(["caption", "dim-label"])
+            .build();
+        let texts = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .valign(gtk::Align::Center)
+            .spacing(2)
+            .build();
+        texts.append(&title_label);
+        texts.append(&subtitle_label);
+
+        let avatar = adw::Avatar::new(28, Some(author_name(&mail.from)), true);
+        avatar.set_valign(gtk::Align::Center);
+
+        // Reply depth is shown by indenting the row content, capped so a
+        // pathological chain of replies cannot push the text out of view.
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(9)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6 + 18 * row.depth.min(8) as i32)
+            .margin_end(6)
+            .build();
+        content.append(&avatar);
+        content.append(&texts);
+
+        let row_widget = gtk::ListBoxRow::builder()
+            .child(&content)
+            .tooltip_text(&mail.subject)
+            .build();
+        list.append(&row_widget);
         message_of_row.push(row.index);
     }
 
@@ -626,21 +654,32 @@ fn build_overview_sidebar(
     ));
 
     let heading = gtk::Label::builder()
+        .label("Thread Overview")
+        .xalign(0.0)
+        .css_classes(["heading"])
+        .build();
+    let count = gtk::Label::builder()
         .label(format!(
-            "Thread Overview — {} message{}",
+            "{} message{}",
             thread.len(),
             if thread.len() == 1 { "" } else { "s" }
         ))
         .xalign(0.0)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    let header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
         .margin_top(12)
         .margin_bottom(12)
         .margin_start(12)
         .margin_end(12)
-        .css_classes(["heading"])
         .build();
+    header.append(&heading);
+    header.append(&count);
 
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    sidebar.append(&heading);
+    sidebar.append(&header);
     sidebar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     sidebar.append(
         &gtk::ScrolledWindow::builder()
@@ -1488,26 +1527,28 @@ mod tests {
     }
 
     #[test]
-    fn overview_labels_follow_lore_conventions() {
+    fn overview_rows_title_by_author_unless_the_subject_changed() {
         let op = mail("op@x", None, "[PATCH 0/2] series", "Nika Krasnova <nika@x>");
         let same = mail("a@x", Some("op@x"), "Re: [PATCH 0/2] series", "Miguel Ojeda <m@x>");
         let changed = mail("b@x", Some("op@x"), "[PATCH 1/2] first patch", "Nika Krasnova <nika@x>");
 
-        // The OP row: date and author only.
-        assert_eq!(overview_row_label(&op, 0, None), "2026-06-29 03:51 Nika Krasnova");
-        // Same subject as the parent (modulo Re:): author only, marker indented.
+        // The OP row: author over the date.
         assert_eq!(
-            overview_row_label(&same, 1, Some("[PATCH 0/2] series")),
-            "2026-06-29 03:51 ` Miguel Ojeda"
+            overview_row_texts(&op, None),
+            ("Nika Krasnova".to_string(), "2026-06-29 03:51".to_string())
         );
+        // Same subject as the parent (modulo Re:): likewise.
         assert_eq!(
-            overview_row_label(&same, 3, Some("[PATCH 0/2] series")),
-            "2026-06-29 03:51     ` Miguel Ojeda"
+            overview_row_texts(&same, Some("[PATCH 0/2] series")),
+            ("Miguel Ojeda".to_string(), "2026-06-29 03:51".to_string())
         );
-        // Changed subject: shown before the author.
+        // Changed subject: the subject takes the title, author joins the date.
         assert_eq!(
-            overview_row_label(&changed, 1, Some("[PATCH 0/2] series")),
-            "2026-06-29 03:51 ` [PATCH 1/2] first patch Nika Krasnova"
+            overview_row_texts(&changed, Some("[PATCH 0/2] series")),
+            (
+                "[PATCH 1/2] first patch".to_string(),
+                "Nika Krasnova · 2026-06-29 03:51".to_string()
+            )
         );
     }
 

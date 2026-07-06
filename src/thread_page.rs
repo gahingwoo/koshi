@@ -438,6 +438,12 @@ struct TreeRow {
     parent_row: Option<usize>,
     /// Whether this message has at least one reply of its own.
     has_children: bool,
+    /// Connector-line state, one entry per gutter column (length == depth).
+    /// Every entry but the last marks an ancestor whose subtree continues
+    /// past this row (draw a straight vertical through that column); the
+    /// last entry is this node's own "a sibling follows below" (draw the
+    /// elbow's downward continuation).
+    trunk: Vec<bool>,
 }
 
 /// Arrange the thread as lore.kernel.org's overview does: depth-first over
@@ -479,12 +485,13 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
         index: usize,
         depth: usize,
         parent_row: Option<usize>,
+        trunk: Vec<bool>,
     }
     let seed = |roots: &[usize]| -> Vec<Pending> {
         roots
             .iter()
             .rev()
-            .map(|&index| Pending { index, depth: 0, parent_row: None })
+            .map(|&index| Pending { index, depth: 0, parent_row: None, trunk: Vec::new() })
             .collect()
     };
 
@@ -501,11 +508,18 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
             let row_pos = rows.len();
             let kids = &children[pending.index];
             let has_children = kids.iter().any(|&kid| !emitted[kid]);
-            for &kid in kids.iter().rev() {
+            let last = kids.len().saturating_sub(1);
+            // A child's gutter is its parent's gutter plus one column: the
+            // parent's own "continues below" flag becomes a pass-through
+            // vertical for the child, and the child adds its own flag.
+            for (order, &kid) in kids.iter().enumerate().rev() {
+                let mut trunk = pending.trunk.clone();
+                trunk.push(order != last);
                 stack.push(Pending {
                     index: kid,
                     depth: pending.depth + 1,
                     parent_row: Some(row_pos),
+                    trunk,
                 });
             }
             rows.push(TreeRow {
@@ -513,12 +527,18 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
                 depth: pending.depth,
                 parent_row: pending.parent_row,
                 has_children,
+                trunk: pending.trunk,
             });
         }
         // Messages caught in a reference cycle have no root to be reached
         // from; surface the first stranded one as a root and keep going.
         match emitted.iter().position(|&done| !done) {
-            Some(index) => stack.push(Pending { index, depth: 0, parent_row: None }),
+            Some(index) => stack.push(Pending {
+                index,
+                depth: 0,
+                parent_row: None,
+                trunk: Vec::new(),
+            }),
             None => return rows,
         }
     }
@@ -574,15 +594,22 @@ fn overview_row_texts(mail: &Mail) -> (String, String) {
     )
 }
 
-/// Pixels of indentation per reply level in the overview tree.
-const OVERVIEW_INDENT: i32 = 20;
-/// Cap on indentation, so a pathological reply chain can't push the row
-/// text off the side of the sidebar.
+/// The width of one indentation column in the overview tree's gutter.
+const OVERVIEW_COLUMN: f64 = 20.0;
+/// Cap on drawn indentation, so a pathological reply chain can't push the
+/// row text off the side of the sidebar.
 const OVERVIEW_MAX_DEPTH: usize = 12;
 
-/// Per-row collapse bookkeeping for the overview list.
+/// Per-row bookkeeping for the overview list: collapse state plus the two
+/// widgets the connector-line drawing needs to place a row's gutter.
 struct OverviewRow {
     row: gtk::ListBoxRow,
+    /// The row's content box; its left edge is where the gutter columns
+    /// begin, and it shares that left edge with every other row so columns
+    /// at the same depth line up across rows.
+    content: gtk::Box,
+    /// Connector-line state, one bool per gutter column (see TreeRow).
+    trunk: Vec<bool>,
     /// Row position of the parent, for hiding a collapsed subtree.
     parent_row: Option<usize>,
     /// Whether this row's own replies are shown.
@@ -602,10 +629,68 @@ fn refresh_overview_visibility(rows: &[OverviewRow]) {
     }
 }
 
+/// Draw the whole reply tree's connector lines in one pass over an overlay
+/// covering the list. Each row is drawn across its *full* allocation (which
+/// abuts its neighbours' with no gap), so a straight vertical from one row
+/// meets the next — unlike a per-row child widget, which would be inset by
+/// the row's padding and leave the lines broken between rows.
+fn draw_overview_lines(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, rows: &[OverviewRow]) {
+    let color = area.color();
+    cr.set_source_rgba(
+        f64::from(color.red()),
+        f64::from(color.green()),
+        f64::from(color.blue()),
+        0.55 * f64::from(color.alpha()),
+    );
+    cr.set_line_width(1.0);
+
+    for row in rows {
+        let depth = row.trunk.len();
+        if depth == 0 || !row.row.is_visible() {
+            continue;
+        }
+        // The row gives the (gap-free) vertical span; the content box gives
+        // the gutter's left edge in the drawing area's coordinates.
+        let (Some(bounds), Some(content)) =
+            (row.row.compute_bounds(area), row.content.compute_bounds(area))
+        else {
+            continue;
+        };
+        let left = f64::from(content.x());
+        let top = f64::from(bounds.y());
+        let bottom = f64::from(bounds.y() + bounds.height());
+        let mid = ((top + bottom) / 2.0).floor() + 0.5;
+
+        for (column, &continues) in row.trunk.iter().enumerate() {
+            // Center of this column, nudged to a half-pixel for a crisp line.
+            let x = (left + column as f64 * OVERVIEW_COLUMN + OVERVIEW_COLUMN / 2.0).floor() + 0.5;
+            if column + 1 < depth {
+                // An ancestor column: a full-height line if its thread goes on.
+                if continues {
+                    cr.move_to(x, top);
+                    cr.line_to(x, bottom);
+                }
+            } else {
+                // This row's own column: an elbow down from the parent and
+                // across toward the avatar, continuing below if a sibling
+                // follows (`continues` is this node's own flag here).
+                cr.move_to(x, top);
+                cr.line_to(x, mid);
+                cr.line_to(left + (column as f64 + 1.0) * OVERVIEW_COLUMN, mid);
+                if continues {
+                    cr.move_to(x, mid);
+                    cr.line_to(x, bottom);
+                }
+            }
+        }
+    }
+    let _ = cr.stroke();
+}
+
 /// The overview sidebar: a heading over one activatable row per message,
-/// laid out as a collapsible reply tree, replies indented under their
-/// parent. Activating a row scrolls the message stack to that message; the
-/// disclosure button on a row with replies hides or shows its subtree.
+/// laid out as a collapsible reply tree with connector lines. Activating a
+/// row scrolls the message stack to that message; the disclosure button on
+/// a row with replies hides or shows its subtree.
 fn build_overview_sidebar(
     thread: &[Mail],
     sections: Vec<gtk::Box>,
@@ -650,17 +735,29 @@ fn build_overview_sidebar(
         let avatar = adw::Avatar::new(28, Some(author_name(&mail.from)), true);
         avatar.set_valign(gtk::Align::Center);
 
-        // Reply depth is shown by indenting the row, capped so a pathological
-        // chain of replies cannot push the text off the side.
-        let indent = OVERVIEW_INDENT * row.depth.min(OVERVIEW_MAX_DEPTH) as i32;
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(6)
             .margin_top(6)
             .margin_bottom(6)
-            .margin_start(6 + indent)
+            .margin_start(6)
             .margin_end(6)
             .build();
+
+        // Reserve the gutter's width as an empty leading column; the overlay
+        // draws the connector lines over it. Depth is clamped so a runaway
+        // reply chain can't push the row text off the side.
+        let mut trunk = row.trunk;
+        if row.depth > OVERVIEW_MAX_DEPTH {
+            // Keep this node's own elbow flag (the last entry) when clamping.
+            let own = trunk[trunk.len() - 1];
+            trunk.truncate(OVERVIEW_MAX_DEPTH - 1);
+            trunk.push(own);
+        }
+        if !trunk.is_empty() {
+            let width = (trunk.len() as f64 * OVERVIEW_COLUMN) as i32;
+            content.append(&gtk::Box::builder().width_request(width).build());
+        }
 
         // A disclosure toggle for rows with replies; a same-width spacer for
         // the rest, so every avatar at a given depth lines up.
@@ -692,6 +789,8 @@ fn build_overview_sidebar(
         }
         rows.push(OverviewRow {
             row: row_widget,
+            content,
+            trunk,
             parent_row: row.parent_row,
             expanded: Cell::new(true),
         });
@@ -699,10 +798,46 @@ fn build_overview_sidebar(
     }
 
     let rows = Rc::new(rows);
+
+    // The connector lines are drawn once over the whole list by an overlay
+    // drawing area that reads the live row positions, so it must repaint
+    // whenever those change: on scroll, on resize, and on collapse.
+    let list_scrolled = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
+    let lines = gtk::DrawingArea::new();
+    // Purely decorative: never a target, so clicks and hover reach the rows.
+    lines.set_can_target(false);
+    lines.set_draw_func(glib::clone!(
+        #[strong]
+        rows,
+        move |area, cr, _width, _height| draw_overview_lines(area, cr, &rows)
+    ));
+    let overlay = gtk::Overlay::new();
+    overlay.set_vexpand(true);
+    overlay.set_child(Some(&list_scrolled));
+    overlay.add_overlay(&lines);
+
+    let vadjustment = list_scrolled.vadjustment();
+    vadjustment.connect_value_changed(glib::clone!(
+        #[weak]
+        lines,
+        move |_| lines.queue_draw()
+    ));
+    vadjustment.connect_changed(glib::clone!(
+        #[weak]
+        lines,
+        move |_| lines.queue_draw()
+    ));
+
     for (row_pos, button) in disclosures {
         button.connect_clicked(glib::clone!(
             #[strong]
             rows,
+            #[weak]
+            lines,
             move |button| {
                 let expanded = !rows[row_pos].expanded.get();
                 rows[row_pos].expanded.set(expanded);
@@ -717,6 +852,7 @@ fn build_overview_sidebar(
                     "Expand replies"
                 }));
                 refresh_overview_visibility(&rows);
+                lines.queue_draw();
             }
         ));
     }
@@ -765,13 +901,7 @@ fn build_overview_sidebar(
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar.append(&header);
     sidebar.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    sidebar.append(
-        &gtk::ScrolledWindow::builder()
-            .child(&list)
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .build(),
-    );
+    sidebar.append(&overlay);
     sidebar.upcast()
 }
 

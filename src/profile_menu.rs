@@ -1,66 +1,106 @@
-//! The header-bar profile button and the popover it opens: the user's name
-//! and email, the effective git-send-email settings, and — when the user has
-//! configured `[sendemail "<name>"]` identities — a radio selector to switch
-//! between them.
+//! The header-bar profile button and the light popover it opens.
 //!
-//! All stock Adwaita: a boxed [`adw::PreferencesGroup`] list, standard style
-//! classes, no custom CSS. The popover rebuilds its contents each time it
-//! opens so it always reflects the live git configuration.
+//! The popover is menu-weight — who you are, which send-email identity is
+//! active, where mail goes, and two lead-in rows — following the GNOME split
+//! between a primary menu and a settings surface. The dense git-send-email
+//! configuration lives in an [`adw::PreferencesDialog`] reached from the
+//! "Sending details" row, not crammed into the popover.
+//!
+//! Everything is stock Adwaita with built-in style classes; no custom CSS, no
+//! avatars. The popover rebuilds from live `git config` on every open, so an
+//! identity switch (which just writes `sendemail.identity` and closes) is
+//! reflected the next time it opens — no in-place rebuild needed.
 
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::profile::{self, Profile};
+use crate::profile::{self, Profile, Setting};
+
+/// `[sendemail]` keys shown under "Server" in the details dialog.
+const SERVER_KEYS: &[&str] = &[
+    "smtpServer",
+    "smtpServerPort",
+    "smtpServerOption",
+    "smtpEncryption",
+    "smtpUser",
+    "smtpDomain",
+    "smtpSslCertPath",
+    "sendmailCmd",
+];
+
+/// `[sendemail]` keys shown under "Addressing"; everything else is "Behavior".
+const ADDRESSING_KEYS: &[&str] = &[
+    "from",
+    "envelopeSender",
+    "to",
+    "cc",
+    "toCmd",
+    "ccCmd",
+    "suppressCc",
+    "suppressFrom",
+];
 
 /// The account button for the header bar: an icon that opens the profile
 /// popover.
 pub fn build_profile_button() -> gtk::MenuButton {
     let popover = gtk::Popover::new();
-    // Repopulate on every open so a config change (or an identity switch made
-    // in a previous open) is always reflected.
-    popover.connect_show(|popover| {
-        popover.set_child(Some(&build_content(popover, &profile::load())));
-    });
-
     let button = gtk::MenuButton::builder()
         .icon_name("avatar-default-symbolic")
         .tooltip_text("Profile")
         .build();
     button.set_popover(Some(&popover));
     button.add_css_class("flat");
+
+    // Repopulate on every open from live git config; pass the button so the
+    // "Sending details" row can resolve the window to present its dialog on.
+    popover.connect_show(glib::clone!(
+        #[weak]
+        button,
+        move |popover| {
+            popover.set_child(Some(&build_content(popover, &button, &profile::load())));
+        }
+    ));
+
     button
 }
 
-fn build_content(popover: &gtk::Popover, profile: &Profile) -> gtk::Widget {
-    let container = gtk::Box::builder()
+fn build_content(popover: &gtk::Popover, button: &gtk::MenuButton, profile: &Profile) -> gtk::Widget {
+    let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(18)
-        .width_request(340)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .width_request(300)
         .build();
 
     if profile.is_empty() {
-        container.append(&build_empty_state());
-        container.append(&build_footer(popover));
-        return wrap_in_scroller(&container);
+        root.append(&heading_label("No git profile"));
+        root.append(&wrapped_dim_label(
+            "Koshi reads your name, email, and SMTP settings from git. \
+             Configure git send-email to see them here.",
+        ));
+        let group = adw::PreferencesGroup::new();
+        group.add(&account_settings_row(popover));
+        root.append(&group);
+        return root.upcast();
     }
 
-    container.append(&build_header(profile));
-    if !profile.identities.is_empty() {
-        container.append(&build_identities(popover, profile));
+    root.append(&build_header(profile));
+    if profile.identities.len() >= 2 {
+        root.append(&build_identities(popover, profile));
     }
-    if let Some(sending) = build_sending_group(profile) {
-        container.append(&sending);
+    if let Some(transport) = build_transport(profile) {
+        root.append(&transport);
     }
-    if let Some(status) = build_status(profile) {
-        container.append(&status);
-    }
-    container.append(&build_footer(popover));
+    root.append(&build_actions(popover, button, profile));
 
-    wrap_in_scroller(&container)
+    root.upcast()
 }
 
-/// Name and email at the top. The name falls back to the active identity, then
-/// to the email, so the block is never blank when anything is configured.
+/// Name and email, plus — when exactly one identity is configured — a caption
+/// naming it (there is nothing to switch to, so it is context, not a control).
 fn build_header(profile: &Profile) -> gtk::Widget {
     let block = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -73,53 +113,32 @@ fn build_header(profile: &Profile) -> gtk::Widget {
         .or_else(|| profile.active().map(|id| id.name.clone()))
         .or_else(|| profile.user_email.clone())
         .unwrap_or_else(|| "Profile".to_string());
-    block.append(
-        &gtk::Label::builder()
-            .label(name)
-            .use_markup(false)
-            .css_classes(["title-4"])
-            .halign(gtk::Align::Start)
-            .xalign(0.0)
-            .wrap(true)
-            .build(),
-    );
+    block.append(&heading_label(&name));
 
     if let Some(email) = &profile.user_email {
-        block.append(
-            &gtk::Label::builder()
-                .label(email)
-                .use_markup(false)
-                .css_classes(["dim-label"])
-                .halign(gtk::Align::Start)
-                .xalign(0.0)
-                .selectable(true)
-                .wrap(true)
-                .build(),
-        );
+        let label = wrapped_dim_label(email);
+        label.add_css_class("caption");
+        label.set_selectable(true);
+        block.append(&label);
+    }
+
+    if profile.identities.len() == 1 {
+        let label = wrapped_dim_label(&format!("Identity: {}", profile.identities[0].name));
+        label.add_css_class("caption");
+        block.append(&label);
     }
 
     block.upcast()
 }
 
-/// The identity selector: one radio row per `[sendemail "<name>"]`
-/// subsection. Selecting a row writes `sendemail.identity` and rebuilds the
-/// popover so the active badge and effective settings update.
+/// The identity switcher, shown only when two or more identities exist: one
+/// activatable row each, the active one marked with a checkmark. Activating a
+/// different row writes `sendemail.identity` and closes the popover.
 fn build_identities(popover: &gtk::Popover, profile: &Profile) -> gtk::Widget {
-    let group = adw::PreferencesGroup::builder()
-        .title("Identities")
-        .description("git send-email")
-        .build();
+    let group = adw::PreferencesGroup::new();
 
-    let mut group_leader: Option<gtk::CheckButton> = None;
     for identity in &profile.identities {
         let is_active = profile.active_identity.as_deref() == Some(identity.name.as_str());
-
-        let check = gtk::CheckButton::new();
-        match &group_leader {
-            Some(leader) => check.set_group(Some(leader)),
-            None => group_leader = Some(check.clone()),
-        }
-        check.set_active(is_active);
 
         let row = adw::ActionRow::builder()
             .title(glib::markup_escape_text(&identity.name))
@@ -128,180 +147,225 @@ fn build_identities(popover: &gtk::Popover, profile: &Profile) -> gtk::Widget {
         if let Some(email) = &identity.email {
             row.set_subtitle(&glib::markup_escape_text(email));
         }
-        row.add_prefix(&check);
-        row.set_activatable_widget(Some(&check));
-
         if is_active {
-            row.add_suffix(
-                &gtk::Label::builder()
-                    .label("Active")
-                    .css_classes(["dim-label", "caption"])
-                    .valign(gtk::Align::Center)
-                    .build(),
-            );
+            row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
         }
 
-        // Connect after set_active so the initial state does not trigger a
-        // write. A radio switch toggles two buttons — only act on the one
-        // turning on.
         let name = identity.name.clone();
-        check.connect_toggled(glib::clone!(
+        row.connect_activated(glib::clone!(
             #[weak]
             popover,
-            move |check| {
-                if !check.is_active() {
-                    return;
+            move |_| {
+                if !is_active {
+                    profile::set_active_identity(&name);
                 }
-                profile::set_active_identity(&name);
-                // Rebuild from an idle: repopulating the popover destroys the
-                // very CheckButton whose handler is running.
-                glib::idle_add_local_once(glib::clone!(
-                    #[weak]
-                    popover,
-                    move || {
-                        popover.set_child(Some(&build_content(&popover, &profile::load())));
-                    }
-                ));
+                popover.popdown();
             }
         ));
-
         group.add(&row);
     }
 
     group.upcast()
 }
 
-/// The effective send-email settings as read-only property rows. Titled to
-/// name the active identity when one is in effect.
-fn build_sending_group(profile: &Profile) -> Option<gtk::Widget> {
+/// A single calm row saying where mail goes: server as title, "Port 465 · SSL"
+/// as subtitle (the Wi-Fi-row idiom). Absent when nothing sends mail.
+fn build_transport(profile: &Profile) -> Option<gtk::Widget> {
+    // Nothing routes mail (no SMTP server, no sendmail command) — no row.
+    profile.effective_transport()?;
+
     let settings = profile.effective_sendemail();
-    if settings.is_empty() {
+    let get = |key: &str| {
+        settings
+            .iter()
+            .find(|s| s.key == key)
+            .map(|s| s.value.as_str())
+    };
+
+    let (title, subtitle) = if let Some(server) = get("smtpServer") {
+        let mut parts = Vec::new();
+        if let Some(port) = get("smtpServerPort") {
+            parts.push(format!("Port {port}"));
+        }
+        if let Some(encryption) = get("smtpEncryption") {
+            parts.push(encryption_label(encryption));
+        }
+        (server.to_string(), parts.join(" \u{00b7} "))
+    } else if let Some(command) = get("sendmailCmd") {
+        ("Local sendmail".to_string(), command.to_string())
+    } else {
         return None;
-    }
+    };
 
-    let group = adw::PreferencesGroup::builder().title("Sending").build();
-    // Key the description off the *resolved* identity, not the raw pointer: a
-    // dangling `sendemail.identity` takes no effect, so the effective values
-    // below are top-level only. The name is escaped because a
-    // PreferencesGroup description always renders Pango markup.
-    match profile.active() {
-        Some(identity) => group.set_description(Some(&format!(
-            "Using identity \u{201c}{}\u{201d}",
-            glib::markup_escape_text(&identity.name)
-        ))),
-        None => group.set_description(Some("git send-email")),
+    let group = adw::PreferencesGroup::new();
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&title))
+        .build();
+    row.add_prefix(&gtk::Image::from_icon_name("network-server-symbolic"));
+    if !subtitle.is_empty() {
+        row.set_subtitle(&glib::markup_escape_text(&subtitle));
     }
-
-    for setting in &settings {
-        group.add(&property_row(&setting.key, &setting.value));
-    }
+    group.add(&row);
 
     Some(group.upcast())
 }
 
-/// A key/value row: the git key as the title, the value dimmed and
-/// right-aligned. The value is plain text (never markup — `from` values carry
-/// `<addr>`) and selectable so it can be copied.
-fn property_row(key: &str, value: &str) -> adw::ActionRow {
+fn encryption_label(value: &str) -> String {
+    match value.to_ascii_lowercase().as_str() {
+        "ssl" => "SSL".to_string(),
+        "tls" => "TLS".to_string(),
+        "" | "none" => "No encryption".to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// The lead-in rows: "Sending details" (opens the config dialog, only when
+/// there is config to show) and "Account Settings".
+fn build_actions(
+    popover: &gtk::Popover,
+    button: &gtk::MenuButton,
+    profile: &Profile,
+) -> gtk::Widget {
+    let group = adw::PreferencesGroup::new();
+
+    if !profile.effective_sendemail().is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("Sending details")
+            .subtitle("SMTP and git send-email options")
+            .activatable(true)
+            .build();
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+
+        let profile = profile.clone();
+        row.connect_activated(glib::clone!(
+            #[weak]
+            popover,
+            #[weak]
+            button,
+            move |_| {
+                popover.popdown();
+                let dialog = build_sending_dialog(&profile);
+                dialog.present(button.root().as_ref());
+            }
+        ));
+        group.add(&row);
+    }
+
+    group.add(&account_settings_row(popover));
+    group.upcast()
+}
+
+/// An "Account Settings" row wired to the existing `app.preferences` action.
+fn account_settings_row(popover: &gtk::Popover) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(glib::markup_escape_text(key))
-        .build();
-    row.add_suffix(
-        &gtk::Label::builder()
-            .label(value)
-            .use_markup(false)
-            .css_classes(["dim-label"])
-            .halign(gtk::Align::End)
-            .hexpand(true)
-            .xalign(1.0)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .max_width_chars(28)
-            .selectable(true)
-            .build(),
-    );
-    row
-}
-
-/// A one-line "sends via …" indicator using the effective transport.
-fn build_status(profile: &Profile) -> Option<gtk::Widget> {
-    let transport = profile.effective_transport()?;
-
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .halign(gtk::Align::Start)
-        .build();
-    let icon = gtk::Image::from_icon_name("emblem-ok-symbolic");
-    icon.add_css_class("success");
-    row.append(&icon);
-    row.append(
-        &gtk::Label::builder()
-            .label(format!("Sends via {transport}"))
-            .use_markup(false)
-            .css_classes(["success", "caption"])
-            .halign(gtk::Align::Start)
-            .xalign(0.0)
-            .wrap(true)
-            .build(),
-    );
-
-    Some(row.upcast())
-}
-
-fn build_empty_state() -> gtk::Widget {
-    let block = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .build();
-    block.append(
-        &gtk::Label::builder()
-            .label("No git profile")
-            .css_classes(["title-4"])
-            .halign(gtk::Align::Start)
-            .xalign(0.0)
-            .build(),
-    );
-    block.append(
-        &gtk::Label::builder()
-            .label(
-                "Koshi reads your name, email, and SMTP settings from git. \
-                 Configure git send-email to see them here.",
-            )
-            .use_markup(false)
-            .css_classes(["dim-label"])
-            .halign(gtk::Align::Start)
-            .xalign(0.0)
-            .wrap(true)
-            .build(),
-    );
-    block.upcast()
-}
-
-/// The full-width "Account Settings" button, which opens Preferences and
-/// dismisses the popover.
-fn build_footer(popover: &gtk::Popover) -> gtk::Widget {
-    let button = gtk::Button::builder()
-        .label("Account Settings")
+        .title("Account Settings")
+        .activatable(true)
         .action_name("app.preferences")
         .build();
-    button.connect_clicked(glib::clone!(
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    row.connect_activated(glib::clone!(
         #[weak]
         popover,
         move |_| popover.popdown()
     ));
-    button.upcast()
+    row
 }
 
-/// Keep the popover a sensible size: cap its height and let the content
-/// scroll, while sizing its width to the content.
-fn wrap_in_scroller(child: &impl IsA<gtk::Widget>) -> gtk::Widget {
-    gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .propagate_natural_width(true)
-        .propagate_natural_height(true)
-        .max_content_height(560)
-        .child(child)
+/// The full git-send-email configuration, split into Server / Addressing /
+/// Behavior groups of read-only `property` rows with per-value copy buttons.
+fn build_sending_dialog(profile: &Profile) -> adw::PreferencesDialog {
+    let page = adw::PreferencesPage::builder()
+        .title("Send Email")
+        .icon_name("mail-send-symbolic")
+        .build();
+
+    let settings = profile.effective_sendemail();
+    let (mut server, mut addressing, mut behavior) = (Vec::new(), Vec::new(), Vec::new());
+    for setting in &settings {
+        if SERVER_KEYS.contains(&setting.key.as_str()) {
+            server.push(setting);
+        } else if ADDRESSING_KEYS.contains(&setting.key.as_str()) {
+            addressing.push(setting);
+        } else {
+            behavior.push(setting);
+        }
+    }
+
+    if !server.is_empty() {
+        let group = adw::PreferencesGroup::builder().title("Server").build();
+        match profile.active() {
+            Some(identity) => group.set_description(Some(&format!(
+                "Using identity \u{201c}{}\u{201d}",
+                glib::markup_escape_text(&identity.name)
+            ))),
+            None => group.set_description(Some("git send-email")),
+        }
+        for setting in server {
+            group.add(&property_row(setting));
+        }
+        page.add(&group);
+    }
+
+    for (title, bucket) in [("Addressing", addressing), ("Behavior", behavior)] {
+        if bucket.is_empty() {
+            continue;
+        }
+        let group = adw::PreferencesGroup::builder().title(title).build();
+        for setting in bucket {
+            group.add(&property_row(setting));
+        }
+        page.add(&group);
+    }
+
+    let dialog = adw::PreferencesDialog::builder().title("Send Email").build();
+    dialog.add(&page);
+    dialog
+}
+
+/// A read-only key/value row: the git key as a de-emphasized title, the value
+/// emphasized and selectable, with a flat button to copy it.
+fn property_row(setting: &Setting) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(glib::markup_escape_text(&setting.key))
+        .css_classes(["property"])
+        .build();
+    // Plain text — a `from` value carries `<addr>` that must not be markup.
+    row.set_subtitle(&glib::markup_escape_text(&setting.value));
+    row.set_subtitle_selectable(true);
+
+    let copy = gtk::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .valign(gtk::Align::Center)
+        .tooltip_text("Copy value")
+        .css_classes(["flat"])
+        .build();
+    let value = setting.value.clone();
+    copy.connect_clicked(move |button| {
+        button.clipboard().set_text(&value);
+    });
+    row.add_suffix(&copy);
+
+    row
+}
+
+fn heading_label(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .use_markup(false)
+        .css_classes(["heading"])
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .wrap(true)
         .build()
-        .upcast()
+}
+
+fn wrapped_dim_label(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .use_markup(false)
+        .css_classes(["dim-label"])
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .wrap(true)
+        .build()
 }

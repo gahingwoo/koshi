@@ -216,7 +216,24 @@ pub fn build_thread_page(
         .min_sidebar_width(360.0)
         .max_sidebar_width(1400.0)
         .build();
-    let page = adw::NavigationPage::new(&split, "Loading…");
+
+    // Below this width a side-by-side sidebar would squeeze the messages
+    // into a sliver (its minimum width alone is 360px), so collapse the
+    // split view there: the sidebar then overlays the content instead.
+    let bin = adw::BreakpointBin::builder()
+        .width_request(360)
+        .height_request(200)
+        .child(&split)
+        .build();
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxWidth,
+        800.0,
+        adw::LengthUnit::Sp,
+    ));
+    narrow.add_setter(&split, "collapsed", Some(&true.to_value()));
+    bin.add_breakpoint(narrow);
+
+    let page = adw::NavigationPage::new(&bin, "Loading…");
     page.set_widget_name(THREAD_PAGE_NAME);
     spawn_thread_load(remote, split, nav.clone(), page.clone(), list.to_string(), message_id.to_string());
     page
@@ -226,7 +243,12 @@ pub fn build_thread_page(
 /// build_thread_page. Does nothing until the thread has loaded (there is no
 /// tree to show before that) or on pages that aren't thread pages.
 pub fn toggle_overview(page: &adw::NavigationPage) {
-    let Some(split) = page.child().and_downcast::<adw::OverlaySplitView>() else {
+    let Some(split) = page
+        .child()
+        .and_downcast::<adw::BreakpointBin>()
+        .and_then(|bin| bin.child())
+        .and_downcast::<adw::OverlaySplitView>()
+    else {
         return;
     };
     if split.sidebar().is_some() {
@@ -422,7 +444,12 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
     let mut position: HashMap<&str, usize> = HashMap::new();
     for (index, mail) in thread.iter().enumerate() {
         if let Some(id) = &mail.message_id {
-            position.entry(normalize_message_id(id)).or_insert(index);
+            let id = normalize_message_id(id);
+            // An empty Message-ID must not become a key: any message with
+            // an empty In-Reply-To would then "reply" to it.
+            if !id.is_empty() {
+                position.entry(id).or_insert(index);
+            }
         }
     }
 
@@ -1416,6 +1443,18 @@ mod tests {
         // The cycle is cut once: its first message roots it, the other nests.
         let late = rows.iter().find(|row| row.index == 3).unwrap();
         assert_eq!((late.parent, late.depth), (Some(2), 1));
+    }
+
+    #[test]
+    fn tree_ignores_empty_ids() {
+        // A bare "Message-ID:" header parses to Some(""); a bare
+        // "In-Reply-To:" likewise. Neither may link the two messages.
+        let mut a = mail("x@x", None, "a", "A");
+        a.message_id = Some(String::new());
+        let mut b = mail("y@y", None, "b", "B");
+        b.in_reply_to = Some(String::new());
+        let rows = thread_tree(&[a, b]);
+        assert!(rows.iter().all(|row| row.depth == 0 && row.parent.is_none()));
     }
 
     #[test]

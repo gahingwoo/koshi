@@ -438,12 +438,6 @@ struct TreeRow {
     parent_row: Option<usize>,
     /// Whether this message has at least one reply of its own.
     has_children: bool,
-    /// Connector-line state, one entry per gutter column (length == depth).
-    /// Every entry but the last marks an ancestor whose subtree continues
-    /// past this row (draw a straight vertical through that column); the
-    /// last entry is this node's own "a sibling follows below" (draw the
-    /// elbow's downward continuation).
-    trunk: Vec<bool>,
 }
 
 /// Arrange the thread as lore.kernel.org's overview does: depth-first over
@@ -479,25 +473,21 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
         }
     }
 
-    // A pending entry carries everything a row needs before it is emitted;
-    // children are pushed in reverse so they pop back into arrival order.
+    // A pending entry carries what a row needs before it is emitted; children
+    // are pushed in reverse so they pop back into arrival order.
     struct Pending {
         index: usize,
         depth: usize,
         parent_row: Option<usize>,
-        trunk: Vec<bool>,
     }
-    let seed = |roots: &[usize]| -> Vec<Pending> {
-        roots
-            .iter()
-            .rev()
-            .map(|&index| Pending { index, depth: 0, parent_row: None, trunk: Vec::new() })
-            .collect()
-    };
 
     let mut rows: Vec<TreeRow> = Vec::with_capacity(thread.len());
     let mut emitted = vec![false; thread.len()];
-    let mut stack = seed(&roots);
+    let mut stack: Vec<Pending> = roots
+        .iter()
+        .rev()
+        .map(|&index| Pending { index, depth: 0, parent_row: None })
+        .collect();
     loop {
         while let Some(pending) = stack.pop() {
             // The emitted guard makes reference cycles finite: a child that
@@ -508,18 +498,11 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
             let row_pos = rows.len();
             let kids = &children[pending.index];
             let has_children = kids.iter().any(|&kid| !emitted[kid]);
-            let last = kids.len().saturating_sub(1);
-            // A child's gutter is its parent's gutter plus one column: the
-            // parent's own "continues below" flag becomes a pass-through
-            // vertical for the child, and the child adds its own flag.
-            for (order, &kid) in kids.iter().enumerate().rev() {
-                let mut trunk = pending.trunk.clone();
-                trunk.push(order != last);
+            for &kid in kids.iter().rev() {
                 stack.push(Pending {
                     index: kid,
                     depth: pending.depth + 1,
                     parent_row: Some(row_pos),
-                    trunk,
                 });
             }
             rows.push(TreeRow {
@@ -527,18 +510,12 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
                 depth: pending.depth,
                 parent_row: pending.parent_row,
                 has_children,
-                trunk: pending.trunk,
             });
         }
         // Messages caught in a reference cycle have no root to be reached
         // from; surface the first stranded one as a root and keep going.
         match emitted.iter().position(|&done| !done) {
-            Some(index) => stack.push(Pending {
-                index,
-                depth: 0,
-                parent_row: None,
-                trunk: Vec::new(),
-            }),
+            Some(index) => stack.push(Pending { index, depth: 0, parent_row: None }),
             None => return rows,
         }
     }
@@ -594,22 +571,22 @@ fn overview_row_texts(mail: &Mail) -> (String, String) {
     )
 }
 
-/// The width of one indentation column in the overview tree's gutter.
-const OVERVIEW_COLUMN: f64 = 20.0;
+/// Horizontal indent added per reply level, in pixels.
+const OVERVIEW_INDENT: i32 = 22;
 /// Cap on drawn indentation, so a pathological reply chain can't push the
 /// row text off the side of the sidebar.
 const OVERVIEW_MAX_DEPTH: usize = 12;
 
-/// Per-row bookkeeping for the overview list: collapse state plus the two
-/// widgets the connector-line drawing needs to place a row's gutter.
+/// Per-row bookkeeping for the overview list: collapse state plus the
+/// widgets whose live positions anchor the connector lines.
 struct OverviewRow {
     row: gtk::ListBoxRow,
-    /// The row's content box; its left edge is where the gutter columns
-    /// begin, and it shares that left edge with every other row so columns
-    /// at the same depth line up across rows.
-    content: gtk::Box,
-    /// Connector-line state, one bool per gutter column (see TreeRow).
-    trunk: Vec<bool>,
+    /// The disclosure button (for a parent) or the equal-width placeholder
+    /// (for a leaf) sitting at this row's indent. Its center is where this
+    /// row's subtree line descends from and where an incoming line meets it.
+    handle: gtk::Widget,
+    /// The avatar; its left edge is where an incoming connector line stops.
+    avatar: gtk::Widget,
     /// Row position of the parent, for hiding a collapsed subtree.
     parent_row: Option<usize>,
     /// Whether this row's own replies are shown.
@@ -629,12 +606,19 @@ fn refresh_overview_visibility(rows: &[OverviewRow]) {
     }
 }
 
-/// Draw the whole reply tree's connector lines in one pass over an overlay
-/// covering the list. Each row is drawn across its *full* allocation (which
-/// abuts its neighbours' with no gap), so a straight vertical from one row
-/// meets the next — unlike a per-row child widget, which would be inset by
-/// the row's padding and leave the lines broken between rows.
-fn draw_overview_lines(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, rows: &[OverviewRow]) {
+/// Draw the reply tree's connector lines in one pass over an overlay covering
+/// the list. For each parent a single vertical runs from its own center down
+/// to its last visible child's center, with a horizontal branching off into
+/// each child — the classic tree connector. Anchoring to widget *centers*
+/// (read live via compute_bounds) rather than row edges makes the lines join
+/// across the list's inter-row spacing and line up with the real disclosure
+/// buttons, whatever their exact size.
+fn draw_overview_lines(
+    area: &gtk::DrawingArea,
+    cr: &gtk::cairo::Context,
+    rows: &[OverviewRow],
+    children: &[Vec<usize>],
+) {
     let color = area.color();
     cr.set_source_rgba(
         f64::from(color.red()),
@@ -644,44 +628,45 @@ fn draw_overview_lines(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, rows: 
     );
     cr.set_line_width(1.0);
 
-    for row in rows {
-        let depth = row.trunk.len();
-        if depth == 0 || !row.row.is_visible() {
+    let center_y = |bounds: &gtk::graphene::Rect| f64::from(bounds.y() + bounds.height() / 2.0);
+
+    for (index, parent) in rows.iter().enumerate() {
+        if !parent.row.is_visible() {
             continue;
         }
-        // The row gives the (gap-free) vertical span; the content box gives
-        // the gutter's left edge in the drawing area's coordinates.
-        let (Some(bounds), Some(content)) =
-            (row.row.compute_bounds(area), row.content.compute_bounds(area))
-        else {
+        let kids: Vec<usize> = children[index]
+            .iter()
+            .copied()
+            .filter(|&kid| rows[kid].row.is_visible())
+            .collect();
+        let (Some(&last), Some(handle), Some(parent_bounds)) = (
+            kids.last(),
+            parent.handle.compute_bounds(area),
+            parent.row.compute_bounds(area),
+        ) else {
             continue;
         };
-        let left = f64::from(content.x());
-        let top = f64::from(bounds.y());
-        let bottom = f64::from(bounds.y() + bounds.height());
-        let mid = ((top + bottom) / 2.0).floor() + 0.5;
+        let Some(last_bounds) = rows[last].row.compute_bounds(area) else {
+            continue;
+        };
 
-        for (column, &continues) in row.trunk.iter().enumerate() {
-            // Center of this column, nudged to a half-pixel for a crisp line.
-            let x = (left + column as f64 * OVERVIEW_COLUMN + OVERVIEW_COLUMN / 2.0).floor() + 0.5;
-            if column + 1 < depth {
-                // An ancestor column: a full-height line if its thread goes on.
-                if continues {
-                    cr.move_to(x, top);
-                    cr.line_to(x, bottom);
-                }
-            } else {
-                // This row's own column: an elbow down from the parent and
-                // across toward the avatar, continuing below if a sibling
-                // follows (`continues` is this node's own flag here).
-                cr.move_to(x, top);
-                cr.line_to(x, mid);
-                cr.line_to(left + (column as f64 + 1.0) * OVERVIEW_COLUMN, mid);
-                if continues {
-                    cr.move_to(x, mid);
-                    cr.line_to(x, bottom);
-                }
-            }
+        // The trunk: from the parent's center down to its last child's,
+        // running through the parent's disclosure-button column.
+        let x = (f64::from(handle.x() + handle.width() / 2.0)).floor() + 0.5;
+        cr.move_to(x, center_y(&parent_bounds));
+        cr.line_to(x, center_y(&last_bounds));
+
+        // A branch into each child, stopping at the child's avatar.
+        for kid in kids {
+            let (Some(kid_bounds), Some(avatar)) = (
+                rows[kid].row.compute_bounds(area),
+                rows[kid].avatar.compute_bounds(area),
+            ) else {
+                continue;
+            };
+            let y = center_y(&kid_bounds).floor() + 0.5;
+            cr.move_to(x, y);
+            cr.line_to(f64::from(avatar.x()), y);
         }
     }
     let _ = cr.stroke();
@@ -744,23 +729,16 @@ fn build_overview_sidebar(
             .margin_end(6)
             .build();
 
-        // Reserve the gutter's width as an empty leading column; the overlay
-        // draws the connector lines over it. Depth is clamped so a runaway
-        // reply chain can't push the row text off the side.
-        let mut trunk = row.trunk;
-        if row.depth > OVERVIEW_MAX_DEPTH {
-            // Keep this node's own elbow flag (the last entry) when clamping.
-            let own = trunk[trunk.len() - 1];
-            trunk.truncate(OVERVIEW_MAX_DEPTH - 1);
-            trunk.push(own);
-        }
-        if !trunk.is_empty() {
-            let width = (trunk.len() as f64 * OVERVIEW_COLUMN) as i32;
-            content.append(&gtk::Box::builder().width_request(width).build());
+        // Reserve this row's indentation as an empty leading column, clamped
+        // so a runaway reply chain can't push the text off the side.
+        let indent = row.depth.min(OVERVIEW_MAX_DEPTH) as i32 * OVERVIEW_INDENT;
+        if indent > 0 {
+            content.append(&gtk::Box::builder().width_request(indent).build());
         }
 
-        // A disclosure toggle for rows with replies; a same-width spacer for
-        // the rest, so every avatar at a given depth lines up.
+        // The handle sits at the indent: a disclosure toggle for a row with
+        // replies, or an equal-width placeholder so every avatar at a given
+        // depth lines up. The connector lines anchor to its center.
         let button = row.has_children.then(|| {
             gtk::Button::builder()
                 .icon_name("pan-down-symbolic")
@@ -769,10 +747,17 @@ fn build_overview_sidebar(
                 .css_classes(["flat"])
                 .build()
         });
-        match &button {
-            Some(button) => content.append(button),
-            None => content.append(&gtk::Box::builder().width_request(34).build()),
-        }
+        let handle: gtk::Widget = match &button {
+            Some(button) => {
+                content.append(button);
+                button.clone().upcast()
+            }
+            None => {
+                let placeholder = gtk::Box::builder().width_request(34).build();
+                content.append(&placeholder);
+                placeholder.upcast()
+            }
+        };
 
         content.append(&avatar);
         content.append(&texts);
@@ -789,13 +774,25 @@ fn build_overview_sidebar(
         }
         rows.push(OverviewRow {
             row: row_widget,
-            content,
-            trunk,
+            handle,
+            avatar: avatar.upcast(),
             parent_row: row.parent_row,
             expanded: Cell::new(true),
         });
         message_of_row.push(row.index);
     }
+
+    // Direct children of each row, for the line drawing (built from the flat
+    // parent_row links now that every row exists).
+    let children: Vec<Vec<usize>> = {
+        let mut children = vec![Vec::new(); rows.len()];
+        for (index, row) in rows.iter().enumerate() {
+            if let Some(parent) = row.parent_row {
+                children[parent].push(index);
+            }
+        }
+        children
+    };
 
     let rows = Rc::new(rows);
 
@@ -813,7 +810,7 @@ fn build_overview_sidebar(
     lines.set_draw_func(glib::clone!(
         #[strong]
         rows,
-        move |area, cr, _width, _height| draw_overview_lines(area, cr, &rows)
+        move |area, cr, _width, _height| draw_overview_lines(area, cr, &rows, &children)
     ));
     let overlay = gtk::Overlay::new();
     overlay.set_vexpand(true);

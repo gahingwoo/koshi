@@ -44,6 +44,10 @@ const ADDRESSING_KEYS: &[&str] = &[
 /// popover.
 pub fn build_profile_button() -> gtk::MenuButton {
     let popover = gtk::Popover::new();
+    // A clean menu-style popover (no arrow), nudged in from the window's right
+    // edge so it does not sit flush against it.
+    popover.set_has_arrow(false);
+    popover.set_offset(-12, 0);
     let button = gtk::MenuButton::builder()
         .icon_name("avatar-default-symbolic")
         .tooltip_text("Profile")
@@ -104,7 +108,7 @@ fn build_content(popover: &gtk::Popover, button: &gtk::MenuButton, profile: &Pro
 fn build_header(profile: &Profile) -> gtk::Widget {
     let block = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
+        .spacing(6)
         .build();
 
     let name = profile
@@ -116,10 +120,7 @@ fn build_header(profile: &Profile) -> gtk::Widget {
     block.append(&heading_label(&name));
 
     if let Some(email) = &profile.user_email {
-        let label = wrapped_dim_label(email);
-        label.add_css_class("caption");
-        label.set_selectable(true);
-        block.append(&label);
+        block.append(&build_email_pill(email));
     }
 
     if profile.identities.len() == 1 {
@@ -129,6 +130,32 @@ fn build_header(profile: &Profile) -> gtk::Widget {
     }
 
     block.upcast()
+}
+
+/// The user's email as a monospace address pill, matching the To/Cc chips in
+/// the thread view (built-in `address-chip` class). Clicking it copies the
+/// whole address — it is not free-selectable text, so there is no stray
+/// cursor or partial-selection.
+fn build_email_pill(email: &str) -> gtk::Widget {
+    let label = gtk::Label::builder()
+        .use_markup(true)
+        .label(format!("<tt>{}</tt>", glib::markup_escape_text(email)))
+        .css_classes(["caption"])
+        .build();
+
+    let pill = gtk::Button::builder()
+        .child(&label)
+        .halign(gtk::Align::Start)
+        .tooltip_text("Copy email address")
+        .css_classes(["address-chip"])
+        .build();
+
+    let email = email.to_string();
+    pill.connect_clicked(move |pill| {
+        pill.clipboard().set_text(&email);
+    });
+
+    pill.upcast()
 }
 
 /// The identity switcher, shown only when two or more identities exist: one
@@ -245,7 +272,9 @@ fn build_actions(
             move |_| {
                 popover.popdown();
                 let dialog = build_sending_dialog(&profile);
-                dialog.present(button.root().as_ref());
+                // Present relative to the button widget itself (it stays
+                // rooted in the header); adw::Dialog walks up to the window.
+                dialog.present(Some(&button));
             }
         ));
         group.add(&row);
@@ -273,11 +302,26 @@ fn account_settings_row(popover: &gtk::Popover) -> adw::ActionRow {
 
 /// The full git-send-email configuration, split into Server / Addressing /
 /// Behavior groups of read-only `property` rows with per-value copy buttons.
-fn build_sending_dialog(profile: &Profile) -> adw::PreferencesDialog {
-    let page = adw::PreferencesPage::builder()
-        .title("Send Email")
-        .icon_name("mail-send-symbolic")
-        .build();
+///
+/// A plain `adw::Dialog` (not `adw::PreferencesDialog`): this is a read-only
+/// view, so it needs none of the search / view-switcher machinery, and skipping
+/// it makes the window open snappily.
+fn build_sending_dialog(profile: &Profile) -> adw::Dialog {
+    let page = adw::PreferencesPage::new();
+
+    // One note above every group explaining where these values come from and
+    // that they are set in git, not here.
+    let description = match profile.active() {
+        Some(identity) => format!(
+            "Read from your git configuration, using the active identity \u{201c}{}\u{201d}. \
+             To change them, edit your git send-email settings.",
+            glib::markup_escape_text(&identity.name)
+        ),
+        None => "Read from your git configuration. To change them, edit your git \
+                 send-email settings (git config)."
+            .to_string(),
+    };
+    page.set_description(description.as_str());
 
     let settings = profile.effective_sendemail();
     let (mut server, mut addressing, mut behavior) = (Vec::new(), Vec::new(), Vec::new());
@@ -291,22 +335,11 @@ fn build_sending_dialog(profile: &Profile) -> adw::PreferencesDialog {
         }
     }
 
-    if !server.is_empty() {
-        let group = adw::PreferencesGroup::builder().title("Server").build();
-        match profile.active() {
-            Some(identity) => group.set_description(Some(&format!(
-                "Using identity \u{201c}{}\u{201d}",
-                glib::markup_escape_text(&identity.name)
-            ))),
-            None => group.set_description(Some("git send-email")),
-        }
-        for setting in server {
-            group.add(&property_row(setting));
-        }
-        page.add(&group);
-    }
-
-    for (title, bucket) in [("Addressing", addressing), ("Behavior", behavior)] {
+    for (title, bucket) in [
+        ("Server", server),
+        ("Addressing", addressing),
+        ("Behavior", behavior),
+    ] {
         if bucket.is_empty() {
             continue;
         }
@@ -317,13 +350,22 @@ fn build_sending_dialog(profile: &Profile) -> adw::PreferencesDialog {
         page.add(&group);
     }
 
-    let dialog = adw::PreferencesDialog::builder().title("Send Email").build();
-    dialog.add(&page);
-    dialog
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&page));
+
+    adw::Dialog::builder()
+        .title("Send Email")
+        .content_width(460)
+        .content_height(620)
+        .child(&toolbar)
+        .build()
 }
 
 /// A read-only key/value row: the git key as a de-emphasized title, the value
-/// emphasized and selectable, with a flat button to copy it.
+/// emphasized, with a flat button to copy it. The value is deliberately NOT
+/// selectable — these are display-only, so there is no text cursor and nothing
+/// looks editable; copying goes through the button.
 fn property_row(setting: &Setting) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(glib::markup_escape_text(&setting.key))
@@ -331,7 +373,6 @@ fn property_row(setting: &Setting) -> adw::ActionRow {
         .build();
     // Plain text — a `from` value carries `<addr>` that must not be markup.
     row.set_subtitle(&glib::markup_escape_text(&setting.value));
-    row.set_subtitle_selectable(true);
 
     let copy = gtk::Button::builder()
         .icon_name("edit-copy-symbolic")

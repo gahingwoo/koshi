@@ -18,7 +18,10 @@ pub fn build_list_page(
         &gtk::Label::builder()
             .label(heading)
             .halign(gtk::Align::Start)
+            .xalign(0.0)
             .hexpand(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .css_classes(["title-1"])
             .build(),
     );
@@ -39,6 +42,9 @@ pub fn build_list_page(
         &gtk::Label::builder()
             .label(description)
             .halign(gtk::Align::Start)
+            .xalign(0.0)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .css_classes(["dim-label"])
             .build(),
     );
@@ -50,7 +56,10 @@ pub fn build_list_page(
         .child(&content)
         .build();
 
-    let scrolled = gtk::ScrolledWindow::builder().child(&clamp).build();
+    let scrolled = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&clamp)
+        .build();
 
     adw::NavigationPage::new(&scrolled, page_title)
 }

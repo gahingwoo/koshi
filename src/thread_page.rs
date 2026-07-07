@@ -602,6 +602,22 @@ fn refresh_overview_visibility(rows: &[OverviewRow]) {
     }
 }
 
+/// Scroll the message pane so `section`'s top aligns with the top of the
+/// view. Returns the adjustment value it set, or None if the widgets aren't
+/// laid out yet — the caller re-applies until that value holds steady.
+fn scroll_section_to_top(scrolled: &gtk::ScrolledWindow, section: &gtk::Widget) -> Option<f64> {
+    // scrolled -> auto Viewport -> the scrollable content (the Clamp). A
+    // section's offset within that content is independent of the current
+    // scroll, so it is exactly the adjustment value that lifts it to the top.
+    let content = scrolled.child().and_downcast::<gtk::Viewport>()?.child()?;
+    let top = f64::from(section.compute_bounds(&content)?.y());
+    let vadjustment = scrolled.vadjustment();
+    let max = (vadjustment.upper() - vadjustment.page_size()).max(vadjustment.lower());
+    let value = top.clamp(vadjustment.lower(), max);
+    vadjustment.set_value(value);
+    Some(value)
+}
+
 /// The overview sidebar: a heading over one activatable row per message,
 /// laid out as a collapsible reply tree indented by depth. Activating a row
 /// scrolls the message stack to that message; the disclosure button on a row
@@ -742,19 +758,60 @@ fn build_overview_sidebar(
         ));
     }
 
+    // A generation counter so a new activation supersedes any correction
+    // loop still running from a previous click.
+    let scroll_generation = Rc::new(Cell::new(0u64));
     list.connect_row_activated(glib::clone!(
         #[weak]
         scrolled,
+        #[strong]
+        scroll_generation,
         move |_, row| {
-            let Some(section) = message_of_row
-                .get(row.index() as usize)
-                .and_then(|&index| sections.get(index))
-            else {
+            let Some(&index) = message_of_row.get(row.index() as usize) else {
                 return;
             };
-            if let Some(viewport) = scrolled.child().and_downcast::<gtk::Viewport>() {
-                viewport.scroll_to(section, None);
-            }
+            let Some(section) = sections.get(index).cloned() else {
+                return;
+            };
+            let section: gtk::Widget = section.upcast();
+
+            // Aligning once at click time lands on the wrong message: the
+            // message bodies are GtkTextViews whose heights finish validating
+            // over the next few frames, and each correction shifts every
+            // section below it. So re-align on every frame until the target
+            // position stops moving (or a bounded number of frames pass).
+            let generation = scroll_generation.get().wrapping_add(1);
+            scroll_generation.set(generation);
+            let previous = Cell::new(f64::NAN);
+            let steady = Cell::new(0u32);
+            let frames = Cell::new(0u32);
+            scrolled.add_tick_callback(glib::clone!(
+                #[strong]
+                scroll_generation,
+                move |scrolled, _| {
+                    if scroll_generation.get() != generation {
+                        return glib::ControlFlow::Break;
+                    }
+                    let Some(value) = scroll_section_to_top(scrolled, &section) else {
+                        return glib::ControlFlow::Break;
+                    };
+                    frames.set(frames.get() + 1);
+                    if (value - previous.get()).abs() < 0.5 {
+                        steady.set(steady.get() + 1);
+                        if steady.get() >= 3 {
+                            return glib::ControlFlow::Break;
+                        }
+                    } else {
+                        steady.set(0);
+                        previous.set(value);
+                    }
+                    if frames.get() >= 60 {
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                }
+            ));
         }
     ));
 

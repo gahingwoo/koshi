@@ -812,6 +812,16 @@ fn build_overview_sidebar(
                     }
                 }
             ));
+
+            // The overview has done its job once a message is picked; dismiss
+            // it so the message it jumps to is actually visible — open, it
+            // overlays and dims most of the pane.
+            if let Some(split) = row
+                .ancestor(adw::OverlaySplitView::static_type())
+                .and_downcast::<adw::OverlaySplitView>()
+            {
+                split.set_show_sidebar(false);
+            }
         }
     ));
 

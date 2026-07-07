@@ -79,6 +79,23 @@ impl RemoteContent {
     }
 
     pub fn show_error(&self, error: &lore::Error, on_retry: impl Fn() + 'static) {
+        let message = error.to_string();
+
+        // Carry the error text in a capped label rather than the status page's
+        // own description: an unbounded message (a long request URL, say) would
+        // otherwise grow the page tall enough to need scrolling and shove the
+        // Retry button out of view. Two lines then ellipsis, full text on hover.
+        let detail = gtk::Label::builder()
+            .label(&message)
+            .justify(gtk::Justification::Center)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .lines(2)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .tooltip_text(&message)
+            .css_classes(["dim-label"])
+            .build();
+
         let retry = gtk::Button::builder()
             .label("Retry")
             .halign(gtk::Align::Center)
@@ -86,11 +103,18 @@ impl RemoteContent {
             .build();
         retry.connect_clicked(move |_| on_retry());
 
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(18)
+            .halign(gtk::Align::Center)
+            .build();
+        content.append(&detail);
+        content.append(&retry);
+
         let status = adw::StatusPage::builder()
             .icon_name("network-error-symbolic")
             .title("Couldn't Reach lore.kernel.org")
-            .description(glib::markup_escape_text(&error.to_string()))
-            .child(&retry)
+            .child(&content)
             .build();
 
         self.swap_child("error", &status);

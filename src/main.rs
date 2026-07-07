@@ -150,7 +150,11 @@ fn setup_search(search_entry: &gtk::SearchEntry, tab_view: &adw::TabView) {
         #[weak]
         tab_view,
         move |entry| {
-            let text = entry.text().trim().to_string();
+            // Collapse all whitespace (pasted text can carry newlines and tabs)
+            // into single spaces so the query stays one line — both for the
+            // search request and for the header/status labels that display it,
+            // where embedded newlines would defeat their ellipsization.
+            let text = entry.text().split_whitespace().collect::<Vec<_>>().join(" ");
             if text.is_empty() {
                 return;
             }

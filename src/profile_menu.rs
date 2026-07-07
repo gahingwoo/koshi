@@ -44,10 +44,6 @@ const ADDRESSING_KEYS: &[&str] = &[
 /// popover.
 pub fn build_profile_button() -> gtk::MenuButton {
     let popover = gtk::Popover::new();
-    // A clean menu-style popover (no arrow), nudged in from the window's right
-    // edge so it does not sit flush against it.
-    popover.set_has_arrow(false);
-    popover.set_offset(-12, 0);
     let button = gtk::MenuButton::builder()
         .icon_name("avatar-default-symbolic")
         .tooltip_text("Profile")
@@ -270,11 +266,14 @@ fn build_actions(
             #[weak]
             button,
             move |_| {
-                popover.popdown();
                 let dialog = build_sending_dialog(&profile);
-                // Present relative to the button widget itself (it stays
-                // rooted in the header); adw::Dialog walks up to the window.
-                dialog.present(Some(&button));
+                // Present on the top-level window (a stable widget) and only
+                // then dismiss the popover. Presenting relative to the row
+                // inside the closing popover serialises the dialog behind the
+                // popover's dismissal grab/animation, which is the source of
+                // the open lag; the window is always mapped, so it does not.
+                dialog.present(button.root().and_downcast::<gtk::Window>().as_ref());
+                popover.popdown();
             }
         ));
         group.add(&row);

@@ -5,6 +5,8 @@ mod highlight;
 mod inbox_page;
 mod list_page;
 mod lore;
+mod profile;
+mod profile_menu;
 mod remote_page;
 mod thread_list_page;
 mod thread_page;
@@ -17,6 +19,7 @@ use gtk::{gio, glib};
 
 use favorites_page::{FAVORITES_PAGE_NAME, build_favorites_page};
 use inbox_page::{INBOX_LIST_TITLE, build_inbox_page};
+use profile_menu::build_profile_button;
 use thread_list_page::{build_search_page, build_thread_list_page};
 use thread_page::{THREAD_PAGE_NAME, build_thread_page, toggle_overview};
 
@@ -485,7 +488,7 @@ fn build_header_bar(
         .build();
 
     header.pack_end(&build_primary_menu_button());
-    header.pack_end(&build_account_button());
+    header.pack_end(&build_profile_button());
     header.pack_end(&favorites_button);
     header.pack_end(&overview_button);
 
@@ -504,20 +507,6 @@ fn build_primary_menu_button() -> gtk::MenuButton {
         .primary(true)
         .tooltip_text("Main Menu")
         .build()
-}
-
-fn build_account_button() -> gtk::MenuButton {
-    let menu = gio::Menu::new();
-    menu.append(Some("Sign In"), Some("app.sign-in"));
-    menu.append(Some("Manage Accounts"), Some("app.manage-accounts"));
-
-    let button = gtk::MenuButton::builder()
-        .icon_name("avatar-default-symbolic")
-        .menu_model(&menu)
-        .tooltip_text("Account")
-        .build();
-    button.add_css_class("flat");
-    button
 }
 
 fn setup_actions(
@@ -554,15 +543,7 @@ fn setup_actions(
         })
         .build();
 
-    // Stubs for the account menu so its items are not rendered insensitive.
-    let sign_in = gio::ActionEntry::builder("sign-in")
-        .activate(|_: &adw::Application, _, _| {})
-        .build();
-    let manage_accounts = gio::ActionEntry::builder("manage-accounts")
-        .activate(|_: &adw::Application, _, _| {})
-        .build();
-
-    app.add_action_entries([preferences, shortcuts, about, sign_in, manage_accounts]);
+    app.add_action_entries([preferences, shortcuts, about]);
 
     app.set_accels_for_action("win.focus-search", &["<Control>l"]);
     app.set_accels_for_action("win.toggle-thread-overview", &["F9"]);

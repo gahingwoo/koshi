@@ -1,7 +1,7 @@
 mod feed;
 mod manifest;
 
-pub use feed::{PAGE_SIZE, ThreadSummary, fetch_thread_roots, search};
+pub use feed::{PAGE_SIZE, Sort, ThreadSummary, fetch_thread_roots, search};
 pub use manifest::{Inbox, fetch_inboxes};
 
 use std::fmt;

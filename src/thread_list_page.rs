@@ -1,11 +1,11 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::list_page::build_list_page;
-use crate::lore::{self, ThreadSummary};
+use crate::lore::{self, Sort, ThreadSummary};
 use crate::remote_page::RemoteContent;
 use crate::thread_page::build_thread_page;
 
@@ -27,11 +27,16 @@ impl Mode {
     async fn fetch(
         &self,
         offset: usize,
+        sort: Sort,
         cancellable: &gio::Cancellable,
     ) -> Result<Vec<ThreadSummary>, lore::Error> {
         match self {
+            // Browsing a list has no search terms to rank, so it is always by
+            // date; `sort` only applies to full-text search.
             Mode::Recent { list } => lore::fetch_thread_roots(list, offset, cancellable).await,
-            Mode::Search { list, query } => lore::search(list, query, offset, cancellable).await,
+            Mode::Search { list, query } => {
+                lore::search(list, query, offset, sort, cancellable).await
+            }
         }
     }
 }
@@ -68,6 +73,7 @@ fn build_page(
     description: &str,
 ) -> adw::NavigationPage {
     let remote = RemoteContent::new();
+    let sort = Rc::new(Cell::new(Sort::default()));
 
     let refresh_button = gtk::Button::builder()
         .icon_name("view-refresh-symbolic")
@@ -81,26 +87,43 @@ fn build_page(
         nav,
         #[strong]
         mode,
-        move |_| load(remote.clone(), nav, mode.clone())
+        #[strong]
+        sort,
+        move |_| load(remote.clone(), nav, mode.clone(), sort.get())
     ));
 
-    let page = build_list_page(
-        page_title,
-        heading,
-        description,
-        &[refresh_button.upcast(), build_sort_button().upcast()],
-        remote.widget(),
-    );
+    // Relevance ranking only makes sense for a full-text search; a plain list
+    // browse is always newest-first, so the sort control is search-only.
+    let mut actions = vec![refresh_button.upcast::<gtk::Widget>()];
+    if matches!(mode, Mode::Search { .. }) {
+        let sort_button = build_sort_button(glib::clone!(
+            #[strong]
+            remote,
+            #[weak]
+            nav,
+            #[strong]
+            mode,
+            #[strong]
+            sort,
+            move |chosen| {
+                sort.set(chosen);
+                load(remote.clone(), nav, mode.clone(), chosen);
+            }
+        ));
+        actions.push(sort_button.upcast());
+    }
 
-    load(remote, nav.clone(), mode);
+    let page = build_list_page(page_title, heading, description, &actions, remote.widget());
+
+    load(remote, nav.clone(), mode, sort.get());
     page
 }
 
-fn load(remote: RemoteContent, nav: adw::NavigationView, mode: Mode) {
+fn load(remote: RemoteContent, nav: adw::NavigationView, mode: Mode, sort: Sort) {
     remote.show_loading();
     let cancellable = remote.cancellable();
     glib::spawn_future_local(async move {
-        match mode.fetch(0, &cancellable).await {
+        match mode.fetch(0, sort, &cancellable).await {
             Ok(threads) if threads.is_empty() => {
                 let status = adw::StatusPage::builder()
                     .icon_name("system-search-symbolic")
@@ -109,7 +132,7 @@ fn load(remote: RemoteContent, nav: adw::NavigationView, mode: Mode) {
                 remote.show_content(&status);
             }
             Ok(threads) => {
-                remote.show_content(&build_thread_list(&nav, &cancellable, &mode, threads));
+                remote.show_content(&build_thread_list(&nav, &cancellable, &mode, sort, threads));
             }
             Err(error) if error.is_cancelled() => {}
             Err(error) => {
@@ -117,7 +140,7 @@ fn load(remote: RemoteContent, nav: adw::NavigationView, mode: Mode) {
                 let nav = nav.downgrade();
                 remote.show_error(&error, move || {
                     if let (Some(remote), Some(nav)) = (weak.upgrade(), nav.upgrade()) {
-                        load(remote, nav, mode.clone());
+                        load(remote, nav, mode.clone(), sort);
                     }
                 });
             }
@@ -125,12 +148,22 @@ fn load(remote: RemoteContent, nav: adw::NavigationView, mode: Mode) {
     });
 }
 
-fn build_sort_button() -> gtk::MenuButton {
+fn build_sort_button(on_change: impl Fn(Sort) + 'static) -> gtk::MenuButton {
     let sort_action =
         gio::SimpleAction::new_stateful("sort", Some(glib::VariantTy::STRING), &"date".into());
-    sort_action.connect_activate(|action, param| {
+    sort_action.connect_activate(move |action, param| {
         if let Some(param) = param {
+            // Selecting the already-active option is a no-op; only re-fetch on
+            // a real change.
+            if action.state().as_ref() == Some(param) {
+                return;
+            }
             action.set_state(param);
+            let sort = match param.str() {
+                Some("relevance") => Sort::Relevance,
+                _ => Sort::Date,
+            };
+            on_change(sort);
         }
     });
     let group = gio::SimpleActionGroup::new();
@@ -155,6 +188,7 @@ fn build_thread_list(
     nav: &adw::NavigationView,
     cancellable: &gio::Cancellable,
     mode: &Mode,
+    sort: Sort,
     threads: Vec<ThreadSummary>,
 ) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
@@ -192,7 +226,7 @@ fn build_thread_list(
                 let message_id = threads.borrow()[index].message_id.clone();
                 nav.push(&build_thread_page(&nav, mode.list(), &message_id));
             } else {
-                load_more(list, row, threads.clone(), mode.clone(), cancellable.clone());
+                load_more(list, row, threads.clone(), mode.clone(), sort, cancellable.clone());
             }
         }
     ));
@@ -206,6 +240,7 @@ fn load_more(
     row: &gtk::ListBoxRow,
     threads: Rc<RefCell<Vec<ThreadSummary>>>,
     mode: Mode,
+    sort: Sort,
     cancellable: gio::Cancellable,
 ) {
     if !row.is_sensitive() {
@@ -216,7 +251,7 @@ fn load_more(
     let row = row.clone();
     glib::spawn_future_local(async move {
         let offset = threads.borrow().len();
-        match mode.fetch(offset, &cancellable).await {
+        match mode.fetch(offset, sort, &cancellable).await {
             Ok(more) => {
                 list.remove(&row);
                 let full_page = more.len() >= lore::PAGE_SIZE;

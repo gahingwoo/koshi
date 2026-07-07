@@ -15,6 +15,26 @@ pub struct ThreadSummary {
 /// Entries per Atom results page (fixed by lore; paginate with `o=`).
 pub const PAGE_SIZE: usize = 200;
 
+/// Result ordering for a search. lore (public-inbox) sorts by received time,
+/// newest first, unless the `r` flag is present, which switches to Xapian
+/// relevance ranking.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sort {
+    #[default]
+    Date,
+    Relevance,
+}
+
+impl Sort {
+    /// The query-string fragment that selects this ordering.
+    fn query_flag(self) -> &'static str {
+        match self {
+            Sort::Date => "",
+            Sort::Relevance => "&r",
+        }
+    }
+}
+
 /// Recent thread roots of a list, newest first. lore rejects a lone
 /// `NOT s:"Re:"`, so an always-true received-time clause is prepended
 /// (the same trick kw's patch-hub uses).
@@ -34,10 +54,11 @@ pub async fn search(
     list: &str,
     query: &str,
     offset: usize,
+    sort: Sort,
     cancellable: &gio::Cancellable,
 ) -> Result<Vec<ThreadSummary>, Error> {
     let escaped = glib::Uri::escape_string(query, None, true);
-    let url = format!("{BASE_URL}/{list}/?q={escaped}&x=A&o={offset}");
+    let url = format!("{BASE_URL}/{list}/?q={escaped}&x=A&o={offset}{}", sort.query_flag());
     let bytes = fetch(&url, cancellable).await?;
     parse_atom(&String::from_utf8_lossy(&bytes))
 }

@@ -18,10 +18,7 @@ pub fn build_list_page(
         &gtk::Label::builder()
             .label(heading)
             .halign(gtk::Align::Start)
-            .xalign(0.0)
             .hexpand(true)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
             .css_classes(["title-1"])
             .build(),
     );
@@ -39,12 +36,19 @@ pub fn build_list_page(
         .build();
     content.append(&title_row);
     content.append(
+        // Cap the description at two wrapped lines and ellipsize the rest so a
+        // long search query can't grow the header tall enough to push the
+        // content below it (an empty/error status page) off the bottom of the
+        // window. The full text stays available in a tooltip.
         &gtk::Label::builder()
             .label(description)
             .halign(gtk::Align::Start)
             .xalign(0.0)
             .wrap(true)
             .wrap_mode(gtk::pango::WrapMode::WordChar)
+            .lines(2)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .tooltip_text(description)
             .css_classes(["dim-label"])
             .build(),
     );

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{gdk, gio, glib};
 use mailparse::MailHeaderMap;
 
@@ -26,6 +27,305 @@ struct Mail {
     /// The message's raw RFC 5322 text (without the mbox "From " line),
     /// shown by the per-mail Raw view.
     raw: String,
+}
+
+// One message as a GListModel item. Holds the parsed Mail behind an Rc so the
+// store owns each message once and the factory hands rows a cheap handle
+// rather than cloning body strings on every bind.
+glib::wrapper! {
+    pub struct MessageObject(ObjectSubclass<imp::MessageObject>);
+}
+
+impl MessageObject {
+    fn new(mail: Rc<Mail>) -> Self {
+        let obj: Self = glib::Object::new();
+        obj.imp().mail.set(mail).ok();
+        obj
+    }
+
+    fn message(&self) -> Rc<Mail> {
+        self.imp().mail.get().expect("MessageObject mail set").clone()
+    }
+}
+
+// The recyclable row widget for one message body. All the per-body chrome
+// (read-only monospace TextView, highlight, context menu, action group) is
+// built once in `constructed`; `set_message` just re-points it at whichever
+// Mail the factory binds, so scrolling reuses a handful of these instead of
+// realizing one TextView per message in the whole thread.
+glib::wrapper! {
+    pub struct MessageRow(ObjectSubclass<imp::MessageRow>)
+        @extends adw::Bin, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl MessageRow {
+    fn new(nav: &adw::NavigationView, composer: &composer::Composer) -> Self {
+        let obj: Self = glib::Object::new();
+        let imp = obj.imp();
+        imp.nav.set(nav.clone()).ok();
+        imp.composer.set(composer.clone()).ok();
+        obj
+    }
+
+    fn set_message(&self, mail: Rc<Mail>) {
+        let imp = self.imp();
+        let view = imp.view.get().expect("MessageRow view built");
+        view.buffer().set_text(&mail.body);
+        highlight::refresh(&view.buffer());
+
+        let nav = imp.nav.get().expect("MessageRow nav set");
+        let composer = imp.composer.get().expect("MessageRow composer set");
+        let group = build_body_action_group(&mail, view, nav, composer);
+        self.insert_action_group("mailview", Some(&group));
+        imp.set_selection_actions_enabled(&group, view.buffer().has_selection());
+        *imp.group.borrow_mut() = Some(group);
+    }
+}
+
+mod imp {
+    use std::cell::{OnceCell, RefCell};
+    use std::rc::Rc;
+
+    use adw::prelude::*;
+    use adw::subclass::prelude::*;
+    use gtk::{gdk, gio, glib};
+
+    use super::{build_body_menu, Mail};
+    use crate::composer;
+    use crate::highlight;
+
+    #[derive(Default)]
+    pub struct MessageObject {
+        pub(super) mail: OnceCell<Rc<Mail>>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for MessageObject {
+        const NAME: &'static str = "KoshiMessageObject";
+        type Type = super::MessageObject;
+    }
+
+    impl ObjectImpl for MessageObject {}
+
+    #[derive(Default)]
+    pub struct MessageRow {
+        pub view: OnceCell<gtk::TextView>,
+        pub popover: OnceCell<gtk::PopoverMenu>,
+        pub group: RefCell<Option<gio::SimpleActionGroup>>,
+        pub nav: OnceCell<adw::NavigationView>,
+        pub composer: OnceCell<composer::Composer>,
+    }
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for MessageRow {
+        const NAME: &'static str = "KoshiMessageRow";
+        type Type = super::MessageRow;
+        type ParentType = adw::Bin;
+    }
+
+    impl ObjectImpl for MessageRow {
+        fn constructed(&self) {
+            self.parent_constructed();
+            self.build_ui();
+        }
+
+        fn dispose(&self) {
+            // The popover is parented to this row rather than to a child, so
+            // it must be explicitly unparented before the row is finalized.
+            if let Some(popover) = self.popover.get() {
+                popover.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for MessageRow {}
+    impl BinImpl for MessageRow {}
+
+    impl MessageRow {
+        fn build_ui(&self) {
+            let view = gtk::TextView::builder()
+                .editable(false)
+                .cursor_visible(false)
+                .monospace(true)
+                .wrap_mode(gtk::WrapMode::None)
+                .left_margin(12)
+                .right_margin(12)
+                .top_margin(12)
+                .bottom_margin(12)
+                .build();
+
+            // Bodies don't wrap (patches carry deliberately long lines), so a
+            // horizontal-only scroller handles overflow; the natural height is
+            // propagated so the list row is exactly as tall as the message.
+            let hscroll = gtk::ScrolledWindow::builder()
+                .child(&view)
+                .hscrollbar_policy(gtk::PolicyType::Automatic)
+                .vscrollbar_policy(gtk::PolicyType::Never)
+                .propagate_natural_height(true)
+                .build();
+
+            // The ListView is the ScrolledWindow's scrollable child (so it can
+            // virtualize), which means the reading-width clamp lives per row
+            // rather than around the whole stack.
+            let clamp = adw::Clamp::builder()
+                .maximum_size(1100)
+                .tightening_threshold(800)
+                .child(&hscroll)
+                .build();
+            self.obj().set_child(Some(&clamp));
+
+            highlight::attach(&view.buffer());
+
+            // The popover can't be parented to the TextView itself (it warns
+            // about foreign children), so it hangs off the row.
+            let popover = gtk::PopoverMenu::from_model(Some(&build_body_menu()));
+            popover.set_parent(&*self.obj());
+            popover.set_has_arrow(false);
+            popover.set_halign(gtk::Align::Start);
+
+            let gesture = gtk::GestureClick::new();
+            gesture.set_button(gdk::BUTTON_SECONDARY);
+            gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+            let popover_weak = popover.downgrade();
+            gesture.connect_pressed(move |gesture, _, x, y| {
+                let Some(popover) = popover_weak.upgrade() else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.popup();
+            });
+            view.add_controller(gesture);
+
+            // Enable the selection-dependent actions on the currently bound
+            // group whenever the selection changes. The group is rebuilt per
+            // bind, so this looks it up by reference rather than capturing
+            // specific action instances.
+            let row_weak = self.obj().downgrade();
+            view.buffer().connect_has_selection_notify(move |buffer| {
+                if let Some(row) = row_weak.upgrade() {
+                    let imp = row.imp();
+                    if let Some(group) = imp.group.borrow().as_ref() {
+                        imp.set_selection_actions_enabled(group, buffer.has_selection());
+                    }
+                }
+            });
+
+            self.view.set(view).ok();
+            self.popover.set(popover).ok();
+        }
+
+        pub fn set_selection_actions_enabled(
+            &self,
+            group: &gio::SimpleActionGroup,
+            enabled: bool,
+        ) {
+            for name in ["quote-selection", "quote-with-date", "copy"] {
+                if let Some(action) = group.lookup_action(name)
+                    && let Ok(action) = action.downcast::<gio::SimpleAction>()
+                {
+                    action.set_enabled(enabled);
+                }
+            }
+        }
+    }
+}
+
+// The static context menu for a body view. Action names resolve against the
+// "mailview" group rebuilt per message in build_body_action_group.
+fn build_body_menu() -> gio::Menu {
+    let quote_section = gio::Menu::new();
+    quote_section.append(Some("_Quote Selection"), Some("mailview.quote-selection"));
+    quote_section.append(Some("Quote With _Date"), Some("mailview.quote-with-date"));
+
+    let edit_section = gio::Menu::new();
+    edit_section.append(Some("_Copy"), Some("mailview.copy"));
+    edit_section.append(Some("Select _All"), Some("mailview.select-all"));
+
+    let mail_section = gio::Menu::new();
+    mail_section.append(Some("_Reply"), Some("mailview.reply"));
+    mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
+    mail_section.append(Some("View _Raw"), Some("mailview.raw"));
+
+    let menu = gio::Menu::new();
+    menu.append_section(None, &quote_section);
+    menu.append_section(None, &edit_section);
+    menu.append_section(None, &mail_section);
+    menu
+}
+
+// Build the "mailview" action group for one message: selection quoting/copy
+// plus the reply/open-web/raw mail actions. Rebuilt on every bind (visible
+// rows only), which keeps build_mail_actions unchanged.
+fn build_body_action_group(
+    mail: &Mail,
+    view: &gtk::TextView,
+    nav: &adw::NavigationView,
+    composer: &composer::Composer,
+) -> gio::SimpleActionGroup {
+    let insert_quoted = |prefix: Option<String>| {
+        glib::clone!(
+            #[weak]
+            view,
+            #[strong]
+            composer,
+            move |_: &gio::SimpleAction, _: Option<&glib::Variant>| {
+                let buffer = view.buffer();
+                if let Some((start, end)) = buffer.selection_bounds() {
+                    let text = buffer.text(&start, &end, false);
+                    let quoted: Vec<String> =
+                        text.lines().map(|line| format!("> {line}")).collect();
+                    let mut result = quoted.join("\n");
+                    if let Some(prefix) = &prefix {
+                        result = format!("{prefix}\n{result}");
+                    }
+                    composer.insert_quote(&result);
+                }
+            }
+        )
+    };
+
+    let quote = gio::SimpleAction::new("quote-selection", None);
+    quote.set_enabled(false);
+    quote.connect_activate(insert_quoted(None));
+
+    let quote_with_date = gio::SimpleAction::new("quote-with-date", None);
+    quote_with_date.set_enabled(false);
+    quote_with_date.connect_activate(insert_quoted(Some(format!(
+        "On {}, {} wrote:",
+        mail.date, mail.from
+    ))));
+
+    let copy = gio::SimpleAction::new("copy", None);
+    copy.set_enabled(false);
+    copy.connect_activate(glib::clone!(
+        #[weak]
+        view,
+        move |_, _| {
+            view.buffer().copy_clipboard(&view.clipboard());
+        }
+    ));
+
+    let select_all = gio::SimpleAction::new("select-all", None);
+    select_all.connect_activate(glib::clone!(
+        #[weak]
+        view,
+        move |_, _| {
+            let buffer = view.buffer();
+            buffer.select_range(&buffer.start_iter(), &buffer.end_iter());
+        }
+    ));
+
+    let group = gio::SimpleActionGroup::new();
+    group.add_action(&quote);
+    group.add_action(&quote_with_date);
+    group.add_action(&copy);
+    group.add_action(&select_all);
+    for action in build_mail_actions(mail, view.upcast_ref(), nav, composer) {
+        group.add_action(&action);
+    }
+    group
 }
 
 /// Parse an mboxrd thread into its messages, in file order (lore serves
@@ -275,9 +575,8 @@ fn spawn_thread_load(
                     show_thread_error(&remote, &error, &split, &nav, &page, list, message_id);
                 } else {
                     page.set_title(&thread[0].subject);
-                    let widgets = build_thread_content(&nav, &thread, &list);
-                    remote.show_content(&widgets.content);
-                    split.set_sidebar(Some(&widgets.overview));
+                    let content = build_thread_content(&nav, thread, &list);
+                    remote.show_content(&content);
                 }
             }
             Err(error) if error.is_cancelled() => {}
@@ -309,18 +608,11 @@ fn show_thread_error(
     });
 }
 
-/// The two widgets a loaded thread produces: the scrolling message stack
-/// (with the composer below it) and the overview sidebar for the split view.
-struct ThreadWidgets {
-    content: gtk::Box,
-    overview: gtk::Widget,
-}
-
 fn build_thread_content(
     nav: &adw::NavigationView,
-    thread: &[Mail],
+    thread: Vec<Mail>,
     list: &str,
-) -> ThreadWidgets {
+) -> gtk::Box {
     let op = &thread[0];
 
     let overlay = adw::ToastOverlay::new();
@@ -349,68 +641,76 @@ fn build_thread_content(
     let title_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
+        .margin_top(18)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
         .build();
     title_row.append(&title);
     title_row.append(&build_star_button(op, list, &overlay));
     title_row.append(&op_reply);
-
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .margin_top(36)
-        .margin_bottom(36)
-        .margin_start(12)
-        .margin_end(12)
-        .spacing(24)
-        .build();
-    content.append(&title_row);
-    // One title-column width shared by every card, so the header value
-    // columns line up across the whole stack, not just within one message.
-    let titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
-    let mut sections: Vec<gtk::Box> = Vec::with_capacity(thread.len());
-    for (index, mail) in thread.iter().enumerate() {
-        let is_op = index == 0;
-        let section = build_message_section(mail, is_op, nav, &overlay, &composer, &titles);
-        content.append(&section);
-        sections.push(section);
-    }
-
-    let clamp = adw::Clamp::builder()
+    // Match the bodies' reading width so the title lines up with them.
+    let title_clamp = adw::Clamp::builder()
         .maximum_size(1100)
         .tightening_threshold(800)
-        .child(&content)
+        .child(&title_row)
         .build();
 
+    // Message bodies render through a virtualized ListView so only the
+    // on-screen ones are realized and shaped by Pango — building every body
+    // up front stutters the load and holds gigabytes of text layout at once.
+    let model = gio::ListStore::new::<MessageObject>();
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(glib::clone!(
+        #[strong]
+        nav,
+        #[strong]
+        composer,
+        move |_, item| {
+            let item = item
+                .downcast_ref::<gtk::ListItem>()
+                .expect("list item is a ListItem");
+            let row = MessageRow::new(&nav, &composer);
+            item.set_child(Some(&row));
+        }
+    ));
+    factory.connect_bind(move |_, item| {
+        let item = item
+            .downcast_ref::<gtk::ListItem>()
+            .expect("list item is a ListItem");
+        let message = item
+            .item()
+            .and_downcast::<MessageObject>()
+            .expect("item is a MessageObject");
+        let row = item
+            .child()
+            .and_downcast::<MessageRow>()
+            .expect("child is a MessageRow");
+        row.set_message(message.message());
+    });
+
+    let selection = gtk::NoSelection::new(Some(model.clone()));
+    let list_view = gtk::ListView::new(Some(selection), Some(factory));
+    // A visible line between messages stands in for the per-message header
+    // cards that are dropped for now (bodies-only pass).
+    list_view.set_show_separators(true);
+    list_view.set_single_click_activate(false);
+
+    for mail in thread {
+        model.append(&MessageObject::new(Rc::new(mail)));
+    }
+
     let scrolled = gtk::ScrolledWindow::builder()
-        .child(&clamp)
+        .child(&list_view)
         .vexpand(true)
         .build();
-    // The ScrolledWindow wraps the clamp in a GtkViewport whose
-    // scroll-to-focus behavior jumps the page whenever a child grabs focus —
-    // e.g. clicking into a message body to select text. That auto-scroll is
-    // exactly right for keyboard focus (Tab must bring the focused widget
-    // into view), so instead of turning it off wholesale, suppress it only
-    // around pointer clicks: disable on press (capture phase, before the
-    // click's focus grab) and re-enable from an idle once the grab has been
-    // processed.
-    if let Some(viewport) = scrolled.child().and_downcast::<gtk::Viewport>() {
-        let gesture = gtk::GestureClick::builder()
-            .propagation_phase(gtk::PropagationPhase::Capture)
-            .build();
-        gesture.connect_pressed(glib::clone!(
-            #[weak]
-            viewport,
-            move |_, _, _, _| {
-                viewport.set_scroll_to_focus(false);
-                glib::idle_add_local_once(glib::clone!(
-                    #[weak]
-                    viewport,
-                    move || viewport.set_scroll_to_focus(true)
-                ));
-            }
-        ));
-        scrolled.add_controller(gesture);
-    }
-    overlay.set_child(Some(&scrolled));
+
+    // The title stays pinned above the scrolling list rather than scrolling
+    // away with it, so the thread's favorite star and reply stay reachable.
+    let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    inner.append(&title_clamp);
+    inner.append(&scrolled);
+    overlay.set_child(Some(&inner));
 
     // The composer sits below the scrolling mail body in a plain box, so it
     // stays visible without living in a ToolbarView bottom bar (whose
@@ -420,11 +720,7 @@ fn build_thread_content(
     content_box.append(&overlay);
     content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content_box.append(composer.widget());
-
-    ThreadWidgets {
-        content: content_box,
-        overview: build_overview_sidebar(thread, sections, &scrolled),
-    }
+    content_box
 }
 
 /// One row of the overview tree in depth-first display order.
@@ -622,6 +918,9 @@ fn scroll_section_to_top(scrolled: &gtk::ScrolledWindow, section: &gtk::Widget) 
 /// laid out as a collapsible reply tree indented by depth. Activating a row
 /// scrolls the message stack to that message; the disclosure button on a row
 /// with replies hides or shows its subtree.
+// Retained (dead for now) for the follow-up pass that restores per-message
+// headers and the overview on top of the virtualized message list.
+#[allow(dead_code)]
 fn build_overview_sidebar(
     thread: &[Mail],
     sections: Vec<gtk::Box>,
@@ -858,6 +1157,10 @@ fn build_overview_sidebar(
 }
 
 /// One message of the thread: its header list stacked over its body view.
+// Retained (dead for now) for the follow-up pass that restores per-message
+// header cards on top of the virtualized message list; build_body_view and
+// the header-row builders below are reachable only through here.
+#[allow(dead_code)]
 fn build_message_section(
     mail: &Mail,
     is_op: bool,

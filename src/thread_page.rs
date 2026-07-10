@@ -670,6 +670,15 @@ fn build_thread_content(
             let item = item
                 .downcast_ref::<gtk::ListItem>()
                 .expect("list item is a ListItem");
+            // Reading rows, not interactive ones: no activatable hover
+            // styling, no selection, and no row focus — a focusable row
+            // grabs focus on any click inside it, which makes the ListView
+            // scroll-snap that row into view. With the row out of the focus
+            // chain, clicks land on the TextView directly and the scroll
+            // position stays put.
+            item.set_activatable(false);
+            item.set_selectable(false);
+            item.set_focusable(false);
             let row = MessageRow::new(&nav, &composer);
             item.set_child(Some(&row));
         }
@@ -705,11 +714,59 @@ fn build_thread_content(
         .vexpand(true)
         .build();
 
+    // TextView heights validate asynchronously, so for the first few frames
+    // every realized row measures near zero and the ListView packs the
+    // viewport with dozens of empty rows — a flash of bare separator lines.
+    // Keep the list covered by the same spinner RemoteContent's loading page
+    // shows (so the swap is invisible) until the geometry stops moving: the
+    // adjustment's upper bound holds steady once the visible rows have their
+    // real heights. The frame cap bounds the wait, like the old per-frame
+    // scroll re-align did.
+    let spinner = adw::Spinner::builder()
+        .width_request(48)
+        .height_request(48)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .vexpand(true)
+        .build();
+    let cover = adw::Bin::builder()
+        .css_classes(["background"])
+        .child(&spinner)
+        .build();
+    let cover_overlay = gtk::Overlay::builder().child(&scrolled).build();
+    cover_overlay.add_overlay(&cover);
+
+    let previous = Cell::new(f64::NAN);
+    let steady = Cell::new(0u32);
+    let frames = Cell::new(0u32);
+    scrolled.add_tick_callback(glib::clone!(
+        #[weak]
+        cover,
+        #[upgrade_or]
+        glib::ControlFlow::Break,
+        move |scrolled, _| {
+            let upper = scrolled.vadjustment().upper();
+            if (upper - previous.get()).abs() < 0.5 {
+                steady.set(steady.get() + 1);
+            } else {
+                steady.set(0);
+                previous.set(upper);
+            }
+            frames.set(frames.get() + 1);
+            if steady.get() >= 3 || frames.get() >= 60 {
+                cover.set_visible(false);
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        }
+    ));
+
     // The title stays pinned above the scrolling list rather than scrolling
     // away with it, so the thread's favorite star and reply stay reachable.
     let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
     inner.append(&title_clamp);
-    inner.append(&scrolled);
+    inner.append(&cover_overlay);
     overlay.set_child(Some(&inner));
 
     // The composer sits below the scrolling mail body in a plain box, so it

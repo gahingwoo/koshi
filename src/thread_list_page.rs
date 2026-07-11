@@ -354,8 +354,7 @@ fn add_row_actions(row: &adw::ActionRow, list: &str, message_id: &str) {
 
     // The popover is built fresh per right-click and unparented when it closes:
     // a stock ActionRow has no dispose hook, so a popover parented for the row's
-    // whole life leaks and warns at finalize. The action group is inserted on
-    // the popover itself so the menu items resolve against it directly.
+    // whole life leaks and warns at finalize.
     let secondary = gtk::GestureClick::new();
     secondary.set_button(gdk::BUTTON_SECONDARY);
     secondary.connect_pressed(glib::clone!(
@@ -367,12 +366,17 @@ fn add_row_actions(row: &adw::ActionRow, list: &str, message_id: &str) {
         menu,
         move |gesture, _, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            // The menu model is set last, after the action group is in place and
+            // the popover is parented: PopoverMenu builds its item widgets when
+            // the model is set, and items built before the "menu" group exists
+            // never bind their actions (so clicking them does nothing).
+            let popover = gtk::PopoverMenu::from_model(gio::MenuModel::NONE);
             popover.insert_action_group("menu", Some(&group));
             popover.set_parent(&row);
             popover.set_has_arrow(false);
             popover.set_halign(gtk::Align::Start);
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.set_menu_model(Some(&menu));
             popover.connect_closed(|popover| popover.unparent());
             popover.popup();
         }

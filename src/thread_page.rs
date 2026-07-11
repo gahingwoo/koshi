@@ -829,8 +829,11 @@ fn spawn_thread_load(
                     show_thread_error(&remote, &error, &split, &nav, &page, list, message_id);
                 } else {
                     page.set_title(&thread[0].subject);
-                    let content = build_thread_content(&nav, thread, &list);
-                    remote.show_content(&content);
+                    // Mounted under RemoteContent's still-spinning cover; the
+                    // content itself lifts it once the visible rows are
+                    // filled and painted (see build_thread_content).
+                    let content = build_thread_content(&nav, thread, &list, remote.downgrade());
+                    remote.show_content_covered(&content);
                 }
             }
             Err(error) if error.is_cancelled() => {}
@@ -866,7 +869,8 @@ fn build_thread_content(
     nav: &adw::NavigationView,
     thread: Vec<Mail>,
     list: &str,
-) -> gtk::Overlay {
+    remote: crate::remote_page::RemoteContentWeak,
+) -> gtk::Box {
     let op = &thread[0];
 
     let overlay = adw::ToastOverlay::new();
@@ -1047,44 +1051,26 @@ fn build_thread_content(
     content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content_box.append(composer.widget());
 
-    // The rows fill (and their heights settle) over the first few frames
-    // after the reveal; showing the page during that would flash half-built
-    // rows. Keep the whole page behind a cover that looks exactly like
-    // RemoteContent's loading page (so the stack swap is invisible — the
-    // spinner just keeps spinning in place) until the fill chain reports the
-    // viewport quiescent, with a frame cap bounding the wait.
-    let spinner = adw::Spinner::builder()
-        .width_request(48)
-        .height_request(48)
-        .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
-        .vexpand(true)
-        .build();
-    let cover = adw::Bin::builder()
-        .css_classes(["background"])
-        .child(&spinner)
-        .build();
-    let covered = gtk::Overlay::builder().child(&content_box).build();
-    covered.add_overlay(&cover);
-
+    // This content is mounted underneath RemoteContent's loading cover, so
+    // the rows can lay out, fill and paint while the spinner keeps spinning;
+    // lift the cover once the fill chain reports the viewport quiescent,
+    // with a frame cap bounding the wait. The remote handle is weak — the
+    // content lives inside the RemoteContent tree, so a strong one would be
+    // a reference cycle.
     let frames = Cell::new(0u32);
-    scrolled.add_tick_callback(glib::clone!(
-        #[weak]
-        cover,
-        #[upgrade_or]
-        glib::ControlFlow::Break,
-        move |_, _| {
-            frames.set(frames.get() + 1);
-            if quiescent.get() || frames.get() >= 60 {
-                cover.set_visible(false);
-                glib::ControlFlow::Break
-            } else {
-                glib::ControlFlow::Continue
+    scrolled.add_tick_callback(move |_, _| {
+        frames.set(frames.get() + 1);
+        if quiescent.get() || frames.get() >= 60 {
+            if let Some(remote) = remote.upgrade() {
+                remote.reveal();
             }
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
         }
-    ));
+    });
 
-    covered
+    content_box
 }
 
 /// One row of the overview tree in depth-first display order.

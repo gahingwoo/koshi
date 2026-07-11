@@ -119,8 +119,21 @@ impl RemoteContent {
         self.cover.set_visible(false);
     }
 
-    pub fn show_error(&self, error: &lore::Error, on_retry: impl Fn() + 'static) {
+    /// Show the error page for a failed fetch. `secondary`, when present, adds
+    /// a second button (label + handler) beside Retry — the thread page uses it
+    /// for "Open on Web", the escape hatch when a thread is too large for us to
+    /// render but lore's own capped web view can still show it.
+    pub fn show_error(
+        &self,
+        error: &lore::Error,
+        on_retry: impl Fn() + 'static,
+        secondary: Option<(&str, Box<dyn Fn() + 'static>)>,
+    ) {
         let message = error.to_string();
+        // A too-large thread is not a reachability failure — lore answered
+        // fine, the payload is just more than we render — so it gets its own
+        // framing instead of the network-error one.
+        let too_large = matches!(error, lore::Error::TooLarge);
 
         // Carry the error text in a capped label rather than the status page's
         // own description: an unbounded message (a long request URL, say) would
@@ -139,10 +152,39 @@ impl RemoteContent {
 
         let retry = gtk::Button::builder()
             .label("Retry")
-            .halign(gtk::Align::Center)
             .css_classes(["pill"])
             .build();
         retry.connect_clicked(move |_| on_retry());
+
+        // Whichever action is the useful one leads and wears the accent: Open
+        // on Web when retrying would just hit the same wall, Retry otherwise.
+        let secondary = secondary.map(|(label, action)| {
+            let classes: &[&str] = if too_large {
+                &["pill", "suggested-action"]
+            } else {
+                &["pill"]
+            };
+            let button = gtk::Button::builder().label(label).css_classes(classes).build();
+            button.connect_clicked(move |_| action());
+            button
+        });
+
+        let buttons = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(12)
+            .halign(gtk::Align::Center)
+            .build();
+        if too_large {
+            if let Some(button) = &secondary {
+                buttons.append(button);
+            }
+            buttons.append(&retry);
+        } else {
+            buttons.append(&retry);
+            if let Some(button) = &secondary {
+                buttons.append(button);
+            }
+        }
 
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -150,11 +192,17 @@ impl RemoteContent {
             .halign(gtk::Align::Center)
             .build();
         content.append(&detail);
-        content.append(&retry);
+        content.append(&buttons);
+
+        let (icon, title) = if too_large {
+            ("dialog-warning-symbolic", "Thread Too Large")
+        } else {
+            ("network-error-symbolic", "Couldn't Reach lore.kernel.org")
+        };
 
         let status = adw::StatusPage::builder()
-            .icon_name("network-error-symbolic")
-            .title("Couldn't Reach lore.kernel.org")
+            .icon_name(icon)
+            .title(title)
             .child(&content)
             .build();
 

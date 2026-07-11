@@ -1030,14 +1030,31 @@ fn show_thread_error(
     let split = split.downgrade();
     let nav = nav.downgrade();
     let page = page.downgrade();
-    remote.show_error(error, move || {
-        let (Some(remote), Some(split), Some(nav), Some(page)) =
-            (weak.upgrade(), split.upgrade(), nav.upgrade(), page.upgrade())
-        else {
-            return;
-        };
-        spawn_thread_load(remote, split, nav, page, list.clone(), message_id.clone());
+
+    // "Open on Web" hands the reader off to lore's own thread view (which caps
+    // itself at 1000 messages), the useful escape hatch when we bail out —
+    // above all on the too-large threads Retry can never get past.
+    let escaped = glib::Uri::escape_string(message_id.trim().trim_matches(['<', '>']), None, true);
+    let web_url = format!("{}/{}/{}/", lore::BASE_URL, list, escaped);
+    let overlay = remote.widget().downgrade();
+    let open_web: Box<dyn Fn()> = Box::new(move || {
+        if let Some(overlay) = overlay.upgrade() {
+            launch_uri(&overlay, &web_url);
+        }
     });
+
+    remote.show_error(
+        error,
+        move || {
+            let (Some(remote), Some(split), Some(nav), Some(page)) =
+                (weak.upgrade(), split.upgrade(), nav.upgrade(), page.upgrade())
+            else {
+                return;
+            };
+            spawn_thread_load(remote, split, nav, page, list.clone(), message_id.clone());
+        },
+        Some(("Open on Web", open_web)),
+    );
 }
 
 fn build_thread_content(

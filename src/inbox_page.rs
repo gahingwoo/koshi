@@ -41,11 +41,15 @@ fn load(remote: RemoteContent, nav: adw::NavigationView) {
             Err(error) => {
                 let weak = remote.downgrade();
                 let nav = nav.downgrade();
-                remote.show_error(&error, move || {
-                    if let (Some(remote), Some(nav)) = (weak.upgrade(), nav.upgrade()) {
-                        load(remote, nav);
-                    }
-                });
+                remote.show_error(
+                    &error,
+                    move || {
+                        if let (Some(remote), Some(nav)) = (weak.upgrade(), nav.upgrade()) {
+                            load(remote, nav);
+                        }
+                    },
+                    None,
+                );
             }
         }
     });

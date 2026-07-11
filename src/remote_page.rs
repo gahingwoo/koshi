@@ -170,7 +170,7 @@ impl RemoteContent {
         });
 
         let buttons = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
+            .orientation(gtk::Orientation::Vertical)
             .spacing(12)
             .halign(gtk::Align::Center)
             .build();

@@ -4,7 +4,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::list_page::{build_list_page, build_row_menu};
+use crate::list_page::{build_list_page, build_row_menu_button};
 use crate::lore::{self, Sort, ThreadSummary};
 use crate::remote_page::RemoteContent;
 use crate::thread_page::{build_thread_page, launch_uri};
@@ -324,48 +324,41 @@ fn add_row_actions(row: &adw::ActionRow, list: &str, message_id: &str) {
     let list = list.to_string();
     let message_id = message_id.to_string();
 
+    let menu_button = build_row_menu_button(vec![
+        (
+            "Open in New _Tab",
+            Box::new(glib::clone!(
+                #[weak]
+                row,
+                #[strong]
+                list,
+                #[strong]
+                message_id,
+                move || open_in_new_tab(&row, &list, &message_id)
+            )),
+        ),
+        (
+            "Open on _Web",
+            Box::new(glib::clone!(
+                #[weak]
+                row,
+                #[strong]
+                url,
+                move || launch_uri(&row, &url)
+            )),
+        ),
+    ]);
+    row.add_suffix(&menu_button);
+
+    // Right-click anywhere on the row opens the same menu.
     let secondary = gtk::GestureClick::new();
     secondary.set_button(gdk::BUTTON_SECONDARY);
     secondary.connect_pressed(glib::clone!(
         #[weak]
-        row,
-        #[strong]
-        list,
-        #[strong]
-        message_id,
-        #[strong]
-        url,
-        move |gesture, _, x, y| {
+        menu_button,
+        move |gesture, _, _, _| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            let popover = build_row_menu(
-                &row,
-                vec![
-                    (
-                        "Open in New _Tab",
-                        Box::new(glib::clone!(
-                            #[weak]
-                            row,
-                            #[strong]
-                            list,
-                            #[strong]
-                            message_id,
-                            move || open_in_new_tab(&row, &list, &message_id)
-                        )),
-                    ),
-                    (
-                        "Open on _Web",
-                        Box::new(glib::clone!(
-                            #[weak]
-                            row,
-                            #[strong]
-                            url,
-                            move || launch_uri(&row, &url)
-                        )),
-                    ),
-                ],
-            );
-            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
+            menu_button.popup();
         }
     ));
     row.add_controller(secondary);

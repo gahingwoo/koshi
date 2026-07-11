@@ -5,7 +5,7 @@ use adw::prelude::*;
 use gtk::{gdk, glib};
 
 use crate::favorites::{self, FavoriteInbox};
-use crate::list_page::{build_list_page_with_search, build_row_menu};
+use crate::list_page::{build_list_page_with_search, build_row_menu_button};
 use crate::lore::{self, Inbox};
 use crate::remote_page::RemoteContent;
 use crate::thread_list_page::build_thread_list_page;
@@ -99,6 +99,7 @@ fn build_content(nav: &adw::NavigationView, inboxes: Vec<Inbox>, entry: &gtk::Se
         let row = build_row(&inbox.slug, &inbox.description);
         row.add_suffix(&star);
         row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        add_row_actions(&row, &inbox.slug, &inbox.description);
         list.append(&row);
     }
     let stars: StarButtons = Rc::new(stars);
@@ -206,6 +207,7 @@ fn refresh_favorites(section: &gtk::Box, nav: &adw::NavigationView, stars: &Star
         let row = build_row(&fav.slug, &fav.description);
         row.add_suffix(&star);
         row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        add_row_actions(&row, &fav.slug, &fav.description);
         list.append(&row);
     }
 
@@ -262,7 +264,6 @@ fn build_row(slug: &str, description: &str) -> adw::ActionRow {
         .activatable(true)
         .build();
     row.add_prefix(&gtk::Image::from_icon_name("mail-unread-symbolic"));
-    add_row_actions(&row, slug, description);
     row
 }
 
@@ -275,48 +276,41 @@ fn add_row_actions(row: &adw::ActionRow, slug: &str, description: &str) {
     let slug = slug.to_string();
     let description = description.to_string();
 
+    let menu_button = build_row_menu_button(vec![
+        (
+            "Open in New _Tab",
+            Box::new(glib::clone!(
+                #[weak]
+                row,
+                #[strong]
+                slug,
+                #[strong]
+                description,
+                move || open_in_new_tab(&row, &slug, &description)
+            )),
+        ),
+        (
+            "Open on _Web",
+            Box::new(glib::clone!(
+                #[weak]
+                row,
+                #[strong]
+                url,
+                move || launch_uri(&row, &url)
+            )),
+        ),
+    ]);
+    row.add_suffix(&menu_button);
+
+    // Right-click anywhere on the row opens the same menu.
     let secondary = gtk::GestureClick::new();
     secondary.set_button(gdk::BUTTON_SECONDARY);
     secondary.connect_pressed(glib::clone!(
         #[weak]
-        row,
-        #[strong]
-        slug,
-        #[strong]
-        description,
-        #[strong]
-        url,
-        move |gesture, _, x, y| {
+        menu_button,
+        move |gesture, _, _, _| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            let popover = build_row_menu(
-                &row,
-                vec![
-                    (
-                        "Open in New _Tab",
-                        Box::new(glib::clone!(
-                            #[weak]
-                            row,
-                            #[strong]
-                            slug,
-                            #[strong]
-                            description,
-                            move || open_in_new_tab(&row, &slug, &description)
-                        )),
-                    ),
-                    (
-                        "Open on _Web",
-                        Box::new(glib::clone!(
-                            #[weak]
-                            row,
-                            #[strong]
-                            url,
-                            move || launch_uri(&row, &url)
-                        )),
-                    ),
-                ],
-            );
-            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
+            menu_button.popup();
         }
     ));
     row.add_controller(secondary);

@@ -121,11 +121,13 @@ impl MessageRow {
         nav: &adw::NavigationView,
         composer: &composer::Composer,
         overlay: &adw::ToastOverlay,
+        list: &str,
     ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         imp.nav.set(nav.clone()).ok();
         imp.composer.set(composer.clone()).ok();
+        imp.list.set(list.to_string()).ok();
         // Weak: the overlay is this row's ancestor, and a strong handle here
         // would cycle the whole page tree alive after it is popped.
         imp.overlay.set(Some(overlay));
@@ -227,6 +229,16 @@ impl MessageRow {
             let nav = imp.nav.get().expect("MessageRow nav set");
             let composer = imp.composer.get().expect("MessageRow composer set");
             let group = build_body_action_group(&mail, &view, nav, composer);
+            // Added here rather than in build_body_action_group because they
+            // need the toast overlay, which only the row holds (weakly — it
+            // may already be gone during page teardown; the items then hide
+            // as action-missing).
+            if let Some(overlay) = imp.overlay.upgrade() {
+                let list = imp.list.get().expect("MessageRow list set");
+                for action in build_favorite_actions(&mail, list, &overlay) {
+                    group.add_action(&action);
+                }
+            }
             self.insert_action_group("mailview", Some(&group));
             imp.set_selection_actions_enabled(&group, view.buffer().has_selection());
             *imp.group.borrow_mut() = Some(group);
@@ -351,6 +363,9 @@ mod imp {
         pub group: RefCell<Option<gio::SimpleActionGroup>>,
         pub nav: OnceCell<adw::NavigationView>,
         pub composer: OnceCell<composer::Composer>,
+        /// The lore list slug the thread was opened from, keyed into
+        /// favorites so they can be fetched again.
+        pub(super) list: OnceCell<String>,
         /// The page's toast overlay, for the header card's address pills.
         /// Weak — it is an ancestor of this row.
         pub(super) overlay: glib::WeakRef<adw::ToastOverlay>,
@@ -541,6 +556,7 @@ fn build_body_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     menu.append_section(None, &quote_section);
     menu.append_section(None, &edit_section);
+    menu.append_section(None, &build_favorite_section());
     menu.append_section(None, &mail_section);
     menu
 }
@@ -1084,11 +1100,6 @@ fn build_thread_content(
         .css_classes(["title-2", "monospace"])
         .build();
 
-    // The OP's Reply button lives up here next to the star rather than in
-    // its header list, aligned with the title's first line like the star.
-    let op_reply = build_reply_button(op, &composer);
-    op_reply.set_valign(gtk::Align::Start);
-
     // Switches the message pane between the single opened message and the
     // whole thread; wired to swap the ListView's model once both are built.
     let view_toggle = build_view_toggle();
@@ -1103,8 +1114,6 @@ fn build_thread_content(
         .build();
     title_row.append(&title);
     title_row.append(&view_toggle);
-    title_row.append(&build_star_button(op, list, &overlay));
-    title_row.append(&op_reply);
     // Match the bodies' reading width so the title lines up with them.
     let title_clamp = adw::Clamp::builder()
         .maximum_size(1100)
@@ -1119,6 +1128,7 @@ fn build_thread_content(
     // the ones near the viewport hold (and Pango-shape) their body text.
     let model = gio::ListStore::new::<MessageObject>();
     let factory = gtk::SignalListItemFactory::new();
+    let list = list.to_string();
     factory.connect_setup(glib::clone!(
         #[strong]
         nav,
@@ -1126,6 +1136,8 @@ fn build_thread_content(
         composer,
         #[strong]
         overlay,
+        #[strong]
+        list,
         move |_, item| {
             let item = item
                 .downcast_ref::<gtk::ListItem>()
@@ -1139,7 +1151,7 @@ fn build_thread_content(
             item.set_activatable(false);
             item.set_selectable(false);
             item.set_focusable(false);
-            let row = MessageRow::new(&nav, &composer, &overlay);
+            let row = MessageRow::new(&nav, &composer, &overlay, &list);
             item.set_child(Some(&row));
         }
     ));
@@ -1265,7 +1277,7 @@ fn build_thread_content(
     vadjustment.connect_changed(move |_| start_chain());
 
     // The title stays pinned above the scrolling list rather than scrolling
-    // away with it, so the thread's favorite star and reply stay reachable.
+    // away with it, so the subject and view toggle stay reachable.
     let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
     inner.append(&title_clamp);
     inner.append(&scrolled);
@@ -1759,10 +1771,14 @@ fn build_overview_sidebar(
 // The mail actions for the header card's selectable labels, resolved against
 // the "mailview" group the fill inserts on the row.
 fn build_header_extra_menu() -> gio::Menu {
+    let mail_section = gio::Menu::new();
+    mail_section.append(Some("_Reply"), Some("mailview.reply"));
+    mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
+    mail_section.append(Some("View _Raw"), Some("mailview.raw"));
+
     let menu = gio::Menu::new();
-    menu.append(Some("_Reply"), Some("mailview.reply"));
-    menu.append(Some("Open on _Web"), Some("mailview.open-web"));
-    menu.append(Some("View _Raw"), Some("mailview.raw"));
+    menu.append_section(None, &build_favorite_section());
+    menu.append_section(None, &mail_section);
     menu
 }
 
@@ -1806,64 +1822,82 @@ fn build_reply_context(mail: &Mail) -> composer::ReplyContext {
     }
 }
 
-/// A star toggle sitting right of the subject, aligned with its first line.
-/// Disabled when the mail has no Message-ID to key the favorite by.
-fn build_star_button(mail: &Mail, list: &str, overlay: &adw::ToastOverlay) -> gtk::ToggleButton {
-    let starred = mail
-        .message_id
-        .as_deref()
-        .is_some_and(favorites::is_favorite);
-
-    let button = gtk::ToggleButton::builder()
-        .active(starred)
-        .valign(gtk::Align::Start)
-        .sensitive(mail.message_id.is_some())
-        .css_classes(["flat"])
-        .build();
-
-    let apply = |button: &gtk::ToggleButton, starred: bool| {
-        button.set_icon_name(if starred {
-            "starred-symbolic"
-        } else {
-            "non-starred-symbolic"
-        });
-        button.set_tooltip_text(Some(if starred {
-            "Remove from Favorites"
-        } else {
-            "Add to Favorites"
-        }));
-    };
-    apply(&button, starred);
-
+/// The "mailview" favorite actions for one message: Add and Remove as a pair,
+/// exactly one enabled at a time (their menu items hide via hidden-when, so
+/// together they read as a single toggling entry). Both stay disabled when the
+/// mail has no Message-ID to key the favorite by.
+fn build_favorite_actions(
+    mail: &Mail,
+    list: &str,
+    overlay: &adw::ToastOverlay,
+) -> [gio::SimpleAction; 2] {
     let fav = mail.message_id.as_ref().map(|id| Favorite {
         message_id: id.clone(),
         subject: mail.subject.clone(),
         date: mail.date.clone(),
         list: list.to_string(),
     });
-    button.connect_toggled(glib::clone!(
-        #[weak]
-        overlay,
-        move |button| {
-            let Some(fav) = &fav else { return };
-            // Drive the store from the button's own state rather than blindly
-            // flipping it: another view of the same mail may have changed the
-            // store since this page was built, and a blind flip would then
-            // do the opposite of what the click asked for.
-            let starred = button.is_active();
-            if favorites::is_favorite(&fav.message_id) != starred {
-                favorites::toggle(fav.clone());
-            }
-            apply(button, starred);
-            overlay.add_toast(adw::Toast::new(if starred {
-                "Added to Favorites"
-            } else {
-                "Removed from Favorites"
-            }));
-        }
-    ));
+    let starred = fav
+        .as_ref()
+        .is_some_and(|fav| favorites::is_favorite(&fav.message_id));
 
-    button
+    let add = gio::SimpleAction::new("favorite-add", None);
+    add.set_enabled(fav.is_some() && !starred);
+    let remove = gio::SimpleAction::new("favorite-remove", None);
+    remove.set_enabled(fav.is_some() && starred);
+
+    // Each action drives the store toward its own named state rather than
+    // blindly flipping: another view of the same mail may have changed the
+    // store since these actions were enabled, and a blind flip would then do
+    // the opposite of what the click asked for.
+    let activate = |target: bool| {
+        glib::clone!(
+            #[weak]
+            add,
+            #[weak]
+            remove,
+            #[weak]
+            overlay,
+            #[strong]
+            fav,
+            move |_: &gio::SimpleAction, _: Option<&glib::Variant>| {
+                let Some(fav) = &fav else { return };
+                if favorites::is_favorite(&fav.message_id) != target {
+                    favorites::toggle(fav.clone());
+                }
+                add.set_enabled(!target);
+                remove.set_enabled(target);
+                overlay.add_toast(adw::Toast::new(if target {
+                    "Added to Favorites"
+                } else {
+                    "Removed from Favorites"
+                }));
+            }
+        )
+    };
+    add.connect_activate(activate(true));
+    remove.connect_activate(activate(false));
+
+    [add, remove]
+}
+
+/// The favorite pair as its own menu section, so it sits between separators
+/// wherever it is appended. hidden-when makes the two items mutually
+/// exclusive: whichever action is disabled disappears, so the section always
+/// shows exactly one of Add/Remove (or neither, when the mail has no
+/// Message-ID and both are disabled).
+fn build_favorite_section() -> gio::Menu {
+    let section = gio::Menu::new();
+    let add = gio::MenuItem::new(Some("Add to _Favorites"), Some("mailview.favorite-add"));
+    add.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+    section.append_item(&add);
+    let remove = gio::MenuItem::new(
+        Some("Remove from _Favorites"),
+        Some("mailview.favorite-remove"),
+    );
+    remove.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+    section.append_item(&remove);
+    section
 }
 
 /// A segmented switch between the single opened message and the whole thread.

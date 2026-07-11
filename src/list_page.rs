@@ -1,4 +1,56 @@
 use adw::prelude::*;
+use gtk::glib;
+
+/// A right-click context menu for a list row: a popover of flat buttons, one
+/// per `(label, action)`. Parented to `anchor` and unparented when it closes.
+///
+/// Plain buttons with direct click handlers are used rather than a
+/// `gtk::PopoverMenu` backed by a `gio` action group: as a transient child of a
+/// stock `adw::ActionRow`, the PopoverMenu's items do not reliably bind their
+/// actions, so clicking them would silently do nothing. `label` uses `_` for
+/// its mnemonic.
+pub fn build_row_menu(
+    anchor: &impl IsA<gtk::Widget>,
+    actions: Vec<(&str, Box<dyn Fn()>)>,
+) -> gtk::Popover {
+    let items = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    let popover = gtk::Popover::builder()
+        .has_arrow(false)
+        .halign(gtk::Align::Start)
+        .child(&items)
+        .build();
+    // The stock menu style: tighter padding and full-width row highlight.
+    popover.add_css_class("menu");
+
+    for (label, action) in actions {
+        let button = gtk::Button::builder()
+            .css_classes(["flat"])
+            .child(
+                &gtk::Label::builder()
+                    .label(label)
+                    .use_underline(true)
+                    .xalign(0.0)
+                    .hexpand(true)
+                    .build(),
+            )
+            .build();
+        button.connect_clicked(glib::clone!(
+            #[weak]
+            popover,
+            move |_| {
+                popover.popdown();
+                action();
+            }
+        ));
+        items.append(&button);
+    }
+
+    popover.set_parent(anchor);
+    popover.connect_closed(|popover| popover.unparent());
+    popover
+}
 
 /// Shared scaffold for list-style pages: a scrolled, clamped column holding a
 /// title row (a title-1 heading plus optional trailing buttons), a dim

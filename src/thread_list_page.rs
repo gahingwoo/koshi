@@ -4,7 +4,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::list_page::build_list_page;
+use crate::list_page::{build_list_page, build_row_menu};
 use crate::lore::{self, Sort, ThreadSummary};
 use crate::remote_page::RemoteContent;
 use crate::thread_page::{build_thread_page, launch_uri};
@@ -324,60 +324,47 @@ fn add_row_actions(row: &adw::ActionRow, list: &str, message_id: &str) {
     let list = list.to_string();
     let message_id = message_id.to_string();
 
-    let group = gio::SimpleActionGroup::new();
-
-    let open_new_tab = gio::SimpleAction::new("open-new-tab", None);
-    open_new_tab.connect_activate(glib::clone!(
-        #[weak]
-        row,
-        #[strong]
-        list,
-        #[strong]
-        message_id,
-        move |_, _| open_in_new_tab(&row, &list, &message_id)
-    ));
-    group.add_action(&open_new_tab);
-
-    let open_web = gio::SimpleAction::new("open-web", None);
-    open_web.connect_activate(glib::clone!(
-        #[weak]
-        row,
-        #[strong]
-        url,
-        move |_, _| launch_uri(&row, &url)
-    ));
-    group.add_action(&open_web);
-
-    let menu = gio::Menu::new();
-    menu.append(Some("Open in New _Tab"), Some("menu.open-new-tab"));
-    menu.append(Some("Open on _Web"), Some("menu.open-web"));
-
-    // The popover is built fresh per right-click and unparented when it closes:
-    // a stock ActionRow has no dispose hook, so a popover parented for the row's
-    // whole life leaks and warns at finalize.
     let secondary = gtk::GestureClick::new();
     secondary.set_button(gdk::BUTTON_SECONDARY);
     secondary.connect_pressed(glib::clone!(
         #[weak]
         row,
         #[strong]
-        group,
+        list,
         #[strong]
-        menu,
+        message_id,
+        #[strong]
+        url,
         move |gesture, _, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
-            // The menu model is set last, after the action group is in place and
-            // the popover is parented: PopoverMenu builds its item widgets when
-            // the model is set, and items built before the "menu" group exists
-            // never bind their actions (so clicking them does nothing).
-            let popover = gtk::PopoverMenu::from_model(gio::MenuModel::NONE);
-            popover.insert_action_group("menu", Some(&group));
-            popover.set_parent(&row);
-            popover.set_has_arrow(false);
-            popover.set_halign(gtk::Align::Start);
+            let popover = build_row_menu(
+                &row,
+                vec![
+                    (
+                        "Open in New _Tab",
+                        Box::new(glib::clone!(
+                            #[weak]
+                            row,
+                            #[strong]
+                            list,
+                            #[strong]
+                            message_id,
+                            move || open_in_new_tab(&row, &list, &message_id)
+                        )),
+                    ),
+                    (
+                        "Open on _Web",
+                        Box::new(glib::clone!(
+                            #[weak]
+                            row,
+                            #[strong]
+                            url,
+                            move || launch_uri(&row, &url)
+                        )),
+                    ),
+                ],
+            );
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.set_menu_model(Some(&menu));
-            popover.connect_closed(|popover| popover.unparent());
             popover.popup();
         }
     ));

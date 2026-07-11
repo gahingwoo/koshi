@@ -601,7 +601,6 @@ fn show_about(app: &adw::Application) {
         .comments(env!("CARGO_PKG_DESCRIPTION"))
         .website(env!("CARGO_PKG_HOMEPAGE"))
         .issue_url(concat!(env!("CARGO_PKG_REPOSITORY"), "/issues"))
-        .support_url("mailto:nika@nikableh.moe")
         .developers(["Nika Krasnova <nika@nikableh.moe>"])
         .copyright("© 2026 Nika Krasnova")
         .license_type(gtk::License::Gpl30)

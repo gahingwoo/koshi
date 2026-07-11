@@ -25,6 +25,13 @@ use thread_page::{THREAD_PAGE_NAME, build_thread_page, toggle_overview};
 
 const APP_ID: &str = "moe.nikableh.Koshi";
 
+// Debug builds show the Devel icon so they are distinguishable from an
+// installed release build.
+#[cfg(debug_assertions)]
+const APP_ICON: &str = "moe.nikableh.Koshi.Devel";
+#[cfg(not(debug_assertions))]
+const APP_ICON: &str = APP_ID;
+
 fn main() -> glib::ExitCode {
     gio::resources_register_include!("koshi.gresource")
         .expect("failed to register resources");
@@ -37,7 +44,7 @@ fn main() -> glib::ExitCode {
         // Use the bundled app icon for window/taskbar decorations. When Koshi
         // is installed its desktop file points the shell at the same icon; this
         // covers the uninstalled `cargo run` case and titlebar fallbacks.
-        gtk::Window::set_default_icon_name(APP_ID);
+        gtk::Window::set_default_icon_name(APP_ICON);
     });
     app.connect_activate(build_ui);
     app.run()
@@ -595,7 +602,7 @@ fn show_shortcuts(app: &adw::Application) {
 fn show_about(app: &adw::Application) {
     let about = adw::AboutDialog::builder()
         .application_name("Koshi")
-        .application_icon(APP_ID)
+        .application_icon(APP_ICON)
         .developer_name("Nika Krasnova")
         .version(env!("CARGO_PKG_VERSION"))
         .comments(env!("CARGO_PKG_DESCRIPTION"))

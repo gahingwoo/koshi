@@ -205,7 +205,7 @@ fn build_thread_list(
 
     let full_page = threads.len() >= lore::PAGE_SIZE;
     for thread in &threads {
-        list.append(&build_thread_row(thread));
+        list.append(&build_thread_row(thread, mode.list()));
     }
     if full_page {
         list.append(&build_load_more_row());
@@ -260,7 +260,7 @@ fn load_more(
                 list.remove(&row);
                 let full_page = more.len() >= lore::PAGE_SIZE;
                 for thread in &more {
-                    list.append(&build_thread_row(thread));
+                    list.append(&build_thread_row(thread, mode.list()));
                 }
                 threads.borrow_mut().extend(more);
                 if full_page {
@@ -278,7 +278,7 @@ fn build_load_more_row() -> adw::ButtonRow {
     adw::ButtonRow::builder().title("Load More").build()
 }
 
-fn build_thread_row(thread: &ThreadSummary) -> adw::ActionRow {
+fn build_thread_row(thread: &ThreadSummary, list: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(format!("<tt>{}</tt>", glib::markup_escape_text(&thread.subject)))
         .title_lines(1)
@@ -308,61 +308,105 @@ fn build_thread_row(thread: &ThreadSummary) -> adw::ActionRow {
     );
     row.add_suffix(&timestamp);
 
-    add_context_menu(&row, &thread.message_id);
+    add_row_actions(&row, list, &thread.message_id);
 
     row
 }
 
-/// Give a thread row a secondary-click context menu with "Open on Web", which
-/// opens the thread's lore permalink in the default browser.
-fn add_context_menu(row: &adw::ActionRow, message_id: &str) {
+/// Wire a thread row's secondary-click context menu ("Open in New Tab", "Open
+/// on Web") and its middle-click shortcut for opening the thread in a
+/// background tab.
+fn add_row_actions(row: &adw::ActionRow, list: &str, message_id: &str) {
     // `message_id` arrives already stripped of angle brackets, but trim to be
     // safe and match the /r/ redirect URL used in the message reading view.
     let bare = message_id.trim().trim_start_matches('<').trim_end_matches('>');
     let url = format!("https://lore.kernel.org/r/{bare}/");
+    let list = list.to_string();
+    let message_id = message_id.to_string();
+
+    let group = gio::SimpleActionGroup::new();
+
+    let open_new_tab = gio::SimpleAction::new("open-new-tab", None);
+    open_new_tab.connect_activate(glib::clone!(
+        #[weak]
+        row,
+        #[strong]
+        list,
+        #[strong]
+        message_id,
+        move |_, _| open_in_new_tab(&row, &list, &message_id)
+    ));
+    group.add_action(&open_new_tab);
 
     let open_web = gio::SimpleAction::new("open-web", None);
     open_web.connect_activate(glib::clone!(
         #[weak]
         row,
+        #[strong]
+        url,
         move |_, _| launch_uri(&row, &url)
     ));
-    let group = gio::SimpleActionGroup::new();
     group.add_action(&open_web);
 
     let menu = gio::Menu::new();
+    menu.append(Some("Open in New _Tab"), Some("menu.open-new-tab"));
     menu.append(Some("Open on _Web"), Some("menu.open-web"));
 
-    // The action group lives on the popover itself so the menu item resolves
-    // against it directly, rather than relying on the lookup walking up through
-    // the ActionRow's internals.
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_parent(row);
-    popover.set_has_arrow(false);
-    popover.set_halign(gtk::Align::Start);
-    popover.insert_action_group("menu", Some(&group));
-
-    // A stock ActionRow has no dispose hook, so unparent the popover when the
-    // row leaves the tree; doing it on the popover's own close would race the
-    // menu item's action and swallow the click.
-    row.connect_unrealize(glib::clone!(
-        #[strong]
-        popover,
-        move |_| popover.unparent()
-    ));
-
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(gdk::BUTTON_SECONDARY);
-    gesture.connect_pressed(glib::clone!(
+    // The popover is built fresh per right-click and unparented when it closes:
+    // a stock ActionRow has no dispose hook, so a popover parented for the row's
+    // whole life leaks and warns at finalize. The action group is inserted on
+    // the popover itself so the menu items resolve against it directly.
+    let secondary = gtk::GestureClick::new();
+    secondary.set_button(gdk::BUTTON_SECONDARY);
+    secondary.connect_pressed(glib::clone!(
         #[weak]
-        popover,
+        row,
+        #[strong]
+        group,
+        #[strong]
+        menu,
         move |gesture, _, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.insert_action_group("menu", Some(&group));
+            popover.set_parent(&row);
+            popover.set_has_arrow(false);
+            popover.set_halign(gtk::Align::Start);
             popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.connect_closed(|popover| popover.unparent());
             popover.popup();
         }
     ));
-    row.add_controller(gesture);
+    row.add_controller(secondary);
+
+    // Middle-click opens the thread in a background tab, matching the web
+    // convention of middle-clicking a link.
+    let middle = gtk::GestureClick::new();
+    middle.set_button(gdk::BUTTON_MIDDLE);
+    middle.connect_pressed(glib::clone!(
+        #[weak]
+        row,
+        #[strong]
+        list,
+        #[strong]
+        message_id,
+        move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            open_in_new_tab(&row, &list, &message_id);
+        }
+    ));
+    row.add_controller(middle);
+}
+
+/// Walk up from a thread row to the enclosing TabView and open the thread in a
+/// new background tab there.
+fn open_in_new_tab(widget: &impl IsA<gtk::Widget>, list: &str, message_id: &str) {
+    if let Some(tab_view) = widget
+        .ancestor(adw::TabView::static_type())
+        .and_downcast::<adw::TabView>()
+    {
+        crate::open_thread_in_new_tab(&tab_view, list, message_id);
+    }
 }
 
 /// "Jul 3" for dates in the current year, "Jul 3 2019" otherwise.

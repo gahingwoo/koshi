@@ -158,6 +158,27 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
 
     window.add_action(&go_back);
     window.add_action(&thread_overview);
+
+    // Ctrl-W closes the current tab; on the last tab there is nothing left to
+    // fall back to, so it closes the window (quitting the app with it).
+    let close_tab = gio::SimpleAction::new("close-tab", None);
+    close_tab.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        #[weak]
+        window,
+        move |_, _| {
+            if tab_view.n_pages() > 1 {
+                if let Some(page) = tab_view.selected_page() {
+                    tab_view.close_page(&page);
+                }
+            } else {
+                window.close();
+            }
+        }
+    ));
+    window.add_action(&close_tab);
+
     setup_actions(app, &window, &search_entry);
     setup_search(&search_entry, &tab_view);
 
@@ -398,19 +419,37 @@ fn setup_tab_context_menu(tab_view: &adw::TabView) {
 fn open_new_tab(tab_view: &adw::TabView) {
     let nav = adw::NavigationView::new();
     nav.push(&build_inbox_page(&nav));
-
-    let tab_page = tab_view.append(&nav);
-    tab_page.set_title(INBOX_LIST_TITLE);
+    let tab_page = append_tab(tab_view, &nav, INBOX_LIST_TITLE);
     tab_view.set_selected_page(&tab_page);
+}
+
+/// Open `message_id` (of `list`) as a thread page in a new background tab —
+/// used by the thread list's "Open in New Tab" menu item and middle-click.
+pub(crate) fn open_thread_in_new_tab(tab_view: &adw::TabView, list: &str, message_id: &str) {
+    let nav = adw::NavigationView::new();
+    nav.push(&build_thread_page(&nav, list, message_id));
+    append_tab(tab_view, &nav, "Loading…");
+}
+
+/// Append `nav` as a new tab, keeping the tab title bound to the visible page's
+/// title. Does not select it, and leaves the window's go-back/overview state to
+/// the selection handler — a background tab must not clobber it.
+fn append_tab(
+    tab_view: &adw::TabView,
+    nav: &adw::NavigationView,
+    fallback_title: &str,
+) -> adw::TabPage {
+    let tab_page = tab_view.append(nav);
+    tab_page.set_title(fallback_title);
 
     // The tab title tracks the visible page's title property, not just its
     // value at navigation time: thread pages start as "Loading…" and retitle
     // themselves once fetched.
     let title_binding: Rc<RefCell<Option<glib::Binding>>> = Rc::new(RefCell::new(None));
-    nav.connect_visible_page_notify(glib::clone!(
+    let bind_title = glib::clone!(
         #[weak]
         tab_page,
-        move |nav| {
+        move |nav: &adw::NavigationView| {
             if let Some(binding) = title_binding.take() {
                 binding.unbind();
             }
@@ -421,9 +460,19 @@ fn open_new_tab(tab_view: &adw::TabView) {
                     .build();
                 title_binding.replace(Some(binding));
             }
-            update_go_back_action(nav);
         }
-    ));
+    );
+
+    let on_notify = bind_title.clone();
+    nav.connect_visible_page_notify(move |nav| {
+        on_notify(nav);
+        update_go_back_action(nav);
+    });
+    // The notify only fires on later changes, so bind whatever page the tab
+    // starts on (a thread opened straight into its own tab) now.
+    bind_title(nav);
+
+    tab_page
 }
 
 fn selected_nav(tab_view: &adw::TabView) -> Option<adw::NavigationView> {
@@ -605,6 +654,7 @@ fn setup_actions(
     app.add_action_entries([preferences, shortcuts, about, quit]);
 
     app.set_accels_for_action("win.focus-search", &["<Control>l"]);
+    app.set_accels_for_action("win.close-tab", &["<Control>w"]);
     app.set_accels_for_action("win.toggle-thread-overview", &["F9"]);
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
     app.set_accels_for_action("app.shortcuts", &["<Control>question"]);
@@ -628,6 +678,10 @@ fn show_shortcuts(app: &adw::Application) {
     section.add(adw::ShortcutsItem::from_action(
         "Focus search",
         "win.focus-search",
+    ));
+    section.add(adw::ShortcutsItem::from_action(
+        "Close tab",
+        "win.close-tab",
     ));
     section.add(adw::ShortcutsItem::from_action(
         "Thread overview",

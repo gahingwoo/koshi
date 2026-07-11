@@ -31,6 +31,7 @@ fn main() -> glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| {
+        favorites::init(glib::user_data_dir().join("koshi").join("favorites.json"));
         load_css();
         register_bundled_icons();
         // Use the bundled app icon for window/taskbar decorations. When Koshi

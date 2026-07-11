@@ -560,12 +560,19 @@ fn setup_actions(
         })
         .build();
 
-    app.add_action_entries([preferences, shortcuts, about]);
+    let quit = gio::ActionEntry::builder("quit")
+        .activate(|app: &adw::Application, _, _| {
+            app.quit();
+        })
+        .build();
+
+    app.add_action_entries([preferences, shortcuts, about, quit]);
 
     app.set_accels_for_action("win.focus-search", &["<Control>l"]);
     app.set_accels_for_action("win.toggle-thread-overview", &["F9"]);
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
     app.set_accels_for_action("app.shortcuts", &["<Control>question"]);
+    app.set_accels_for_action("app.quit", &["<Control>q"]);
 }
 
 fn show_preferences(app: &adw::Application) {
@@ -598,6 +605,7 @@ fn show_shortcuts(app: &adw::Application) {
         "Keyboard shortcuts",
         "app.shortcuts",
     ));
+    section.add(adw::ShortcutsItem::from_action("Quit", "app.quit"));
 
     let dialog = adw::ShortcutsDialog::new();
     dialog.add(section);

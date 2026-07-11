@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
-use gtk::{gdk, gio, glib};
+use gtk::{gio, glib};
 use mailparse::MailHeaderMap;
 
 use crate::composer;
@@ -48,13 +48,13 @@ impl MessageObject {
     }
 }
 
-// The row widget for one message body. GtkListView creates and binds every
-// row of a <=205-item model up front (its widget window is a hardcoded 205
-// items), so both construction and bind must be next to free: the row starts
-// as an empty shell holding nothing but its seeded height, and the whole
-// body machinery — TextView, highlight, context menu, action group — is
-// built lazily by the first fill (see update_message_fills for when that
-// happens).
+// The row widget for one message: its header card stacked over its body.
+// GtkListView creates and binds every row of a <=205-item model up front
+// (its widget window is a hardcoded 205 items), so both construction and
+// bind must be next to free: the row starts as an empty shell holding
+// nothing but its seeded height, and the whole machinery — header card,
+// TextView, highlight, context menu, action group — is built lazily by the
+// first fill (see message_fill_step for when that happens).
 glib::wrapper! {
     pub struct MessageRow(ObjectSubclass<imp::MessageRow>)
         @extends adw::Bin, gtk::Widget,
@@ -67,6 +67,12 @@ thread_local! {
     /// pixel-perfect for plain lines — bodies are monospace and never wrap —
     /// so filling a row no longer shifts scroll geometry under the reader.
     static BODY_LINE_HEIGHT: Cell<i32> = const { Cell::new(0) };
+    /// Exact pixel heights of a message's header card, measured from the
+    /// first filled card of each kind (0 until known). A card's structure is
+    /// fixed per kind — nothing in it wraps, and the Details expander starts
+    /// collapsed — so one measurement covers every card of that kind.
+    static HEADER_HEIGHT_OP: Cell<i32> = const { Cell::new(0) };
+    static HEADER_HEIGHT_REPLY: Cell<i32> = const { Cell::new(0) };
 }
 
 /// The measured body line height, or a conservative floor while no body has
@@ -77,52 +83,97 @@ fn body_line_height() -> i32 {
     if height > 0 { height } else { 10 }
 }
 
+/// The measured header-card height for the OP or a reply, or a conservative
+/// floor while no card of that kind has been filled yet. Like the line
+/// height, the floor must underestimate; real cards run past 150px (the
+/// reply card is taller by its Subject row).
+fn header_height(is_op: bool) -> i32 {
+    let height = if is_op {
+        HEADER_HEIGHT_OP.with(Cell::get)
+    } else {
+        HEADER_HEIGHT_REPLY.with(Cell::get)
+    };
+    if height > 0 {
+        height
+    } else if is_op {
+        90
+    } else {
+        120
+    }
+}
+
+/// Vertical pixels of a filled row that are neither header card nor body
+/// lines: the content box's top margin (12) and header/body spacing (12),
+/// plus the body view's own vertical margins (12 + 12).
+const ROW_CHROME_HEIGHT: i32 = 48;
+
 impl MessageRow {
-    fn new(nav: &adw::NavigationView, composer: &composer::Composer) -> Self {
+    fn new(
+        nav: &adw::NavigationView,
+        composer: &composer::Composer,
+        overlay: &adw::ToastOverlay,
+    ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         imp.nav.set(nav.clone()).ok();
         imp.composer.set(composer.clone()).ok();
+        // Weak: the overlay is this row's ancestor, and a strong handle here
+        // would cycle the whole page tree alive after it is popped.
+        imp.overlay.set(Some(overlay));
         obj
     }
 
-    fn set_message(&self, mail: Rc<Mail>) {
+    fn set_message(&self, mail: Rc<Mail>, is_op: bool) {
         let imp = self.imp();
 
         // A rebound row (only possible past 205 messages) may still carry
-        // the previous message's body and actions; both belong to the fill.
+        // the previous message's body, header card and actions; all three
+        // belong to the fill.
         if imp.filled.get() {
             if let Some(view) = imp.view.get() {
                 view.buffer().set_text("");
             }
+            self.remove_header();
             imp.filled.set(false);
             imp.highlighted.set(false);
         }
         if imp.group.borrow_mut().take().is_some() {
             self.insert_action_group("mailview", None::<&gio::SimpleActionGroup>);
         }
+        imp.is_op.set(is_op);
+        // Counted once here so the reseed walk stays O(1) per row: bodies
+        // run to megabytes and reseed is called on every row of every pass.
+        imp.body_lines.set(mail.body.lines().count().max(1) as i32);
         *imp.mail.borrow_mut() = Some(mail);
 
-        // Seed the row's height before the body text exists: one line-height
-        // per line plus the view's 24px of vertical margins.
-        imp.seed_unit.set(0);
+        // Seed the row's height before any of its widgetry exists: the
+        // header card estimate, one line-height per body line, and the
+        // fixed chrome between them.
+        imp.seed_key.set((0, 0));
         self.reseed();
     }
 
-    /// Apply the current line-height estimate to the seeded height. Cheap
-    /// no-op unless the estimate changed since the last seeding, so the fill
-    /// walk calls it on every row of every pass.
+    /// Apply the current line-height and header-height estimates to the
+    /// seeded height. Cheap no-op unless an estimate changed since the last
+    /// seeding, so the fill walk calls it on every row of every pass.
     fn reseed(&self) {
         let imp = self.imp();
-        let unit = body_line_height();
-        if imp.seed_unit.replace(unit) == unit {
+        let key = (body_line_height(), header_height(imp.is_op.get()));
+        if imp.seed_key.replace(key) == key {
             return;
         }
-        let Some(mail) = imp.mail.borrow().clone() else {
+        if imp.mail.borrow().is_none() {
             return;
-        };
-        let lines = mail.body.lines().count().max(1) as i32;
-        self.set_size_request(-1, lines.saturating_mul(unit).saturating_add(24));
+        }
+        let (unit, header) = key;
+        let height = imp
+            .body_lines
+            .get()
+            .max(1)
+            .saturating_mul(unit)
+            .saturating_add(header)
+            .saturating_add(ROW_CHROME_HEIGHT);
+        self.set_size_request(-1, height);
     }
 
     fn is_filled(&self) -> bool {
@@ -133,10 +184,10 @@ impl MessageRow {
         self.imp().highlighted.get()
     }
 
-    /// Give the row its body text (or, on rebind, take the stale one back).
-    /// Rows fill once, from the warmup chain, and keep their body: the
-    /// seeded height (reseed) stands in exactly until then, so the fill
-    /// shifts nothing.
+    /// Give the row its header card and body text (or, on rebind, take the
+    /// stale ones back). Rows fill once, from the warmup chain, and keep
+    /// their content: the seeded height (reseed) stands in exactly until
+    /// then, so the fill shifts nothing.
     ///
     /// Highlighting is deliberately NOT part of the fill — it costs as much
     /// again and runs as its own chain step (apply_highlight) a frame later.
@@ -170,11 +221,70 @@ impl MessageRow {
             self.insert_action_group("mailview", Some(&group));
             imp.set_selection_actions_enabled(&group, view.buffer().has_selection());
             *imp.group.borrow_mut() = Some(group);
-        } else if let Some(view) = imp.view.get() {
-            view.buffer().set_text("");
+
+            self.fill_header(&mail);
+        } else {
+            if let Some(view) = imp.view.get() {
+                view.buffer().set_text("");
+            }
+            self.remove_header();
         }
         imp.filled.set(filled);
         imp.highlighted.set(false);
+    }
+
+    /// Build and mount the message's header card, above the body. Part of
+    /// the fill for the same reason the body is: GtkListView realizes every
+    /// row of a small model, so cards may not exist before the warmup
+    /// reaches their row.
+    fn fill_header(&self, mail: &Rc<Mail>) {
+        let imp = self.imp();
+        self.remove_header();
+        let Some(overlay) = imp.overlay.upgrade() else {
+            return;
+        };
+        let composer = imp.composer.get().expect("MessageRow composer set");
+        let is_op = imp.is_op.get();
+
+        let header = build_header_list(mail, is_op, &overlay, composer);
+        // Selectable header labels replace right-clicks with their own stock
+        // menu, shadowing the row's; hand them the mail actions as an extra
+        // section. The action names resolve against the "mailview" group the
+        // fill just inserted on this row.
+        add_label_extra_menus(header.upcast_ref(), &build_header_extra_menu());
+        let content = imp.content.get().expect("ensure_view built the content box");
+        content.prepend(&header);
+
+        // First card of this kind anywhere: learn its exact height so every
+        // seed from here on is exact. Nothing in a card wraps, so its height
+        // is width-independent and one out-of-band measure is right.
+        let known = if is_op {
+            HEADER_HEIGHT_OP.with(Cell::get)
+        } else {
+            HEADER_HEIGHT_REPLY.with(Cell::get)
+        };
+        if known == 0 {
+            let measured = header.measure(gtk::Orientation::Vertical, -1).1;
+            if measured > 0 {
+                if is_op {
+                    HEADER_HEIGHT_OP.with(|cell| cell.set(measured));
+                } else {
+                    HEADER_HEIGHT_REPLY.with(|cell| cell.set(measured));
+                }
+                self.reseed();
+            }
+        }
+
+        *imp.header.borrow_mut() = Some(header);
+    }
+
+    fn remove_header(&self) {
+        let imp = self.imp();
+        if let Some(header) = imp.header.borrow_mut().take()
+            && let Some(content) = imp.content.get()
+        {
+            content.remove(&header);
+        }
     }
 
     /// Colorize a filled body: quote levels, diff lines, headers. Runs as
@@ -230,15 +340,28 @@ mod imp {
         pub group: RefCell<Option<gio::SimpleActionGroup>>,
         pub nav: OnceCell<adw::NavigationView>,
         pub composer: OnceCell<composer::Composer>,
+        /// The page's toast overlay, for the header card's address pills.
+        /// Weak — it is an ancestor of this row.
+        pub(super) overlay: glib::WeakRef<adw::ToastOverlay>,
+        /// The column holding the header card over the body scroller.
+        pub(super) content: OnceCell<gtk::Box>,
+        /// The mounted header card, rebuilt by each fill.
+        pub(super) header: RefCell<Option<gtk::ListBox>>,
         /// The currently bound message, filled into the buffer on demand.
         pub(super) mail: RefCell<Option<Rc<super::Mail>>>,
+        /// Whether this row shows the thread's first message, whose header
+        /// card omits the Subject row (the pinned title already shows it).
+        pub(super) is_op: Cell<bool>,
+        /// The bound body's line count, counted once per bind.
+        pub(super) body_lines: Cell<i32>,
         /// Whether the buffer currently holds the bound message's body.
         pub(super) filled: Cell<bool>,
         /// Whether the filled body has had its highlight pass.
         pub(super) highlighted: Cell<bool>,
-        /// The line-height the current seed was computed with, so reseed is
-        /// a cheap no-op while the estimate is unchanged.
-        pub(super) seed_unit: Cell<i32>,
+        /// The (line-height, header-height) pair the current seed was
+        /// computed with, so reseed is a cheap no-op while the estimates
+        /// are unchanged.
+        pub(super) seed_key: Cell<(i32, i32)>,
     }
 
     #[glib::object_subclass]
@@ -262,10 +385,10 @@ mod imp {
     impl BinImpl for MessageRow {}
 
     impl MessageRow {
-        /// Build the body widgetry on first use. GtkListView instantiates
-        /// every row of a small model at once, so none of this — TextView,
-        /// scroller, clamp, context menu — may exist until the row actually
-        /// gets a body to show.
+        /// Build the message-independent widgetry on first use. GtkListView
+        /// instantiates every row of a small model at once, so none of this
+        /// — TextView, scroller, clamp, context menu — may exist until the
+        /// row actually gets a message to show.
         pub(super) fn ensure_view(&self) -> &gtk::TextView {
             if let Some(view) = self.view.get() {
                 return view;
@@ -291,15 +414,26 @@ mod imp {
                 .propagate_natural_height(true)
                 .build();
 
+            // The column the fill mounts the header card into, above the
+            // body. Its top margin and spacing are part of the row height
+            // seed (ROW_CHROME_HEIGHT) — keep them in step.
+            let content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(12)
+                .margin_top(12)
+                .build();
+            content.append(&hscroll);
+
             // The ListView is the ScrolledWindow's scrollable child (so it can
             // virtualize), which means the reading-width clamp lives per row
             // rather than around the whole stack.
             let clamp = adw::Clamp::builder()
                 .maximum_size(1100)
                 .tightening_threshold(800)
-                .child(&hscroll)
+                .child(&content)
                 .build();
             self.obj().set_child(Some(&clamp));
+            self.content.set(content).ok();
 
             highlight::attach(&view.buffer());
 
@@ -323,6 +457,24 @@ mod imp {
                 popover.popup();
             });
             view.add_controller(gesture);
+
+            // The body gesture claims its clicks in the capture phase, and
+            // selectable header labels claim theirs (their extra menu carries
+            // the mail actions instead); this bubble-phase gesture catches
+            // right-clicks on the rest of the card — header padding, gaps —
+            // so the actions are reachable from anywhere on the message.
+            let row_gesture = gtk::GestureClick::new();
+            row_gesture.set_button(gdk::BUTTON_SECONDARY);
+            let popover_weak = popover.downgrade();
+            row_gesture.connect_pressed(move |gesture, _, x, y| {
+                let Some(popover) = popover_weak.upgrade() else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+                popover.popup();
+            });
+            self.obj().add_controller(row_gesture);
 
             // Enable the selection-dependent actions on the currently bound
             // group whenever the selection changes. The group is rebuilt per
@@ -933,6 +1085,8 @@ fn build_thread_content(
         nav,
         #[strong]
         composer,
+        #[strong]
+        overlay,
         move |_, item| {
             let item = item
                 .downcast_ref::<gtk::ListItem>()
@@ -946,7 +1100,7 @@ fn build_thread_content(
             item.set_activatable(false);
             item.set_selectable(false);
             item.set_focusable(false);
-            let row = MessageRow::new(&nav, &composer);
+            let row = MessageRow::new(&nav, &composer, &overlay);
             item.set_child(Some(&row));
         }
     ));
@@ -962,14 +1116,13 @@ fn build_thread_content(
             .child()
             .and_downcast::<MessageRow>()
             .expect("child is a MessageRow");
-        row.set_message(message.message());
+        // The first message's header card differs (no Subject row), so the
+        // row must know whether it holds the OP.
+        row.set_message(message.message(), item.position() == 0);
     });
 
     let selection = gtk::NoSelection::new(Some(model.clone()));
     let list_view = gtk::ListView::new(Some(selection), Some(factory));
-    // A visible line between messages stands in for the per-message header
-    // cards that are dropped for now (bodies-only pass).
-    list_view.set_show_separators(true);
     list_view.set_single_click_activate(false);
 
     for mail in thread {
@@ -1275,8 +1428,10 @@ fn scroll_section_to_top(scrolled: &gtk::ScrolledWindow, section: &gtk::Widget) 
 /// laid out as a collapsible reply tree indented by depth. Activating a row
 /// scrolls the message stack to that message; the disclosure button on a row
 /// with replies hides or shows its subtree.
-// Retained (dead for now) for the follow-up pass that restores per-message
-// headers and the overview on top of the virtualized message list.
+// Retained (dead for now) for the follow-up pass that restores the overview
+// on top of the virtualized message list. Note for that pass: `sections` and
+// scroll_section_to_top predate the ListView — jumping must become
+// list_view.scroll_to(position), since parked rows have no geometry.
 #[allow(dead_code)]
 fn build_overview_sidebar(
     thread: &[Mail],
@@ -1513,80 +1668,19 @@ fn build_overview_sidebar(
     sidebar.upcast()
 }
 
-/// One message of the thread: its header list stacked over its body view.
-// Retained (dead for now) for the follow-up pass that restores per-message
-// header cards on top of the virtualized message list; build_body_view and
-// the header-row builders below are reachable only through here.
-#[allow(dead_code)]
-fn build_message_section(
-    mail: &Mail,
-    is_op: bool,
-    nav: &adw::NavigationView,
-    overlay: &adw::ToastOverlay,
-    composer: &composer::Composer,
-    titles: &gtk::SizeGroup,
-) -> gtk::Box {
-    let section = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .build();
-    section.append(&build_header_list(mail, is_op, overlay, composer, titles));
-    section.append(&build_body_view(mail, nav, composer));
-    setup_section_context_menu(mail, &section, nav, composer);
-    section
-}
-
-// The body view's context menu only covers the body text; this one catches
-// right-clicks on the rest of the message card (header rows, padding) so the
-// mail actions are reachable from anywhere on the message. The body gesture
-// claims its clicks in the capture phase, so this bubble-phase gesture never
-// fires for them.
-fn setup_section_context_menu(
-    mail: &Mail,
-    section: &gtk::Box,
-    nav: &adw::NavigationView,
-    composer: &composer::Composer,
-) {
-    let group = gio::SimpleActionGroup::new();
-    for action in build_mail_actions(mail, section.upcast_ref(), nav, composer) {
-        group.add_action(&action);
-    }
-    section.insert_action_group("mail", Some(&group));
-
+// The mail actions for the header card's selectable labels, resolved against
+// the "mailview" group the fill inserts on the row.
+fn build_header_extra_menu() -> gio::Menu {
     let menu = gio::Menu::new();
-    menu.append(Some("_Reply"), Some("mail.reply"));
-    menu.append(Some("Open on _Web"), Some("mail.open-web"));
-    menu.append(Some("View _Raw"), Some("mail.raw"));
-
-    // Selectable labels (header values, address pills) pop their own stock
-    // menu on right-click, which would otherwise shadow the mail actions;
-    // append them there as an extra-menu section.
-    add_label_extra_menus(section.upcast_ref(), &menu);
-
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_parent(section);
-    popover.set_has_arrow(false);
-    popover.set_halign(gtk::Align::Start);
-    section.connect_destroy(glib::clone!(
-        #[weak]
-        popover,
-        move |_| popover.unparent()
-    ));
-
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(gdk::BUTTON_SECONDARY);
-    gesture.connect_pressed(glib::clone!(
-        #[weak]
-        popover,
-        move |gesture, _, x, y| {
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
-        }
-    ));
-    section.add_controller(gesture);
+    menu.append(Some("_Reply"), Some("mailview.reply"));
+    menu.append(Some("Open on _Web"), Some("mailview.open-web"));
+    menu.append(Some("View _Raw"), Some("mailview.raw"));
+    menu
 }
 
+// Selectable labels pop their own stock menu on right-click, which would
+// otherwise shadow the mail actions; append those there as an extra-menu
+// section instead.
 fn add_label_extra_menus(widget: &gtk::Widget, menu: &gio::Menu) {
     if let Some(label) = widget.downcast_ref::<gtk::Label>()
         && label.is_selectable()
@@ -1701,17 +1795,21 @@ fn build_reply_button(mail: &Mail, composer: &composer::Composer) -> gtk::Button
     button
 }
 
+/// A message's header card: subject, author and date over a collapsed
+/// Details expander holding the noisier headers. Everything outside the
+/// expander stays one line — values ellipsize rather than wrap — so every
+/// card of a kind (OP or reply) is the same height and the row seeds stay
+/// exact (see header_height).
 fn build_header_list(
     mail: &Mail,
     is_op: bool,
     overlay: &adw::ToastOverlay,
     composer: &composer::Composer,
-    // Gives every field-name label the same width so the values line up in
-    // a single column; wrapped value lines then stay indented at that column.
-    titles: &gtk::SizeGroup,
 ) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
+        .margin_start(12)
+        .margin_end(12)
         .css_classes(["boxed-list"])
         .build();
 
@@ -1720,43 +1818,50 @@ fn build_header_list(
     // its title, so its Subject row is omitted and its Reply button sits in
     // the title row instead.
     if !is_op {
-        let subject_row = build_text_row("Subject", &mail.subject, titles);
+        let subject_row = build_single_line_row("Subject", &mail.subject);
+        subject_row.set_tooltip_text(Some(&mail.subject));
         if let Some(content) = subject_row.child().and_downcast::<gtk::Box>() {
             content.append(&build_reply_button(mail, composer));
         }
         list.append(&subject_row);
     }
 
-    // The author stays on one line no matter how long the display name is.
-    list.append(&build_single_line_row("Author", &mail.from, titles));
-    list.append(&build_text_row("Date", &mail.date, titles));
+    list.append(&build_single_line_row("Author", &mail.from));
+    list.append(&build_single_line_row("Date", &mail.date));
 
     // The remaining headers are collapsed by default: recipients are almost
     // always the same as the OP's and the ids only matter for debugging, so
     // the Message-Id/In-Reply-To/To/Cc rows only show up on request.
     let details = adw::ExpanderRow::builder().title("Details").build();
     if let Some(id) = &mail.message_id {
-        details.add_row(&build_text_row("Message-Id", id, titles));
+        details.add_row(&build_text_row("Message-Id", id));
     }
     if let Some(id) = &mail.in_reply_to {
-        details.add_row(&build_text_row("In-Reply-To", id, titles));
+        details.add_row(&build_text_row("In-Reply-To", id));
     }
-    details.add_row(&build_address_row("To", &mail.to, &mail.to_addrs, overlay, titles));
+    details.add_row(&build_address_row("To", &mail.to, &mail.to_addrs, overlay));
     if let Some(cc) = &mail.cc {
-        details.add_row(&build_address_row("Cc", cc, &mail.cc_addrs, overlay, titles));
+        details.add_row(&build_address_row("Cc", cc, &mail.cc_addrs, overlay));
     }
     list.append(&details);
 
     list
 }
 
+/// The header cards' title column, in characters: wide enough for the
+/// longest field name ("In-Reply-To"), so the value columns line up across
+/// rows and cards. A fixed width does the job a cross-card SizeGroup did
+/// before the ListView migration — a shared group can't survive row
+/// recycling (possible past 205 messages), where widgets joining and
+/// leaving it on every rebind would re-negotiate every card's layout.
+const HEADER_TITLE_WIDTH_CHARS: i32 = 12;
+
 /// A non-activatable row laying the field name and its value out on one
-/// line: [title | value], with the title column width shared via `titles`.
+/// line: [title | value].
 fn build_row(
     name: &str,
     value: &impl IsA<gtk::Widget>,
     title_valign: gtk::Align,
-    titles: &gtk::SizeGroup,
 ) -> gtk::ListBoxRow {
     // Top-aligned titles (wrapping chip rows) get nudged onto the first
     // value line; centered ones need no offset.
@@ -1766,10 +1871,10 @@ fn build_row(
         .halign(gtk::Align::Start)
         .valign(title_valign)
         .margin_top(title_margin_top)
+        .width_chars(HEADER_TITLE_WIDTH_CHARS)
         .xalign(0.0)
         .css_classes(["heading"])
         .build();
-    titles.add_widget(&title);
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1790,7 +1895,7 @@ fn build_row(
         .build()
 }
 
-fn build_text_row(name: &str, value: &str, titles: &gtk::SizeGroup) -> gtk::ListBoxRow {
+fn build_text_row(name: &str, value: &str) -> gtk::ListBoxRow {
     // A wrapping label's natural width is far narrower than its full text,
     // so it must fill its allocation (halign Fill, the default) — with
     // halign Start it would shrink to that natural width and wrap long
@@ -1812,12 +1917,13 @@ fn build_text_row(name: &str, value: &str, titles: &gtk::SizeGroup) -> gtk::List
         .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
-    build_row(name, &label, gtk::Align::Center, titles)
+    build_row(name, &label, gtk::Align::Center)
 }
 
-/// Like a text row, but the value never wraps: overlong values (author
-/// display names, long addresses) ellipsize instead of growing the row.
-fn build_single_line_row(name: &str, value: &str, titles: &gtk::SizeGroup) -> gtk::ListBoxRow {
+/// Like a text row, but the value never wraps: overlong values (subjects,
+/// author display names, dates) ellipsize instead of growing the row, which
+/// keeps every card of a kind the same height for the row seeds.
+fn build_single_line_row(name: &str, value: &str) -> gtk::ListBoxRow {
     let label = gtk::Label::builder()
         .use_markup(true)
         .label(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
@@ -1828,7 +1934,7 @@ fn build_single_line_row(name: &str, value: &str, titles: &gtk::SizeGroup) -> gt
         .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
-    build_row(name, &label, gtk::Align::Center, titles)
+    build_row(name, &label, gtk::Align::Center)
 }
 
 /// Address rows show parsed pills; if parsing produced nothing but the raw
@@ -1838,10 +1944,9 @@ fn build_address_row(
     raw: &str,
     addrs: &[String],
     overlay: &adw::ToastOverlay,
-    titles: &gtk::SizeGroup,
 ) -> gtk::ListBoxRow {
     if addrs.is_empty() {
-        return build_text_row(name, raw, titles);
+        return build_text_row(name, raw);
     }
 
     let wrap = adw::WrapBox::builder()
@@ -1852,7 +1957,7 @@ fn build_address_row(
         wrap.append(&build_address_pill(addr, overlay));
     }
 
-    let row = build_row(name, &wrap, gtk::Align::Start, titles);
+    let row = build_row(name, &wrap, gtk::Align::Start);
     // Nudge the title down so it baseline-aligns with the first chip line.
     if let Some(title) = wrap
         .parent()
@@ -1946,165 +2051,6 @@ fn build_raw_page(raw: &str, subject: &str) -> adw::NavigationPage {
 
     let scrolled = gtk::ScrolledWindow::builder().child(&view).build();
     adw::NavigationPage::new(&scrolled, &format!("Raw - {subject}"))
-}
-
-fn build_body_view(
-    mail: &Mail,
-    nav: &adw::NavigationView,
-    composer: &composer::Composer,
-) -> adw::Bin {
-    let view = gtk::TextView::builder()
-        .editable(false)
-        .cursor_visible(false)
-        .monospace(true)
-        .wrap_mode(gtk::WrapMode::None)
-        .left_margin(12)
-        .right_margin(12)
-        .top_margin(12)
-        .bottom_margin(12)
-        .build();
-    view.buffer().set_text(&mail.body);
-    highlight::attach(&view.buffer());
-    highlight::refresh(&view.buffer());
-
-    let insert_quoted = |prefix: Option<String>| {
-        glib::clone!(
-            #[weak]
-            view,
-            #[strong]
-            composer,
-            move |_: &gio::SimpleAction, _: Option<&glib::Variant>| {
-                let buffer = view.buffer();
-                if let Some((start, end)) = buffer.selection_bounds() {
-                    let text = buffer.text(&start, &end, false);
-                    let quoted: Vec<String> =
-                        text.lines().map(|line| format!("> {line}")).collect();
-                    let mut result = quoted.join("\n");
-                    if let Some(prefix) = &prefix {
-                        result = format!("{prefix}\n{result}");
-                    }
-                    composer.insert_quote(&result);
-                }
-            }
-        )
-    };
-
-    let quote = gio::SimpleAction::new("quote-selection", None);
-    quote.set_enabled(false);
-    quote.connect_activate(insert_quoted(None));
-
-    let quote_with_date = gio::SimpleAction::new("quote-with-date", None);
-    quote_with_date.set_enabled(false);
-    quote_with_date.connect_activate(insert_quoted(Some(format!(
-        "On {}, {} wrote:",
-        mail.date, mail.from
-    ))));
-
-    let copy = gio::SimpleAction::new("copy", None);
-    copy.set_enabled(false);
-    copy.connect_activate(glib::clone!(
-        #[weak]
-        view,
-        move |_, _| {
-            view.buffer().copy_clipboard(&view.clipboard());
-        }
-    ));
-
-    let select_all = gio::SimpleAction::new("select-all", None);
-    select_all.connect_activate(glib::clone!(
-        #[weak]
-        view,
-        move |_, _| {
-            let buffer = view.buffer();
-            buffer.select_range(&buffer.start_iter(), &buffer.end_iter());
-        }
-    ));
-
-    view.buffer().connect_has_selection_notify(glib::clone!(
-        #[weak]
-        quote,
-        #[weak]
-        quote_with_date,
-        #[weak]
-        copy,
-        move |buffer| {
-            quote.set_enabled(buffer.has_selection());
-            quote_with_date.set_enabled(buffer.has_selection());
-            copy.set_enabled(buffer.has_selection());
-        }
-    ));
-
-    // The popover can't be parented to the TextView itself (it allocates its
-    // own children and warns about foreign ones), so everything hangs off a
-    // plain Box wrapper instead — including the action group.
-    let hscroll = gtk::ScrolledWindow::builder()
-        .child(&view)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .propagate_natural_height(true)
-        .build();
-
-    let wrapper = adw::Bin::builder().child(&hscroll).build();
-
-    let group = gio::SimpleActionGroup::new();
-    group.add_action(&quote);
-    group.add_action(&quote_with_date);
-    group.add_action(&copy);
-    group.add_action(&select_all);
-    for action in build_mail_actions(mail, view.upcast_ref(), nav, composer) {
-        group.add_action(&action);
-    }
-    wrapper.insert_action_group("mailview", Some(&group));
-
-    setup_context_menu(&view, &wrapper);
-
-    wrapper
-}
-
-// GTK only appends extra-menu items after the built-in ones, so to put the
-// quote items first the context menu is replaced wholesale.
-fn setup_context_menu(view: &gtk::TextView, wrapper: &adw::Bin) {
-    let quote_section = gio::Menu::new();
-    quote_section.append(Some("_Quote Selection"), Some("mailview.quote-selection"));
-    quote_section.append(Some("Quote With _Date"), Some("mailview.quote-with-date"));
-
-    let edit_section = gio::Menu::new();
-    edit_section.append(Some("_Copy"), Some("mailview.copy"));
-    edit_section.append(Some("Select _All"), Some("mailview.select-all"));
-
-    let mail_section = gio::Menu::new();
-    mail_section.append(Some("_Reply"), Some("mailview.reply"));
-    mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
-    mail_section.append(Some("View _Raw"), Some("mailview.raw"));
-
-    let menu = gio::Menu::new();
-    menu.append_section(None, &quote_section);
-    menu.append_section(None, &edit_section);
-    menu.append_section(None, &mail_section);
-
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_parent(wrapper);
-    popover.set_has_arrow(false);
-    popover.set_halign(gtk::Align::Start);
-    wrapper.connect_destroy(glib::clone!(
-        #[weak]
-        popover,
-        move |_| popover.unparent()
-    ));
-
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(gdk::BUTTON_SECONDARY);
-    gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
-    gesture.connect_pressed(glib::clone!(
-        #[weak]
-        popover,
-        move |gesture, _, x, y| {
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
-        }
-    ));
-    view.add_controller(gesture);
 }
 
 fn launch_uri(widget: &impl IsA<gtk::Widget>, uri: &str) {

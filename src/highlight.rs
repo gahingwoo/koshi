@@ -229,27 +229,18 @@ fn take_number(s: &str) -> Option<(u64, &str)> {
     Some((n, &s[end..]))
 }
 
-const QUOTE_TAGS: [&str; 3] = ["koshi-quote-1", "koshi-quote-2", "koshi-quote-3"];
+const QUOTE_TAG: &str = "koshi-quote";
 const ADD_TAG: &str = "koshi-diff-add";
 const REMOVE_TAG: &str = "koshi-diff-remove";
 const HUNK_TAG: &str = "koshi-diff-hunk";
 const HEADER_TAG: &str = "koshi-diff-header";
 const META_TAG: &str = "koshi-diff-meta";
-const ALL_TAGS: [&str; 8] = [
-    QUOTE_TAGS[0],
-    QUOTE_TAGS[1],
-    QUOTE_TAGS[2],
-    ADD_TAG,
-    REMOVE_TAG,
-    HUNK_TAG,
-    HEADER_TAG,
-    META_TAG,
-];
+const ALL_TAGS: [&str; 6] = [QUOTE_TAG, ADD_TAG, REMOVE_TAG, HUNK_TAG, HEADER_TAG, META_TAG];
 
-/// GNOME palette colors per scheme: quote depth cycle, then add, remove,
-/// hunk, header, meta.
+/// GNOME palette colors per scheme: quote, then add, remove, hunk, header,
+/// meta.
 struct Palette {
-    quote: [&'static str; 3],
+    quote: &'static str,
     add: &'static str,
     remove: &'static str,
     hunk: &'static str,
@@ -258,7 +249,7 @@ struct Palette {
 }
 
 const LIGHT: Palette = Palette {
-    quote: ["#1a5fb4", "#26a269", "#813d9c"],
+    quote: "#1a5fb4",
     add: "#26a269",
     remove: "#c01c28",
     hunk: "#1a5fb4",
@@ -267,7 +258,7 @@ const LIGHT: Palette = Palette {
 };
 
 const DARK: Palette = Palette {
-    quote: ["#62a0ea", "#57e389", "#c061cb"],
+    quote: "#62a0ea",
     add: "#57e389",
     remove: "#ed333b",
     hunk: "#62a0ea",
@@ -277,7 +268,7 @@ const DARK: Palette = Palette {
 
 fn tag_name(kind: Kind) -> &'static str {
     match kind {
-        Kind::Quote(depth) => QUOTE_TAGS[(depth - 1) % 3],
+        Kind::Quote(_) => QUOTE_TAG,
         Kind::DiffAdd => ADD_TAG,
         Kind::DiffRemove => REMOVE_TAG,
         Kind::DiffHunk => HUNK_TAG,
@@ -287,18 +278,15 @@ fn tag_name(kind: Kind) -> &'static str {
 }
 
 /// Create this module's tags in the buffer and keep their colors in sync
-/// with the color scheme. Quote tags are created first so the diff tags,
+/// with the color scheme. The quote tag is created first so the diff tags,
 /// created later, win the foreground where a diff span overlaps a quote
 /// prefix (tag priority defaults to creation order).
 pub fn attach(buffer: &gtk::TextBuffer) {
     let table = buffer.tag_table();
-    if table.lookup(QUOTE_TAGS[0]).is_some() {
+    if table.lookup(QUOTE_TAG).is_some() {
         return;
     }
-    for name in QUOTE_TAGS {
-        buffer.create_tag(Some(name), &[]);
-    }
-    for name in [ADD_TAG, REMOVE_TAG, META_TAG] {
+    for name in [QUOTE_TAG, ADD_TAG, REMOVE_TAG, META_TAG] {
         buffer.create_tag(Some(name), &[]);
     }
     for name in [HUNK_TAG, HEADER_TAG] {
@@ -330,9 +318,7 @@ pub fn attach(buffer: &gtk::TextBuffer) {
 fn apply_colors(buffer: &gtk::TextBuffer, dark: bool) {
     let palette = if dark { &DARK } else { &LIGHT };
     let colors = [
-        (QUOTE_TAGS[0], palette.quote[0]),
-        (QUOTE_TAGS[1], palette.quote[1]),
-        (QUOTE_TAGS[2], palette.quote[2]),
+        (QUOTE_TAG, palette.quote),
         (ADD_TAG, palette.add),
         (REMOVE_TAG, palette.remove),
         (HUNK_TAG, palette.hunk),

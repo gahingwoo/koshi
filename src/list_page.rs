@@ -10,6 +10,20 @@ pub fn build_list_page(
     title_buttons: &[gtk::Widget],
     list: &impl IsA<gtk::Widget>,
 ) -> adw::NavigationPage {
+    build_list_page_with_search(page_title, heading, description, title_buttons, list, None)
+}
+
+/// As [`build_list_page`], but pins an optional [`gtk::SearchBar`] above the
+/// scrolled content. The bar reveals on demand (typing / Ctrl+F) and stays
+/// fixed while the list scrolls beneath it.
+pub fn build_list_page_with_search(
+    page_title: &str,
+    heading: &str,
+    description: &str,
+    title_buttons: &[gtk::Widget],
+    list: &impl IsA<gtk::Widget>,
+    search_bar: Option<&gtk::SearchBar>,
+) -> adw::NavigationPage {
     let title_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -62,8 +76,19 @@ pub fn build_list_page(
 
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
         .child(&clamp)
         .build();
 
-    adw::NavigationPage::new(&scrolled, page_title)
+    let Some(search_bar) = search_bar else {
+        return adw::NavigationPage::new(&scrolled, page_title);
+    };
+
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    column.append(search_bar);
+    column.append(&scrolled);
+
+    adw::NavigationPage::new(&column, page_title)
 }

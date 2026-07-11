@@ -5,7 +5,7 @@ use adw::prelude::*;
 use gtk::glib;
 
 use crate::favorites::{self, FavoriteInbox};
-use crate::list_page::build_list_page;
+use crate::list_page::build_list_page_with_search;
 use crate::lore::{self, Inbox};
 use crate::remote_page::RemoteContent;
 use crate::thread_list_page::build_thread_list_page;
@@ -20,32 +20,51 @@ type StarButtons = Rc<HashMap<String, glib::WeakRef<gtk::Button>>>;
 
 pub fn build_inbox_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     let remote = RemoteContent::new();
-    let page = build_list_page(
+
+    // A reveal-on-demand filter over the (hundreds-long) inbox list, distinct
+    // from the window's global lore search: this only narrows the rows already
+    // on screen. It stays hidden until the user types or hits Ctrl+F, so the
+    // two searches never sit on screen together.
+    let entry = gtk::SearchEntry::builder()
+        .placeholder_text("Filter inboxes")
+        .build();
+    let search_bar = gtk::SearchBar::builder().child(&entry).build();
+    search_bar.connect_entry(&entry);
+
+    let page = build_list_page_with_search(
         INBOX_LIST_TITLE,
         "Open a public inbox",
         "Every list mirrored on lore.kernel.org. Pick one to open it in this tab.",
         &[],
         remote.widget(),
+        Some(&search_bar),
     );
-    load(remote, nav.clone());
+    // Capture typing anywhere on the page to open the bar; scope it to the page
+    // so background tabs and the header's global search are unaffected.
+    search_bar.set_key_capture_widget(Some(&page));
+
+    load(remote, nav.clone(), entry);
     page
 }
 
-fn load(remote: RemoteContent, nav: adw::NavigationView) {
+fn load(remote: RemoteContent, nav: adw::NavigationView, entry: gtk::SearchEntry) {
     remote.show_loading();
     let cancellable = remote.cancellable();
     glib::spawn_future_local(async move {
         match lore::fetch_inboxes(&cancellable).await {
-            Ok(inboxes) => remote.show_content(&build_content(&nav, inboxes)),
+            Ok(inboxes) => remote.show_content(&build_content(&nav, inboxes, &entry)),
             Err(error) if error.is_cancelled() => {}
             Err(error) => {
                 let weak = remote.downgrade();
                 let nav = nav.downgrade();
+                let entry = entry.downgrade();
                 remote.show_error(
                     &error,
                     move || {
-                        if let (Some(remote), Some(nav)) = (weak.upgrade(), nav.upgrade()) {
-                            load(remote, nav);
+                        if let (Some(remote), Some(nav), Some(entry)) =
+                            (weak.upgrade(), nav.upgrade(), entry.upgrade())
+                        {
+                            load(remote, nav, entry);
                         }
                     },
                     None,
@@ -59,7 +78,7 @@ fn load(remote: RemoteContent, nav: adw::NavigationView) {
 /// The full list is built exactly once — regenerating its hundreds of rows
 /// on every star click stalls noticeably — so a toggle only updates star
 /// icons in place and regenerates the small favorites section.
-fn build_content(nav: &adw::NavigationView, inboxes: Vec<Inbox>) -> gtk::Box {
+fn build_content(nav: &adw::NavigationView, inboxes: Vec<Inbox>, entry: &gtk::SearchEntry) -> gtk::Box {
     let container = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -105,6 +124,22 @@ fn build_content(nav: &adw::NavigationView, inboxes: Vec<Inbox>) -> gtk::Box {
             }
         ));
     }
+    // Narrow the All Inboxes list to rows whose slug or description matches the
+    // filter text. Favorites stay pinned and unfiltered: they're your short
+    // curated set, and the filter exists to scan the long list below them.
+    list.set_filter_func(glib::clone!(
+        #[weak]
+        entry,
+        #[upgrade_or]
+        true,
+        move |row| row_matches(row, &entry.text())
+    ));
+    entry.connect_search_changed(glib::clone!(
+        #[weak]
+        list,
+        move |_| list.invalidate_filter()
+    ));
+
     container.append(&list);
 
     let inboxes = Rc::new(inboxes);
@@ -184,6 +219,21 @@ fn refresh_favorites(section: &gtk::Box, nav: &adw::NavigationView, stars: &Star
     section.append(&list);
 
     section.append(&build_section_heading("All Inboxes"));
+}
+
+/// Case-insensitive substring match of an inbox row against the filter query,
+/// over both its slug (title) and description (subtitle). An empty query keeps
+/// every row.
+fn row_matches(row: &gtk::ListBoxRow, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let Some(row) = row.downcast_ref::<adw::ActionRow>() else {
+        return true;
+    };
+    let subtitle = row.subtitle().unwrap_or_default();
+    row.title().to_lowercase().contains(&query) || subtitle.to_lowercase().contains(&query)
 }
 
 fn build_section_heading(label: &str) -> gtk::Label {

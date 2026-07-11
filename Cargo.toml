@@ -2,6 +2,11 @@
 name = "koshi"
 version = "0.1.0"
 edition = "2024"
+description = "Read and reply to kernel mailing lists"
+authors = ["Nika Krasnova <nika@nikableh.moe>"]
+license = "GPL-3.0-or-later"
+homepage = "https://github.com/nikableh/koshi"
+repository = "https://github.com/nikableh/koshi"
 
 [dependencies]
 gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }

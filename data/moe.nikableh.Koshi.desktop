@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Koshi
-Comment=Browse and read mailing-list archives
+Comment=Read and reply to kernel mailing lists
 Exec=koshi
 Icon=moe.nikableh.Koshi
 Terminal=false

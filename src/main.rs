@@ -27,10 +27,10 @@ const APP_ID: &str = "moe.nikableh.Koshi";
 
 // Debug builds show the Devel icon so they are distinguishable from an
 // installed release build.
-#[cfg(debug_assertions)]
-const APP_ICON: &str = "moe.nikableh.Koshi.Devel";
-#[cfg(not(debug_assertions))]
-const APP_ICON: &str = APP_ID;
+const APP_ICON: &str = std::cfg_select! {
+    debug_assertions => { "moe.nikableh.Koshi.Devel" }
+    _ => { APP_ID }
+};
 
 fn main() -> glib::ExitCode {
     gio::resources_register_include!("koshi.gresource")

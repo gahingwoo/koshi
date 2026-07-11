@@ -333,27 +333,42 @@ fn build_body_action_group(
 /// on the raw message text before MIME parsing: the mbox writer escapes raw
 /// file lines, so unescaping must happen before any Content-Transfer-Encoding
 /// decoding, not after.
-fn parse_thread(mbox: &str) -> Vec<Mail> {
+///
+/// The whole pipeline works on bytes: messages carry their own charsets, and
+/// only mailparse — which reads each part's declaration — may turn them into
+/// text. A premature whole-file UTF-8 conversion would replace every KOI8-R
+/// byte with U+FFFD before the parser could decode it.
+fn parse_thread(mbox: &[u8]) -> Vec<Mail> {
     split_mbox(mbox)
         .iter()
         .map(|raw| parse_message(&unescape_mboxrd(raw)))
         .collect()
 }
 
+/// Split lines of a byte buffer, normalizing "\r\n" and a missing final
+/// newline away (like str::lines does for text).
+fn split_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes.split_inclusive(|&b| b == b'\n').map(|line| {
+        line.strip_suffix(b"\r\n")
+            .or_else(|| line.strip_suffix(b"\n"))
+            .unwrap_or(line)
+    })
+}
+
 /// Split an mboxrd file into raw messages on its "From " separator lines.
 /// Body lines starting with "From " are ">"-escaped in mboxrd, so a line
 /// beginning "From " at column zero is always a separator. The separator
 /// lines themselves are dropped; anything before the first one is too.
-fn split_mbox(mbox: &str) -> Vec<String> {
-    let mut messages: Vec<String> = Vec::new();
-    let mut current: Option<String> = None;
-    for line in mbox.lines() {
-        if line.starts_with("From ") {
+fn split_mbox(mbox: &[u8]) -> Vec<Vec<u8>> {
+    let mut messages: Vec<Vec<u8>> = Vec::new();
+    let mut current: Option<Vec<u8>> = None;
+    for line in split_lines(mbox) {
+        if line.starts_with(b"From ") {
             messages.extend(current.take());
-            current = Some(String::new());
+            current = Some(Vec::new());
         } else if let Some(message) = current.as_mut() {
-            message.push_str(line);
-            message.push('\n');
+            message.extend_from_slice(line);
+            message.push(b'\n');
         }
     }
     messages.extend(current);
@@ -362,26 +377,29 @@ fn split_mbox(mbox: &str) -> Vec<String> {
 
 /// Undo mboxrd body escaping: any line of one-or-more '>' followed by
 /// "From " loses one leading '>'.
-fn unescape_mboxrd(body: &str) -> String {
-    let mut out = String::new();
-    for line in body.lines() {
-        let quoted = line.trim_start_matches('>');
-        if quoted.starts_with("From ") && quoted.len() < line.len() {
-            out.push_str(&line[1..]);
+fn unescape_mboxrd(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in split_lines(body) {
+        let arrows = line.iter().take_while(|&&b| b == b'>').count();
+        if arrows > 0 && line[arrows..].starts_with(b"From ") {
+            out.extend_from_slice(&line[1..]);
         } else {
-            out.push_str(line);
+            out.extend_from_slice(line);
         }
-        out.push('\n');
+        out.push(b'\n');
     }
-    if !body.ends_with('\n') {
+    if !body.ends_with(b"\n") {
         out.pop();
     }
     out
 }
 
-fn parse_message(raw: &str) -> Mail {
+fn parse_message(raw: &[u8]) -> Mail {
     let unknown = || "(unknown)".to_string();
-    let Ok(parsed) = mailparse::parse_mail(raw.as_bytes()) else {
+    // The raw view is best-effort text; unlike the body it has no charset
+    // machinery, so lossy UTF-8 is the honest rendering of the raw bytes.
+    let raw_text = || String::from_utf8_lossy(raw).into_owned();
+    let Ok(parsed) = mailparse::parse_mail(raw) else {
         return Mail {
             subject: unknown(),
             from: unknown(),
@@ -393,7 +411,7 @@ fn parse_message(raw: &str) -> Mail {
             message_id: None,
             in_reply_to: None,
             body: String::new(),
-            raw: raw.to_string(),
+            raw: raw_text(),
         };
     };
 
@@ -418,7 +436,7 @@ fn parse_message(raw: &str) -> Mail {
         message_id: header("Message-ID"),
         in_reply_to: header("In-Reply-To"),
         body: format!("{}\n", body.trim_end()),
-        raw: raw.to_string(),
+        raw: raw_text(),
     }
 }
 
@@ -493,7 +511,21 @@ fn strip_rfc5322_comments(s: &str) -> String {
 fn find_text_body(part: &mailparse::ParsedMail) -> Option<String> {
     if part.subparts.is_empty() {
         if part.ctype.mimetype.eq_ignore_ascii_case("text/plain") {
-            return part.get_body().ok();
+            let body = part.get_body().ok()?;
+            // Senders occasionally declare a legacy charset on what is
+            // really UTF-8 text. Legacy Cyrillic bytes essentially never
+            // form valid multi-byte UTF-8 sequences, so when the decoded
+            // bytes do validate as UTF-8 with non-ASCII content, believe
+            // the bytes over the declaration.
+            if !part.ctype.charset.eq_ignore_ascii_case("utf-8")
+                && !body.is_ascii()
+                && let Ok(bytes) = part.get_body_raw()
+                && let Ok(utf8) = String::from_utf8(bytes)
+                && !utf8.is_ascii()
+            {
+                return Some(utf8);
+            }
+            return Some(body);
         }
         return None;
     }
@@ -1821,7 +1853,7 @@ mod tests {
     use super::*;
 
     /// A real lore thread bundled as an offline fixture.
-    const RAW_THREAD: &str = include_str!("../data/sample-thread.mbox");
+    const RAW_THREAD: &[u8] = include_bytes!("../data/sample-thread.mbox");
 
     #[test]
     fn parses_the_whole_thread() {
@@ -1919,24 +1951,26 @@ mod tests {
 
     #[test]
     fn splits_on_separator_lines_only() {
-        let mbox = "From a@b Thu Jan  1 00:00:00 1970\nSubject: x\n\n>From escaped\n\
+        let mbox = b"From a@b Thu Jan  1 00:00:00 1970\nSubject: x\n\n>From escaped\n\
                     From c@d Thu Jan  1 00:00:00 1970\nSubject: y\n\nbody\n";
         let messages = split_mbox(mbox);
         assert_eq!(messages.len(), 2);
-        assert!(messages[0].starts_with("Subject: x"));
-        assert!(messages[0].contains(">From escaped"));
-        assert!(messages[1].starts_with("Subject: y"));
+        let first = String::from_utf8(messages[0].clone()).unwrap();
+        let second = String::from_utf8(messages[1].clone()).unwrap();
+        assert!(first.starts_with("Subject: x"));
+        assert!(first.contains(">From escaped"));
+        assert!(second.starts_with("Subject: y"));
     }
 
     #[test]
     fn unescapes_mboxrd_from_lines() {
-        let body = ">From here\n>>From nested\n> From untouched\nno From here\n";
+        let body = b">From here\n>>From nested\n> From untouched\nno From here\n";
         assert_eq!(
             unescape_mboxrd(body),
-            "From here\n>From nested\n> From untouched\nno From here\n"
+            b"From here\n>From nested\n> From untouched\nno From here\n"
         );
         // Trailing-newline shape is preserved.
-        assert_eq!(unescape_mboxrd(">From x"), "From x");
+        assert_eq!(unescape_mboxrd(b">From x"), b"From x");
     }
 
     #[test]
@@ -1944,13 +1978,43 @@ mod tests {
         // Writer-escaped ">From " must lose its '>' before qp decoding,
         // while a '>' the qp decoding itself produces ("=3EFrom") was never
         // escaped by the writer and must survive untouched.
-        let raw = "Subject: qp\nContent-Transfer-Encoding: quoted-printable\n\n\
+        let raw = b"Subject: qp\nContent-Transfer-Encoding: quoted-printable\n\n\
                    >From escaped by the writer\n=3EFrom decoded, stays quoted\n";
         // Compared line-wise: mailparse emits CRLF for decoded qp bodies.
         let mail = parse_message(&unescape_mboxrd(raw));
         let mut lines = mail.body.lines();
         assert_eq!(lines.next(), Some("From escaped by the writer"));
         assert_eq!(lines.next(), Some(">From decoded, stays quoted"));
+    }
+
+    #[test]
+    fn decodes_declared_legacy_charsets() {
+        // "Привет" in KOI8-R — bytes that a premature whole-file UTF-8
+        // conversion would have destroyed before the MIME parser could
+        // read the charset declaration.
+        let mut mbox = b"From x Thu Jan  1 00:00:00 1970\n\
+                        From: x@y\n\
+                        Subject: koi8\n\
+                        Content-Type: text/plain; charset=koi8-r\n\
+                        Content-Transfer-Encoding: 8bit\n\n"
+            .to_vec();
+        mbox.extend_from_slice(&[0xF0, 0xD2, 0xC9, 0xD7, 0xC5, 0xD4, b'\n']);
+        let thread = parse_thread(&mbox);
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].body, "Привет\n");
+    }
+
+    #[test]
+    fn believes_utf8_bytes_over_a_wrong_legacy_charset_label() {
+        let mut mbox = b"From x Thu Jan  1 00:00:00 1970\n\
+                        From: x@y\n\
+                        Subject: mislabeled\n\
+                        Content-Type: text/plain; charset=koi8-r\n\
+                        Content-Transfer-Encoding: 8bit\n\n"
+            .to_vec();
+        mbox.extend_from_slice("Привет\n".as_bytes());
+        let thread = parse_thread(&mbox);
+        assert_eq!(thread[0].body, "Привет\n");
     }
 
     /// A minimal Mail for tree tests: only the fields the overview reads.
@@ -2108,3 +2172,4 @@ mod tests {
         );
     }
 }
+

@@ -69,25 +69,32 @@ pub async fn fetch(url: &str, cancellable: &gio::Cancellable) -> Result<glib::By
 
 /// Decompress an `application/gzip` payload (lore's `.gz` endpoints are
 /// gzipped files, not transport encoding, so libsoup does not decode them).
-pub fn gunzip_to_string(bytes: &[u8]) -> Result<String, Error> {
+pub fn gunzip(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let mut decoded = Vec::new();
     flate2::read::GzDecoder::new(bytes)
         .read_to_end(&mut decoded)
         .map_err(Error::Gunzip)?;
-    Ok(String::from_utf8_lossy(&decoded).into_owned())
+    Ok(decoded)
 }
 
-/// Fetch a whole thread as mboxrd text, given any message in it.
+pub fn gunzip_to_string(bytes: &[u8]) -> Result<String, Error> {
+    Ok(String::from_utf8_lossy(&gunzip(bytes)?).into_owned())
+}
+
+/// Fetch a whole thread as mboxrd bytes, given any message in it.
+/// Bytes, not text: individual messages carry their own charsets (KOI8-R
+/// replies are alive and well on lkml), so any whole-file text conversion
+/// here would corrupt them before the MIME parser can see the declaration.
 /// The Message-ID is accepted with or without angle brackets. The pseudo-list
 /// `r` resolves a Message-ID across every list via lore's redirect.
 pub async fn fetch_thread_mbox(
     list: &str,
     message_id: &str,
     cancellable: &gio::Cancellable,
-) -> Result<String, Error> {
+) -> Result<Vec<u8>, Error> {
     let trimmed = message_id.trim().trim_matches(['<', '>']);
     let escaped = glib::Uri::escape_string(trimmed, None, true);
     let url = format!("{BASE_URL}/{list}/{escaped}/t.mbox.gz");
     let bytes = fetch(&url, cancellable).await?;
-    gunzip_to_string(&bytes)
+    gunzip(&bytes)
 }

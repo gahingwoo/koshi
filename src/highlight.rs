@@ -321,6 +321,9 @@ pub fn attach(buffer: &gtk::TextBuffer) {
         SPAN_CACHE.with_borrow_mut(|cache| {
             cache.remove(&key);
         });
+        PAINT_PROGRESS.with_borrow_mut(|progress| {
+            progress.remove(&key);
+        });
     });
 }
 
@@ -414,6 +417,87 @@ pub fn refresh(buffer: &gtk::TextBuffer) {
     SPAN_CACHE.with_borrow_mut(|cache| {
         cache.insert(key, spans);
     });
+}
+
+/// A partially applied highlight pass, so multi-megabyte bodies can be
+/// colorized a slice at a time instead of freezing one frame for the whole
+/// message (applying the tags dominates; a giant patch carries a span on
+/// nearly every line).
+struct PaintProgress {
+    spans: Vec<Span>,
+    line_starts: Vec<i32>,
+    total_chars: i32,
+    next_line: usize,
+    next_span: usize,
+}
+
+thread_local! {
+    static PAINT_PROGRESS: std::cell::RefCell<std::collections::HashMap<usize, PaintProgress>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Incremental refresh for a freshly filled, read-only buffer: classify the
+/// whole text on the first call, then apply at most `lines` more lines of
+/// tags per call. Returns true while further calls are needed. If the buffer
+/// text changes between calls the pass starts over, so this must not be
+/// mixed with editable buffers — use refresh there.
+pub fn refresh_step(buffer: &gtk::TextBuffer, lines: usize) -> bool {
+    let key = buffer.as_ptr() as usize;
+    let stored = PAINT_PROGRESS.with_borrow_mut(|progress| progress.remove(&key));
+    // A stale pass (buffer text replaced under it) restarts from scratch;
+    // character count is a good-enough fingerprint for set_text swaps.
+    let mut progress = match stored {
+        Some(progress) if progress.total_chars == buffer.char_count() => progress,
+        _ => {
+            let (start, end) = buffer.bounds();
+            let text = buffer.text(&start, &end, true);
+            let mut line_starts = vec![0i32];
+            let mut off = 0i32;
+            for ch in text.chars() {
+                off += 1;
+                if ch == '\n' {
+                    line_starts.push(off);
+                }
+            }
+            PaintProgress {
+                spans: classify(&text),
+                line_starts,
+                total_chars: off,
+                next_line: 0,
+                next_span: 0,
+            }
+        }
+    };
+
+    // The buffer is freshly set (set_text drops all tags), so tags are only
+    // applied, never removed; spans arrive in line order from classify.
+    let end_line = progress.next_line.saturating_add(lines);
+    while progress.next_span < progress.spans.len() {
+        let span = progress.spans[progress.next_span];
+        if span.line >= end_line {
+            break;
+        }
+        let base = progress.line_starts.get(span.line).copied().unwrap_or(0);
+        let from = buffer.iter_at_offset(base + span.start as i32);
+        let to = buffer.iter_at_offset(base + span.end as i32);
+        buffer.apply_tag_by_name(tag_name(span.kind), &from, &to);
+        progress.next_span += 1;
+    }
+    progress.next_line = end_line;
+
+    if progress.next_line >= progress.line_starts.len() {
+        // Done: leave the final spans where refresh's diffing expects them,
+        // so a later full refresh sees the true tag state.
+        SPAN_CACHE.with_borrow_mut(|cache| {
+            cache.insert(key, progress.spans);
+        });
+        false
+    } else {
+        PAINT_PROGRESS.with_borrow_mut(|map| {
+            map.insert(key, progress);
+        });
+        true
+    }
 }
 
 #[cfg(test)]

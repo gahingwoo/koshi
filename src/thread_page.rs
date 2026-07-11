@@ -184,8 +184,15 @@ impl MessageRow {
         if !imp.filled.get() || imp.highlighted.get() {
             return;
         }
-        if let Some(view) = imp.view.get() {
-            highlight::refresh(&view.buffer());
+        // A bounded slice of lines per call: giant bodies (multi-MB patches
+        // carry a tag span on nearly every line) would otherwise freeze a
+        // whole frame — 946ms measured for a 7.9MB message. While slices
+        // remain the row stays un-highlighted, so the fill chain keeps
+        // calling back here.
+        if let Some(view) = imp.view.get()
+            && highlight::refresh_step(&view.buffer(), 1000)
+        {
+            return;
         }
         imp.highlighted.set(true);
     }

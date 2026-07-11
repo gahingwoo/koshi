@@ -37,14 +37,23 @@ glib::wrapper! {
 }
 
 impl MessageObject {
-    fn new(mail: Rc<Mail>) -> Self {
+    fn new(mail: Rc<Mail>, is_op: bool) -> Self {
         let obj: Self = glib::Object::new();
         obj.imp().mail.set(mail).ok();
+        obj.imp().is_op.set(is_op);
         obj
     }
 
     fn message(&self) -> Rc<Mail> {
         self.imp().mail.get().expect("MessageObject mail set").clone()
+    }
+
+    /// Whether this message is the thread's OP. Tracked on the object rather
+    /// than derived from the row's position, because the single view shows one
+    /// message at position 0 that may well be a reply — its card must still
+    /// carry its own Subject row.
+    fn is_op(&self) -> bool {
+        self.imp().is_op.get()
     }
 }
 
@@ -323,6 +332,8 @@ mod imp {
     #[derive(Default)]
     pub struct MessageObject {
         pub(super) mail: OnceCell<Rc<Mail>>,
+        /// Whether this message heads its thread; see MessageObject::is_op.
+        pub(super) is_op: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -988,10 +999,15 @@ fn spawn_thread_load(
                     show_thread_error(&remote, &error, &split, &nav, &page, list, message_id);
                 } else {
                     page.set_title(&thread[0].subject);
+                    // The single view opens on whichever message the thread
+                    // was reached through; find it before the thread is moved
+                    // into the content.
+                    let opened = opened_message_index(&thread, &message_id);
                     // Mounted under RemoteContent's still-spinning cover; the
                     // content itself lifts it once the visible rows are
                     // filled and painted (see build_thread_content).
-                    let content = build_thread_content(&nav, thread, &list, remote.downgrade());
+                    let content =
+                        build_thread_content(&nav, thread, &list, opened, remote.downgrade());
                     remote.show_content_covered(&content);
                 }
             }
@@ -1028,6 +1044,7 @@ fn build_thread_content(
     nav: &adw::NavigationView,
     thread: Vec<Mail>,
     list: &str,
+    opened: usize,
     remote: crate::remote_page::RemoteContentWeak,
 ) -> gtk::Box {
     let op = &thread[0];
@@ -1055,6 +1072,10 @@ fn build_thread_content(
     let op_reply = build_reply_button(op, &composer);
     op_reply.set_valign(gtk::Align::Start);
 
+    // Switches the message pane between the single opened message and the
+    // whole thread; wired to swap the ListView's model once both are built.
+    let view_toggle = build_view_toggle();
+
     let title_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -1064,6 +1085,7 @@ fn build_thread_content(
         .margin_end(12)
         .build();
     title_row.append(&title);
+    title_row.append(&view_toggle);
     title_row.append(&build_star_button(op, list, &overlay));
     title_row.append(&op_reply);
     // Match the bodies' reading width so the title lines up with them.
@@ -1116,18 +1138,48 @@ fn build_thread_content(
             .child()
             .and_downcast::<MessageRow>()
             .expect("child is a MessageRow");
-        // The first message's header card differs (no Subject row), so the
-        // row must know whether it holds the OP.
-        row.set_message(message.message(), item.position() == 0);
+        // The OP's header card differs (no Subject row, since the pinned
+        // title already shows it), so the row must know whether it holds the
+        // OP. The single view can put a reply at position 0, so this reads
+        // the flag off the message, not the row's position.
+        row.set_message(message.message(), message.is_op());
     });
 
-    let selection = gtk::NoSelection::new(Some(model.clone()));
-    let list_view = gtk::ListView::new(Some(selection), Some(factory));
-    list_view.set_single_click_activate(false);
-
-    for mail in thread {
-        model.append(&MessageObject::new(Rc::new(mail)));
+    // Both views draw from the same message objects; only which of them the
+    // ListView is pointed at differs. The threaded model holds every message
+    // in thread order; the single model holds just the opened one.
+    let objects: Vec<MessageObject> = thread
+        .into_iter()
+        .enumerate()
+        .map(|(index, mail)| MessageObject::new(Rc::new(mail), index == 0))
+        .collect();
+    let opened = opened.min(objects.len().saturating_sub(1));
+    for object in &objects {
+        model.append(object);
     }
+    let single_model = gio::ListStore::new::<MessageObject>();
+    single_model.append(&objects[opened]);
+
+    // Opening a message shows that message alone (single view); the toggle
+    // switches to the whole thread. The model swap is all it takes — the
+    // factory, warmup chain and composer are shared across both.
+    let selection = gtk::NoSelection::new(Some(single_model.clone()));
+    let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory));
+    list_view.set_single_click_activate(false);
+    view_toggle.connect_active_notify(glib::clone!(
+        #[strong]
+        model,
+        #[strong]
+        single_model,
+        move |toggle| {
+            // Toggle index 0 is Single, 1 is Threaded (see build_view_toggle).
+            if toggle.active() == 0 {
+                selection.set_model(Some(&single_model));
+            } else {
+                selection.set_model(Some(&model));
+            }
+        }
+    ));
 
     let scrolled = gtk::ScrolledWindow::builder()
         .child(&list_view)
@@ -1325,6 +1377,25 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
             None => return rows,
         }
     }
+}
+
+/// The index of the message the thread was opened through, matched by
+/// Message-ID. Falls back to the OP (index 0) when the id isn't found — the
+/// `r` pseudo-list and stale favorites can resolve to a thread whose exact
+/// message this no longer names.
+fn opened_message_index(thread: &[Mail], message_id: &str) -> usize {
+    let wanted = normalize_message_id(message_id);
+    if wanted.is_empty() {
+        return 0;
+    }
+    thread
+        .iter()
+        .position(|mail| {
+            mail.message_id
+                .as_deref()
+                .is_some_and(|id| normalize_message_id(id) == wanted)
+        })
+        .unwrap_or(0)
 }
 
 /// The comparable core of a Message-ID or In-Reply-To header: the first
@@ -1776,6 +1847,29 @@ fn build_star_button(mail: &Mail, list: &str, overlay: &adw::ToastOverlay) -> gt
     ));
 
     button
+}
+
+/// A segmented switch between the single opened message and the whole thread.
+/// Index 0 is Single (the default), index 1 is Threaded; the caller wires the
+/// active-notify to swap the message model.
+fn build_view_toggle() -> adw::ToggleGroup {
+    let single = adw::Toggle::builder()
+        .label("Single")
+        .tooltip("Show only the opened message")
+        .build();
+    let threaded = adw::Toggle::builder()
+        .label("Threaded")
+        .tooltip("Show the whole thread")
+        .build();
+
+    let group = adw::ToggleGroup::builder()
+        .valign(gtk::Align::Start)
+        .css_classes(["flat"])
+        .build();
+    group.add(single);
+    group.add(threaded);
+    group.set_active(0);
+    group
 }
 
 /// A flat Reply icon button that retargets the composer to `mail`.
@@ -2363,6 +2457,22 @@ mod tests {
         let mut broken = mail("x@x", None, "s", "A");
         broken.date = "not a date".to_string();
         assert_eq!(overview_date(&broken.date), "not a date");
+    }
+
+    #[test]
+    fn opened_index_finds_the_message_the_thread_was_reached_through() {
+        let thread = [
+            mail("op@x", None, "[PATCH 0/2] series", "Nika"),
+            mail("a@x", Some("op@x"), "Re: [PATCH 0/2] series", "Miguel"),
+            mail("b@x", Some("op@x"), "[PATCH 1/2] first", "Nika"),
+        ];
+        // Bare and bracketed ids both resolve to the same message.
+        assert_eq!(opened_message_index(&thread, "a@x"), 1);
+        assert_eq!(opened_message_index(&thread, "<a@x>"), 1);
+        assert_eq!(opened_message_index(&thread, "<b@x> stray"), 2);
+        // An unknown or empty id falls back to the OP.
+        assert_eq!(opened_message_index(&thread, "gone@x"), 0);
+        assert_eq!(opened_message_index(&thread, ""), 0);
     }
 
     #[test]

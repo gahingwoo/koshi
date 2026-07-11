@@ -142,6 +142,11 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
         .content(&toolbar_view)
         .build();
 
+    // Stripe the header bar in debug builds so a dev window is unmistakable.
+    if cfg!(debug_assertions) {
+        window.add_css_class("devel");
+    }
+
     window.add_action(&go_back);
     window.add_action(&thread_overview);
     setup_actions(app, &window, &search_entry);

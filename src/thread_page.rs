@@ -1087,13 +1087,11 @@ fn build_thread_content(
     // retarget it later.
     let composer = composer::build_composer(build_reply_context(op));
 
-    // Selectable but not focusable: see build_text_row for why.
     let title = gtk::Label::builder()
         .label(&op.subject)
         .halign(gtk::Align::Start)
         .hexpand(true)
         .selectable(true)
-        .focusable(false)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .xalign(0.0)
@@ -2046,17 +2044,14 @@ fn build_text_row(name: &str, value: &str) -> gtk::ListBoxRow {
     // halign Start it would shrink to that natural width and wrap long
     // before running out of row space. xalign keeps the text left-aligned.
     //
-    // Selectable labels are also made non-focusable: GtkLabel draws a text
-    // caret whenever a selectable label has key focus and its selection is
-    // empty (gtk_label_snapshot), and clicking a selectable label grabs
-    // focus — so a plain click leaves a caret behind. Refusing focus removes
-    // the caret; the click/drag selection gestures never check focus, so
-    // mouse selection and the context-menu Copy keep working.
+    // Plain stock selectable labels otherwise: GTK's own selection styling,
+    // focus handling (including the text caret a click leaves), and context
+    // menu. Forcing them non-focusable would kill the caret but also paints
+    // every selection in the muted unfocused shade.
     let label = gtk::Label::builder()
         .use_markup(true)
         .label(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
         .selectable(true)
-        .focusable(false)
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .xalign(0.0)
@@ -2073,7 +2068,6 @@ fn build_single_line_row(name: &str, value: &str) -> gtk::ListBoxRow {
         .use_markup(true)
         .label(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
         .selectable(true)
-        .focusable(false)
         .ellipsize(gtk::pango::EllipsizeMode::End)
         .halign(gtk::Align::Start)
         .xalign(0.0)

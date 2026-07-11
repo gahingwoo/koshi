@@ -10,6 +10,7 @@ mod profile_menu;
 mod remote_page;
 mod thread_list_page;
 mod thread_page;
+mod window_state;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -38,7 +39,9 @@ fn main() -> glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| {
-        favorites::init(glib::user_data_dir().join("koshi").join("favorites.json"));
+        let data_dir = glib::user_data_dir().join("koshi");
+        favorites::init(data_dir.join("favorites.json"));
+        window_state::init(data_dir.join("window-state.json"));
         load_css();
         register_bundled_icons();
         // Use the bundled app icon for window/taskbar decorations. When Koshi
@@ -134,13 +137,19 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
         }
     ));
 
+    let saved = window_state::load();
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Koshi")
-        .default_width(1000)
-        .default_height(625)
+        // The default size is the window's un-maximized/un-fullscreened size;
+        // fall back to a sensible base so the first un-fullscreen is sane.
+        .default_width(saved.map_or(1000, |state| state.width))
+        .default_height(saved.map_or(625, |state| state.height))
         .content(&toolbar_view)
         .build();
+
+    apply_window_state(&window, saved);
+    persist_window_state_on_close(&window);
 
     // Stripe the header bar in debug builds so a dev window is unmistakable.
     if cfg!(debug_assertions) {
@@ -153,6 +162,33 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
     setup_search(&search_entry, &tab_view);
 
     (window, tab_view)
+}
+
+/// Restore how the window was last left, or — on the very first launch, when
+/// there is no saved state — open it fullscreen.
+fn apply_window_state(window: &adw::ApplicationWindow, saved: Option<window_state::WindowState>) {
+    match saved {
+        Some(state) if state.fullscreen => window.fullscreen(),
+        Some(state) if state.maximized => window.maximize(),
+        // A saved plain window keeps the default size applied by the builder.
+        Some(_) => {}
+        None => window.fullscreen(),
+    }
+}
+
+/// Save the window's geometry when it closes so the next launch can restore it.
+fn persist_window_state_on_close(window: &adw::ApplicationWindow) {
+    window.connect_close_request(|window| {
+        window_state::save(window_state::WindowState {
+            // While maximized/fullscreened these report the size the window
+            // will return to, which is exactly the size to restore.
+            width: window.default_width(),
+            height: window.default_height(),
+            maximized: window.is_maximized(),
+            fullscreen: window.is_fullscreen(),
+        });
+        glib::Propagation::Proceed
+    });
 }
 
 /// Dispatch the search entry: a lore.kernel.org URL or a Message-ID opens

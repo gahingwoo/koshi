@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, gio, glib};
 
 use crate::favorites::{self, FavoriteInbox};
 use crate::list_page::build_list_page_with_search;
 use crate::lore::{self, Inbox};
 use crate::remote_page::RemoteContent;
 use crate::thread_list_page::build_thread_list_page;
+use crate::thread_page::launch_uri;
 
 pub const INBOX_LIST_TITLE: &str = "Public Inboxes";
 
@@ -261,7 +262,102 @@ fn build_row(slug: &str, description: &str) -> adw::ActionRow {
         .activatable(true)
         .build();
     row.add_prefix(&gtk::Image::from_icon_name("mail-unread-symbolic"));
+    add_row_actions(&row, slug, description);
     row
+}
+
+/// Wire an inbox row's secondary-click context menu ("Open in New Tab", "Open
+/// on Web") and its middle-click shortcut for opening the inbox in a background
+/// tab. "Opening" an inbox means its thread list; the web link is the inbox's
+/// lore page.
+fn add_row_actions(row: &adw::ActionRow, slug: &str, description: &str) {
+    let url = format!("{}/{}/", lore::BASE_URL, slug);
+    let slug = slug.to_string();
+    let description = description.to_string();
+
+    let group = gio::SimpleActionGroup::new();
+
+    let open_new_tab = gio::SimpleAction::new("open-new-tab", None);
+    open_new_tab.connect_activate(glib::clone!(
+        #[weak]
+        row,
+        #[strong]
+        slug,
+        #[strong]
+        description,
+        move |_, _| open_in_new_tab(&row, &slug, &description)
+    ));
+    group.add_action(&open_new_tab);
+
+    let open_web = gio::SimpleAction::new("open-web", None);
+    open_web.connect_activate(glib::clone!(
+        #[weak]
+        row,
+        #[strong]
+        url,
+        move |_, _| launch_uri(&row, &url)
+    ));
+    group.add_action(&open_web);
+
+    let menu = gio::Menu::new();
+    menu.append(Some("Open in New _Tab"), Some("menu.open-new-tab"));
+    menu.append(Some("Open on _Web"), Some("menu.open-web"));
+
+    // The popover is built fresh per right-click and unparented when it closes:
+    // a stock ActionRow has no dispose hook, so a popover parented for the row's
+    // whole life leaks and warns at finalize. The action group is inserted on
+    // the popover itself so the menu items resolve against it directly.
+    let secondary = gtk::GestureClick::new();
+    secondary.set_button(gdk::BUTTON_SECONDARY);
+    secondary.connect_pressed(glib::clone!(
+        #[weak]
+        row,
+        #[strong]
+        group,
+        #[strong]
+        menu,
+        move |gesture, _, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.insert_action_group("menu", Some(&group));
+            popover.set_parent(&row);
+            popover.set_has_arrow(false);
+            popover.set_halign(gtk::Align::Start);
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.connect_closed(|popover| popover.unparent());
+            popover.popup();
+        }
+    ));
+    row.add_controller(secondary);
+
+    // Middle-click opens the inbox in a background tab, matching the web
+    // convention of middle-clicking a link.
+    let middle = gtk::GestureClick::new();
+    middle.set_button(gdk::BUTTON_MIDDLE);
+    middle.connect_pressed(glib::clone!(
+        #[weak]
+        row,
+        #[strong]
+        slug,
+        #[strong]
+        description,
+        move |gesture, _, _, _| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            open_in_new_tab(&row, &slug, &description);
+        }
+    ));
+    row.add_controller(middle);
+}
+
+/// Walk up from an inbox row to the enclosing TabView and open the inbox's
+/// thread list in a new background tab there.
+fn open_in_new_tab(widget: &impl IsA<gtk::Widget>, slug: &str, description: &str) {
+    if let Some(tab_view) = widget
+        .ancestor(adw::TabView::static_type())
+        .and_downcast::<adw::TabView>()
+    {
+        crate::open_list_in_new_tab(&tab_view, slug, description);
+    }
 }
 
 /// A plain button rather than a ToggleButton: the starred/unstarred state

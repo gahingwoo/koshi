@@ -431,6 +431,14 @@ pub(crate) fn open_thread_in_new_tab(tab_view: &adw::TabView, list: &str, messag
     append_tab(tab_view, &nav, "Loading…");
 }
 
+/// Open a `list`'s thread list in a new background tab — used by the inbox
+/// list's "Open in New Tab" menu item and middle-click.
+pub(crate) fn open_list_in_new_tab(tab_view: &adw::TabView, list: &str, description: &str) {
+    let nav = adw::NavigationView::new();
+    nav.push(&build_thread_list_page(&nav, list, description));
+    append_tab(tab_view, &nav, list);
+}
+
 /// Append `nav` as a new tab, keeping the tab title bound to the visible page's
 /// title. Does not select it, and leaves the window's go-back/overview state to
 /// the selection handler — a background tab must not clobber it.

@@ -48,15 +48,33 @@ impl MessageObject {
     }
 }
 
-// The recyclable row widget for one message body. All the per-body chrome
-// (read-only monospace TextView, highlight, context menu, action group) is
-// built once in `constructed`; `set_message` just re-points it at whichever
-// Mail the factory binds, so scrolling reuses a handful of these instead of
-// realizing one TextView per message in the whole thread.
+// The row widget for one message body. GtkListView creates and binds every
+// row of a <=205-item model up front (its widget window is a hardcoded 205
+// items), so both construction and bind must be next to free: the row starts
+// as an empty shell holding nothing but its seeded height, and the whole
+// body machinery — TextView, highlight, context menu, action group — is
+// built lazily by the first fill (see update_message_fills for when that
+// happens).
 glib::wrapper! {
     pub struct MessageRow(ObjectSubclass<imp::MessageRow>)
         @extends adw::Bin, gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+thread_local! {
+    /// Exact pixel height of one body line, measured from the first filled
+    /// TextView (0 until known). With it, the seeded heights are
+    /// pixel-perfect for plain lines — bodies are monospace and never wrap —
+    /// so filling a row no longer shifts scroll geometry under the reader.
+    static BODY_LINE_HEIGHT: Cell<i32> = const { Cell::new(0) };
+}
+
+/// The measured body line height, or a conservative floor while no body has
+/// been filled yet. The floor must underestimate (a too-large seed would pad
+/// short rows forever); any real monospace line is taller than 10px.
+fn body_line_height() -> i32 {
+    let height = BODY_LINE_HEIGHT.with(Cell::get);
+    if height > 0 { height } else { 10 }
 }
 
 impl MessageRow {
@@ -70,21 +88,111 @@ impl MessageRow {
 
     fn set_message(&self, mail: Rc<Mail>) {
         let imp = self.imp();
-        let view = imp.view.get().expect("MessageRow view built");
-        view.buffer().set_text(&mail.body);
-        highlight::refresh(&view.buffer());
 
-        let nav = imp.nav.get().expect("MessageRow nav set");
-        let composer = imp.composer.get().expect("MessageRow composer set");
-        let group = build_body_action_group(&mail, view, nav, composer);
-        self.insert_action_group("mailview", Some(&group));
-        imp.set_selection_actions_enabled(&group, view.buffer().has_selection());
-        *imp.group.borrow_mut() = Some(group);
+        // A rebound row (only possible past 205 messages) may still carry
+        // the previous message's body and actions; both belong to the fill.
+        if imp.filled.get() {
+            if let Some(view) = imp.view.get() {
+                view.buffer().set_text("");
+            }
+            imp.filled.set(false);
+            imp.highlighted.set(false);
+        }
+        if imp.group.borrow_mut().take().is_some() {
+            self.insert_action_group("mailview", None::<&gio::SimpleActionGroup>);
+        }
+        *imp.mail.borrow_mut() = Some(mail);
+
+        // Seed the row's height before the body text exists: one line-height
+        // per line plus the view's 24px of vertical margins.
+        imp.seed_unit.set(0);
+        self.reseed();
+    }
+
+    /// Apply the current line-height estimate to the seeded height. Cheap
+    /// no-op unless the estimate changed since the last seeding, so the fill
+    /// walk calls it on every row of every pass.
+    fn reseed(&self) {
+        let imp = self.imp();
+        let unit = body_line_height();
+        if imp.seed_unit.replace(unit) == unit {
+            return;
+        }
+        let Some(mail) = imp.mail.borrow().clone() else {
+            return;
+        };
+        let lines = mail.body.lines().count().max(1) as i32;
+        self.set_size_request(-1, lines.saturating_mul(unit).saturating_add(24));
+    }
+
+    fn is_filled(&self) -> bool {
+        self.imp().filled.get()
+    }
+
+    fn is_highlighted(&self) -> bool {
+        self.imp().highlighted.get()
+    }
+
+    /// Give the row its body text (or, on rebind, take the stale one back).
+    /// Rows fill once, from the warmup chain, and keep their body: the
+    /// seeded height (reseed) stands in exactly until then, so the fill
+    /// shifts nothing.
+    ///
+    /// Highlighting is deliberately NOT part of the fill — it costs as much
+    /// again and runs as its own chain step (apply_highlight) a frame later.
+    fn set_filled(&self, filled: bool) {
+        let imp = self.imp();
+        if imp.filled.get() == filled {
+            return;
+        }
+        let mail = imp.mail.borrow().clone();
+        let Some(mail) = mail else { return };
+        if filled {
+            let view = imp.ensure_view().clone();
+            view.buffer().set_text(&mail.body);
+
+            // First body anywhere: learn the real line height so every seed
+            // from here on is exact. Measured as the advance between a one-
+            // and a two-line layout, which is precisely what stacked plain
+            // lines occupy in the view.
+            if BODY_LINE_HEIGHT.with(Cell::get) == 0 {
+                let one = view.create_pango_layout(Some("Mg"));
+                let two = view.create_pango_layout(Some("Mg\nMg"));
+                let unit = two.pixel_size().1 - one.pixel_size().1;
+                if unit > 0 {
+                    BODY_LINE_HEIGHT.with(|cell| cell.set(unit));
+                }
+            }
+
+            let nav = imp.nav.get().expect("MessageRow nav set");
+            let composer = imp.composer.get().expect("MessageRow composer set");
+            let group = build_body_action_group(&mail, &view, nav, composer);
+            self.insert_action_group("mailview", Some(&group));
+            imp.set_selection_actions_enabled(&group, view.buffer().has_selection());
+            *imp.group.borrow_mut() = Some(group);
+        } else if let Some(view) = imp.view.get() {
+            view.buffer().set_text("");
+        }
+        imp.filled.set(filled);
+        imp.highlighted.set(false);
+    }
+
+    /// Colorize a filled body: quote levels, diff lines, headers. Runs as
+    /// its own fill-chain step so text and colors each get their own frame.
+    fn apply_highlight(&self) {
+        let imp = self.imp();
+        if !imp.filled.get() || imp.highlighted.get() {
+            return;
+        }
+        if let Some(view) = imp.view.get() {
+            highlight::refresh(&view.buffer());
+        }
+        imp.highlighted.set(true);
     }
 }
 
 mod imp {
-    use std::cell::{OnceCell, RefCell};
+    use std::cell::{Cell, OnceCell, RefCell};
     use std::rc::Rc;
 
     use adw::prelude::*;
@@ -115,6 +223,15 @@ mod imp {
         pub group: RefCell<Option<gio::SimpleActionGroup>>,
         pub nav: OnceCell<adw::NavigationView>,
         pub composer: OnceCell<composer::Composer>,
+        /// The currently bound message, filled into the buffer on demand.
+        pub(super) mail: RefCell<Option<Rc<super::Mail>>>,
+        /// Whether the buffer currently holds the bound message's body.
+        pub(super) filled: Cell<bool>,
+        /// Whether the filled body has had its highlight pass.
+        pub(super) highlighted: Cell<bool>,
+        /// The line-height the current seed was computed with, so reseed is
+        /// a cheap no-op while the estimate is unchanged.
+        pub(super) seed_unit: Cell<i32>,
     }
 
     #[glib::object_subclass]
@@ -125,11 +242,6 @@ mod imp {
     }
 
     impl ObjectImpl for MessageRow {
-        fn constructed(&self) {
-            self.parent_constructed();
-            self.build_ui();
-        }
-
         fn dispose(&self) {
             // The popover is parented to this row rather than to a child, so
             // it must be explicitly unparented before the row is finalized.
@@ -143,7 +255,14 @@ mod imp {
     impl BinImpl for MessageRow {}
 
     impl MessageRow {
-        fn build_ui(&self) {
+        /// Build the body widgetry on first use. GtkListView instantiates
+        /// every row of a small model at once, so none of this — TextView,
+        /// scroller, clamp, context menu — may exist until the row actually
+        /// gets a body to show.
+        pub(super) fn ensure_view(&self) -> &gtk::TextView {
+            if let Some(view) = self.view.get() {
+                return view;
+            }
             let view = gtk::TextView::builder()
                 .editable(false)
                 .cursor_visible(false)
@@ -214,6 +333,7 @@ mod imp {
 
             self.view.set(view).ok();
             self.popover.set(popover).ok();
+            self.view.get().expect("view just set")
         }
 
         pub fn set_selection_actions_enabled(
@@ -326,6 +446,104 @@ fn build_body_action_group(
         group.add_action(&action);
     }
     group
+}
+
+/// One step of warming the thread: give one more row its body text or its
+/// highlight colors, nearest to the viewport first, until every realized
+/// row is done. Rows are never emptied again — a freshly opened thread
+/// warms completely within a few seconds of idle time, and from then on
+/// scrolling costs nothing, anywhere. (Filling on demand instead was tried
+/// and stutters: GtkListView parks rows without geometry right outside the
+/// viewport, so "prefetch margins" cannot see them and every message
+/// boundary crossed while scrolling paid its fill right in the hot path.)
+///
+/// One action per call: the work runs from an idle chain, never inside the
+/// scroll machinery, and text and colors land in separate frames so neither
+/// step alone blows the frame budget.
+///
+/// `viewport_ready` reports whether every row currently intersecting the
+/// viewport is filled and highlighted — the reveal cover waits for that,
+/// not for the whole warmup.
+fn message_fill_step(
+    list_view: &gtk::ListView,
+    scrolled: &gtk::ScrolledWindow,
+    viewport_ready: &Cell<bool>,
+) -> bool {
+    let viewport_height = scrolled.height() as f32;
+    if viewport_height <= 0.0 {
+        return false;
+    }
+    let mut fill: Option<(f32, MessageRow)> = None;
+    let mut paint: Option<(f32, MessageRow)> = None;
+    let mut ready = true;
+    let mut child = list_view.first_child();
+    while let Some(item_widget) = child {
+        child = item_widget.next_sibling();
+        let Some(row) = item_widget.first_child().and_downcast::<MessageRow>() else {
+            continue;
+        };
+        // Keep every seed in step with the measured line height; exact
+        // seeds mean a fill does not move the rows below it.
+        row.reseed();
+        // GtkListView gives real geometry only to the tiles around the
+        // viewport; the rest of its realized children are parked with
+        // child-visible unset and stale bounds. Parked rows still have live
+        // widgets — warm them, just after everything with a known position.
+        let distance = if !item_widget.is_child_visible() {
+            f32::INFINITY
+        } else if let Some(bounds) = item_widget.compute_bounds(scrolled) {
+            // Zero-height bounds mean the row hasn't been laid out yet;
+            // its distance is unknown, not zero.
+            if bounds.height() <= 0.0 {
+                f32::INFINITY
+            } else if bounds.y() > viewport_height {
+                bounds.y() - viewport_height
+            } else if bounds.y() + bounds.height() < 0.0 {
+                -(bounds.y() + bounds.height())
+            } else {
+                0.0
+            }
+        } else {
+            f32::INFINITY
+        };
+        if !row.is_filled() {
+            if distance == 0.0 {
+                ready = false;
+            }
+            if fill.as_ref().is_none_or(|(nearest, _)| distance < *nearest) {
+                fill = Some((distance, row));
+            }
+        } else if !row.is_highlighted() {
+            if distance == 0.0 {
+                ready = false;
+            }
+            if paint.as_ref().is_none_or(|(nearest, _)| distance < *nearest) {
+                paint = Some((distance, row));
+            }
+        }
+    }
+    viewport_ready.set(ready);
+    // Whichever pending action is nearest goes first, so a visible row gets
+    // its colors before the warmup wanders off filling distant text.
+    match (fill, paint) {
+        (Some((fill_at, row)), Some((paint_at, paint_row))) => {
+            if paint_at < fill_at {
+                paint_row.apply_highlight();
+            } else {
+                row.set_filled(true);
+            }
+            true
+        }
+        (Some((_, row)), None) => {
+            row.set_filled(true);
+            true
+        }
+        (None, Some((_, row))) => {
+            row.apply_highlight();
+            true
+        }
+        (None, None) => false,
+    }
 }
 
 /// Parse an mboxrd thread into its messages, in file order (lore serves
@@ -601,7 +819,11 @@ fn spawn_thread_load(
     glib::spawn_future_local(async move {
         match lore::fetch_thread_mbox(&list, &message_id, &cancellable).await {
             Ok(mbox) => {
-                let thread = parse_thread(&mbox);
+                // Parsing a big thread (hundreds of MIME messages) takes long
+                // enough to stall the loading spinner; do it off-thread.
+                let thread = gio::spawn_blocking(move || parse_thread(&mbox))
+                    .await
+                    .unwrap_or_default();
                 if thread.is_empty() {
                     let error = lore::Error::Parse("the thread has no messages".to_string());
                     show_thread_error(&remote, &error, &split, &nav, &page, list, message_id);
@@ -644,7 +866,7 @@ fn build_thread_content(
     nav: &adw::NavigationView,
     thread: Vec<Mail>,
     list: &str,
-) -> gtk::Box {
+) -> gtk::Overlay {
     let op = &thread[0];
 
     let overlay = adw::ToastOverlay::new();
@@ -688,9 +910,11 @@ fn build_thread_content(
         .child(&title_row)
         .build();
 
-    // Message bodies render through a virtualized ListView so only the
-    // on-screen ones are realized and shaped by Pango — building every body
-    // up front stutters the load and holds gigabytes of text layout at once.
+    // Message bodies render through a ListView, but the virtualization that
+    // matters happens at the row level (update_message_fills): GtkListView
+    // itself keeps every row of a <=205-item model realized and bound, so
+    // for typical threads it recycles nothing. Rows are cheap shells; only
+    // the ones near the viewport hold (and Pango-shape) their body text.
     let model = gio::ListStore::new::<MessageObject>();
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(glib::clone!(
@@ -743,17 +967,92 @@ fn build_thread_content(
 
     let scrolled = gtk::ScrolledWindow::builder()
         .child(&list_view)
+        .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
         .build();
 
-    // TextView heights validate asynchronously, so for the first few frames
-    // every realized row measures near zero and the ListView packs the
-    // viewport with dozens of empty rows — a flash of bare separator lines.
-    // Keep the list covered by the same spinner RemoteContent's loading page
-    // shows (so the swap is invisible) until the geometry stops moving: the
-    // adjustment's upper bound holds steady once the visible rows have their
-    // real heights. The frame cap bounds the wait, like the old per-frame
-    // scroll re-align did.
+    // Background warmup. GtkListView keeps every row of a <=205-item model
+    // realized (a hardcoded widget window), so the expensive part — body
+    // text and highlighting — trickles in one row per idle, nearest to the
+    // viewport first, until the whole thread is warm; after that scrolling
+    // does no work at all. Filling from inside the adjustment signals would
+    // mutate layout mid-allocation, so the signals only (re)start the chain.
+    let chain_active = Rc::new(Cell::new(false));
+    // Set once every row intersecting the viewport is filled and painted;
+    // the reveal cover waits for it while the warmup continues behind.
+    let quiescent = Rc::new(Cell::new(false));
+    let start_chain = glib::clone!(
+        #[strong]
+        chain_active,
+        #[strong]
+        quiescent,
+        #[weak]
+        list_view,
+        #[weak]
+        scrolled,
+        move || {
+            if chain_active.replace(true) {
+                return;
+            }
+            let viewport_ready = Cell::new(false);
+            glib::idle_add_local(glib::clone!(
+                #[strong]
+                chain_active,
+                #[strong]
+                quiescent,
+                #[weak_allow_none]
+                list_view,
+                #[weak_allow_none]
+                scrolled,
+                move || {
+                    let (Some(list_view), Some(scrolled)) = (&list_view, &scrolled) else {
+                        chain_active.set(false);
+                        return glib::ControlFlow::Break;
+                    };
+                    let more = message_fill_step(list_view, scrolled, &viewport_ready);
+                    if viewport_ready.get() {
+                        quiescent.set(true);
+                    }
+                    if more {
+                        glib::ControlFlow::Continue
+                    } else {
+                        chain_active.set(false);
+                        glib::ControlFlow::Break
+                    }
+                }
+            ));
+        }
+    );
+    let vadjustment = scrolled.vadjustment();
+    vadjustment.connect_value_changed(glib::clone!(
+        #[strong]
+        start_chain,
+        move |_| start_chain()
+    ));
+    vadjustment.connect_changed(move |_| start_chain());
+
+    // The title stays pinned above the scrolling list rather than scrolling
+    // away with it, so the thread's favorite star and reply stay reachable.
+    let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    inner.append(&title_clamp);
+    inner.append(&scrolled);
+    overlay.set_child(Some(&inner));
+
+    // The composer sits below the scrolling mail body in a plain box, so it
+    // stays visible without living in a ToolbarView bottom bar (whose
+    // GtkWindowHandle wrapper would turn clicks and drags on the composer
+    // padding into window move/maximize gestures).
+    let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content_box.append(&overlay);
+    content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content_box.append(composer.widget());
+
+    // The rows fill (and their heights settle) over the first few frames
+    // after the reveal; showing the page during that would flash half-built
+    // rows. Keep the whole page behind a cover that looks exactly like
+    // RemoteContent's loading page (so the stack swap is invisible — the
+    // spinner just keeps spinning in place) until the fill chain reports the
+    // viewport quiescent, with a frame cap bounding the wait.
     let spinner = adw::Spinner::builder()
         .width_request(48)
         .height_request(48)
@@ -765,27 +1064,18 @@ fn build_thread_content(
         .css_classes(["background"])
         .child(&spinner)
         .build();
-    let cover_overlay = gtk::Overlay::builder().child(&scrolled).build();
-    cover_overlay.add_overlay(&cover);
+    let covered = gtk::Overlay::builder().child(&content_box).build();
+    covered.add_overlay(&cover);
 
-    let previous = Cell::new(f64::NAN);
-    let steady = Cell::new(0u32);
     let frames = Cell::new(0u32);
     scrolled.add_tick_callback(glib::clone!(
         #[weak]
         cover,
         #[upgrade_or]
         glib::ControlFlow::Break,
-        move |scrolled, _| {
-            let upper = scrolled.vadjustment().upper();
-            if (upper - previous.get()).abs() < 0.5 {
-                steady.set(steady.get() + 1);
-            } else {
-                steady.set(0);
-                previous.set(upper);
-            }
+        move |_, _| {
             frames.set(frames.get() + 1);
-            if steady.get() >= 3 || frames.get() >= 60 {
+            if quiescent.get() || frames.get() >= 60 {
                 cover.set_visible(false);
                 glib::ControlFlow::Break
             } else {
@@ -794,22 +1084,7 @@ fn build_thread_content(
         }
     ));
 
-    // The title stays pinned above the scrolling list rather than scrolling
-    // away with it, so the thread's favorite star and reply stay reachable.
-    let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    inner.append(&title_clamp);
-    inner.append(&cover_overlay);
-    overlay.set_child(Some(&inner));
-
-    // The composer sits below the scrolling mail body in a plain box, so it
-    // stays visible without living in a ToolbarView bottom bar (whose
-    // GtkWindowHandle wrapper would turn clicks and drags on the composer
-    // padding into window move/maximize gestures).
-    let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    content_box.append(&overlay);
-    content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    content_box.append(composer.widget());
-    content_box
+    covered
 }
 
 /// One row of the overview tree in depth-first display order.

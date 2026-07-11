@@ -2,12 +2,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 
 use crate::list_page::build_list_page;
 use crate::lore::{self, Sort, ThreadSummary};
 use crate::remote_page::RemoteContent;
-use crate::thread_page::build_thread_page;
+use crate::thread_page::{build_thread_page, launch_uri};
 
 #[derive(Clone)]
 enum Mode {
@@ -308,7 +308,61 @@ fn build_thread_row(thread: &ThreadSummary) -> adw::ActionRow {
     );
     row.add_suffix(&timestamp);
 
+    add_context_menu(&row, &thread.message_id);
+
     row
+}
+
+/// Give a thread row a secondary-click context menu with "Open on Web", which
+/// opens the thread's lore permalink in the default browser.
+fn add_context_menu(row: &adw::ActionRow, message_id: &str) {
+    // `message_id` arrives already stripped of angle brackets, but trim to be
+    // safe and match the /r/ redirect URL used in the message reading view.
+    let bare = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+    let url = format!("https://lore.kernel.org/r/{bare}/");
+
+    let open_web = gio::SimpleAction::new("open-web", None);
+    open_web.connect_activate(glib::clone!(
+        #[weak]
+        row,
+        move |_, _| launch_uri(&row, &url)
+    ));
+    let group = gio::SimpleActionGroup::new();
+    group.add_action(&open_web);
+
+    let menu = gio::Menu::new();
+    menu.append(Some("Open on _Web"), Some("menu.open-web"));
+
+    // The action group lives on the popover itself so the menu item resolves
+    // against it directly, rather than relying on the lookup walking up through
+    // the ActionRow's internals.
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(row);
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk::Align::Start);
+    popover.insert_action_group("menu", Some(&group));
+
+    // A stock ActionRow has no dispose hook, so unparent the popover when the
+    // row leaves the tree; doing it on the popover's own close would race the
+    // menu item's action and swallow the click.
+    row.connect_unrealize(glib::clone!(
+        #[strong]
+        popover,
+        move |_| popover.unparent()
+    ));
+
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gdk::BUTTON_SECONDARY);
+    gesture.connect_pressed(glib::clone!(
+        #[weak]
+        popover,
+        move |gesture, _, x, y| {
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            popover.popup();
+        }
+    ));
+    row.add_controller(gesture);
 }
 
 /// "Jul 3" for dates in the current year, "Jul 3 2019" otherwise.

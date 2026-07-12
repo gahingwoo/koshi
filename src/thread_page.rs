@@ -2384,7 +2384,6 @@ fn build_view_toggle() -> adw::ToggleGroup {
 
     let group = adw::ToggleGroup::builder()
         .valign(gtk::Align::Start)
-        .css_classes(["flat"])
         .build();
     group.add(single);
     group.add(threaded);

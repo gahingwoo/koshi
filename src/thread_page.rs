@@ -9,8 +9,8 @@ use mailparse::MailHeaderMap;
 
 use crate::composer;
 use crate::favorites::{self, Favorite};
-use crate::inbox_page::{apply_star_state, new_star_button};
 use crate::highlight;
+use crate::inbox_page::{apply_star_state, new_star_button};
 use crate::lore;
 use crate::remote_page::RemoteContent;
 
@@ -1025,6 +1025,46 @@ pub fn toggle_overview(page: &adw::NavigationPage) {
     }
 }
 
+/// Reveal and focus the find-in-thread bar of a thread page built by
+/// build_thread_page. A no-op until the thread has loaded (the bar lives
+/// inside the built content) or on pages that aren't thread pages — matching
+/// toggle_overview.
+pub fn start_thread_search(page: &adw::NavigationPage) {
+    let Some(split) = page.child().and_downcast::<adw::OverlaySplitView>() else {
+        return;
+    };
+    let Some(content) = split.content() else {
+        return;
+    };
+    let Some(bar) = find_descendant::<gtk::SearchBar>(&content) else {
+        return;
+    };
+    bar.set_search_mode(true);
+    if let Some(entry) = find_descendant::<gtk::SearchEntry>(&bar) {
+        entry.grab_focus();
+        // Select any existing query so the next keystroke replaces it, like a
+        // second Ctrl+F in an editor.
+        entry.select_region(0, -1);
+    }
+}
+
+/// First descendant of `root` that is a `T`, depth-first. Used to reach the
+/// find bar (and its entry) from the thread page without threading a handle
+/// back out through the async content build.
+fn find_descendant<T: glib::prelude::IsA<gtk::Widget>>(root: &impl IsA<gtk::Widget>) -> Option<T> {
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if let Ok(found) = widget.clone().downcast::<T>() {
+            return Some(found);
+        }
+        if let Some(found) = find_descendant::<T>(&widget) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn spawn_thread_load(
     remote: RemoteContent,
     split: adw::OverlaySplitView,
@@ -1498,10 +1538,16 @@ fn build_thread_content(
     ));
     vadjustment.connect_changed(move |_| start_chain());
 
+    // The find bar (Ctrl+F) is pinned under the title and reveals over the
+    // list; it draws from the same shared message Rcs, so it needs no copy of
+    // the thread.
+    let search_bar = build_thread_search(&list_view, &view_toggle, Rc::new(mails.clone()), opened);
+
     // The title stays pinned above the scrolling list rather than scrolling
     // away with it, so the subject and view toggle stay reachable.
     let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
     inner.append(&title_clamp);
+    inner.append(&search_bar);
     inner.append(&pane);
     overlay.set_child(Some(&inner));
 
@@ -1893,6 +1939,480 @@ fn message_at_viewport_top(list_view: &gtk::ListView, mails: &[Rc<Mail>]) -> Opt
         }
     }
     fallback.map(|(_, index)| index)
+}
+
+/// One find-in-thread hit: a character range within message `msg`'s body.
+/// Offsets index characters, so they map straight onto that body's buffer.
+#[derive(Clone, Copy)]
+struct SearchMatch {
+    msg: usize,
+    start: i32,
+    end: i32,
+}
+
+/// Length-preserving lowercase fold: takes the first char of a char's Unicode
+/// lowercasing. Nearly every mapping is one-to-one (Latin, Cyrillic, Greek),
+/// so a match at folded index i is at character i of the original body; the
+/// rare one-to-many folds (ß) are approximated rather than skewing offsets.
+fn fold_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+fn fold_query(query: &str) -> Vec<char> {
+    query.chars().map(fold_char).collect()
+}
+
+/// Character-offset ranges of every case-insensitive, non-overlapping
+/// occurrence of `needle` (already folded by fold_query) in `body`.
+fn body_matches(body: &str, needle: &[char]) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    if needle.is_empty() {
+        return out;
+    }
+    let hay: Vec<char> = body.chars().map(fold_char).collect();
+    if needle.len() > hay.len() {
+        return out;
+    }
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()] == *needle {
+            out.push((i as i32, (i + needle.len()) as i32));
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The realized MessageRow currently holding `mail`, parked or not — so search
+/// can tag or clear its buffer even when the row is off-screen (its TextView
+/// persists once built). For a <=205-message thread every row stays realized.
+fn realized_message_row(list_view: &gtk::ListView, mail: &Rc<Mail>) -> Option<MessageRow> {
+    let mut child = list_view.first_child();
+    while let Some(item_widget) = child {
+        child = item_widget.next_sibling();
+        if let Some(row) = item_widget.first_child().and_downcast::<MessageRow>()
+            && row.holds(mail)
+        {
+            return Some(row);
+        }
+    }
+    None
+}
+
+/// The viewport y (0 = top of the visible area) of the match starting at
+/// `offset` in `view`'s buffer, or None while the row isn't laid out. The
+/// ListView is the scrollable, so coordinates relative to it are viewport
+/// coordinates — the same frame jump_to_message nudges the vadjustment in.
+fn match_viewport_y(list_view: &gtk::ListView, view: &gtk::TextView, offset: i32) -> Option<f64> {
+    let iter = view.buffer().iter_at_offset(offset);
+    let location = view.iter_location(&iter);
+    let (_, widget_y) = view.buffer_to_window_coords(gtk::TextWindowType::Widget, 0, location.y());
+    let point = view.compute_point(list_view, &gtk::graphene::Point::new(0.0, widget_y as f32))?;
+    Some(f64::from(point.y()))
+}
+
+/// Drop every realized row's search highlight. Only rows near the viewport
+/// hold a built TextView, and past 205 messages rows recycle, so this walks
+/// the realized set rather than the model.
+fn clear_all_search_highlight(list_view: &gtk::ListView) {
+    let mut child = list_view.first_child();
+    while let Some(item_widget) = child {
+        child = item_widget.next_sibling();
+        if let Some(row) = item_widget.first_child().and_downcast::<MessageRow>()
+            && let Some(view) = row.imp().view.get()
+        {
+            highlight::clear_search(&view.buffer());
+        }
+    }
+}
+
+/// Bring a search match into view: scroll_to the message's row (the only
+/// primitive that reaches a parked row), fill it if the warmup hasn't yet,
+/// paint its matches, then nudge the scroller so the match sits a little below
+/// the top. Same tick-loop shape as jump_to_message — the generation counter
+/// lets a newer match supersede a running scroll, and the frame cap bounds it.
+fn scroll_to_match(
+    list_view: &gtk::ListView,
+    position: u32,
+    mail: Rc<Mail>,
+    offset: i32,
+    ranges: Rc<Vec<(i32, i32)>>,
+    current_local: usize,
+    generation: &Rc<Cell<u64>>,
+) {
+    let this_jump = generation.get().wrapping_add(1);
+    generation.set(this_jump);
+    list_view.scroll_to(position, gtk::ListScrollFlags::NONE, None);
+
+    let generation = generation.clone();
+    let applied = Cell::new(false);
+    let steady = Cell::new(0u32);
+    let frames = Cell::new(0u32);
+    list_view.add_tick_callback(move |list_view, _| {
+        if generation.get() != this_jump {
+            return glib::ControlFlow::Break;
+        }
+        frames.set(frames.get() + 1);
+        let Some(scrolled) = list_view
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_downcast::<gtk::ScrolledWindow>()
+        else {
+            return glib::ControlFlow::Break;
+        };
+        if let Some(row) = realized_message_row(list_view, &mail) {
+            // The warmup may not have reached this row; force its body in so
+            // the match has text (and geometry) to scroll to.
+            if !row.is_filled() {
+                row.set_filled(true);
+            }
+            if let Some(view) = row.imp().view.get() {
+                if !applied.replace(true) {
+                    highlight::mark_search(&view.buffer(), &ranges, Some(current_local));
+                }
+                // None until the freshly filled row has laid out; keep waiting
+                // within the frame budget.
+                if let Some(y) = match_viewport_y(list_view, view, offset) {
+                    let vadjustment = scrolled.vadjustment();
+                    // Leave a margin so the match clears the pinned find bar
+                    // and reads as "in context", not glued to the top edge.
+                    let margin = 72.0;
+                    let max =
+                        (vadjustment.upper() - vadjustment.page_size()).max(vadjustment.lower());
+                    let desired =
+                        (vadjustment.value() + y - margin).clamp(vadjustment.lower(), max);
+                    if (desired - vadjustment.value()).abs() < 0.5 {
+                        steady.set(steady.get() + 1);
+                        if steady.get() >= 3 {
+                            return glib::ControlFlow::Break;
+                        }
+                    } else {
+                        steady.set(0);
+                        vadjustment.set_value(desired);
+                    }
+                }
+            }
+        }
+        if frames.get() >= 90 {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// The find-in-thread bar: a search entry with a match counter, prev/next
+/// buttons, and a scope toggle (this message vs the whole thread). Revealed by
+/// Ctrl+F (start_thread_search); Enter / Shift+Enter (and Ctrl+G / Ctrl+Shift+G)
+/// step through matches, Escape closes it.
+///
+/// Matches are found in the raw body strings — no need to have filled every
+/// row's TextView — so the counter is exact across the whole thread; the hit
+/// itself is painted only in the message it lands in, when the scroll fills
+/// that row. Whole-thread scope reaches messages the single view can't show,
+/// so selecting a hit outside the opened message flips to threaded view first.
+fn build_thread_search(
+    list_view: &gtk::ListView,
+    view_toggle: &adw::ToggleGroup,
+    mails: Rc<Vec<Rc<Mail>>>,
+    opened: usize,
+) -> gtk::SearchBar {
+    let opened = opened.min(mails.len().saturating_sub(1));
+
+    let entry = gtk::SearchEntry::builder()
+        .placeholder_text("Find in thread")
+        .hexpand(true)
+        .build();
+    let count_label = gtk::Label::builder()
+        .css_classes(["dim-label", "numeric"])
+        .width_chars(10)
+        .xalign(1.0)
+        .build();
+
+    let prev_button = gtk::Button::builder()
+        .icon_name("go-up-symbolic")
+        .tooltip_text("Previous match (Shift+Enter)")
+        .build();
+    let next_button = gtk::Button::builder()
+        .icon_name("go-down-symbolic")
+        .tooltip_text("Next match (Enter)")
+        .build();
+    let nav_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .css_classes(["linked"])
+        .build();
+    nav_box.append(&prev_button);
+    nav_box.append(&next_button);
+
+    let scope = adw::ToggleGroup::builder().css_classes(["flat"]).build();
+    scope.add(
+        adw::Toggle::builder()
+            .label("Message")
+            .tooltip("Search the message you're reading")
+            .build(),
+    );
+    scope.add(
+        adw::Toggle::builder()
+            .label("Thread")
+            .tooltip("Search every message in the thread")
+            .build(),
+    );
+    scope.set_active(0);
+
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .build();
+    row.append(&entry);
+    row.append(&count_label);
+    row.append(&nav_box);
+    row.append(&scope);
+    let clamp = adw::Clamp::builder()
+        .maximum_size(1100)
+        .tightening_threshold(800)
+        .child(&row)
+        .build();
+    let search_bar = gtk::SearchBar::builder().child(&clamp).build();
+    search_bar.connect_entry(&entry);
+
+    let matches: Rc<RefCell<Vec<SearchMatch>>> = Rc::new(RefCell::new(Vec::new()));
+    let current: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
+    let anchor: Rc<Cell<usize>> = Rc::new(Cell::new(opened));
+    let generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+
+    // Move to the match at `index`: flip to threaded view if the hit lives
+    // outside the opened message, clear stale highlights, then paint and scroll
+    // to it. Reads the target message's own matches so every hit in it lights
+    // up, with the current one distinct.
+    let select: Rc<dyn Fn(usize)> = Rc::new(glib::clone!(
+        #[weak]
+        list_view,
+        #[weak]
+        view_toggle,
+        #[weak]
+        count_label,
+        #[strong]
+        matches,
+        #[strong]
+        current,
+        #[strong]
+        mails,
+        #[strong]
+        generation,
+        move |index: usize| {
+            let matches_ref = matches.borrow();
+            let Some(hit) = matches_ref.get(index).copied() else {
+                return;
+            };
+            let total = matches_ref.len();
+            let mut ranges = Vec::new();
+            let mut current_local = 0;
+            for other in matches_ref.iter().filter(|m| m.msg == hit.msg) {
+                if other.start == hit.start && other.end == hit.end {
+                    current_local = ranges.len();
+                }
+                ranges.push((other.start, other.end));
+            }
+            drop(matches_ref);
+
+            current.set(Some(index));
+            count_label.set_text(&format!("{} of {}", index + 1, total));
+
+            let position = if view_toggle.active() == 0 && hit.msg != opened {
+                // Single view holds only the opened message; the whole-thread
+                // hit needs the threaded model under the ListView first.
+                view_toggle.set_active(1);
+                hit.msg as u32
+            } else if view_toggle.active() == 0 {
+                0
+            } else {
+                hit.msg as u32
+            };
+
+            clear_all_search_highlight(&list_view);
+            scroll_to_match(
+                &list_view,
+                position,
+                mails[hit.msg].clone(),
+                hit.start,
+                Rc::new(ranges),
+                current_local,
+                &generation,
+            );
+        }
+    ));
+
+    // Rebuild the match set for the current query and scope, refresh the
+    // counter, and land on the nearest hit. Runs on every keystroke and on
+    // scope/open changes.
+    let recompute: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        entry,
+        #[weak]
+        scope,
+        #[weak]
+        list_view,
+        #[weak]
+        view_toggle,
+        #[weak]
+        count_label,
+        #[weak]
+        prev_button,
+        #[weak]
+        next_button,
+        #[strong]
+        matches,
+        #[strong]
+        current,
+        #[strong]
+        anchor,
+        #[strong]
+        mails,
+        #[strong]
+        select,
+        move || {
+            let query = entry.text().to_string();
+            let needle = fold_query(&query);
+            let thread_scope = scope.active() == 1;
+
+            // The "this message" anchor tracks where the reader is: the opened
+            // message in single view, the one at the viewport top in threaded.
+            if !thread_scope {
+                let here = if view_toggle.active() == 0 {
+                    opened
+                } else {
+                    message_at_viewport_top(&list_view, &mails).unwrap_or_else(|| anchor.get())
+                };
+                anchor.set(here);
+            }
+
+            let indices: Vec<usize> = if thread_scope {
+                (0..mails.len()).collect()
+            } else {
+                vec![anchor.get()]
+            };
+            let mut found = Vec::new();
+            if !needle.is_empty() {
+                for &msg in &indices {
+                    for (start, end) in body_matches(&mails[msg].body, &needle) {
+                        found.push(SearchMatch { msg, start, end });
+                    }
+                }
+            }
+            let total = found.len();
+            *matches.borrow_mut() = found;
+            current.set(None);
+            prev_button.set_sensitive(total > 0);
+            next_button.set_sensitive(total > 0);
+
+            if query.is_empty() {
+                count_label.set_text("");
+                clear_all_search_highlight(&list_view);
+            } else if total == 0 {
+                count_label.set_text("No results");
+                clear_all_search_highlight(&list_view);
+            } else {
+                // Land on the first hit at or after the anchor message, so
+                // find-as-you-type jumps to the nearest match ahead.
+                let anchor_msg = anchor.get();
+                let start_at = matches
+                    .borrow()
+                    .iter()
+                    .position(|m| m.msg >= anchor_msg)
+                    .unwrap_or(0);
+                select(start_at);
+            }
+        }
+    ));
+
+    // Wrap-around step through the matches.
+    let step: Rc<dyn Fn(i64)> = Rc::new(glib::clone!(
+        #[strong]
+        matches,
+        #[strong]
+        current,
+        #[strong]
+        select,
+        move |delta: i64| {
+            let total = matches.borrow().len() as i64;
+            if total == 0 {
+                return;
+            }
+            let from = current.get().map_or(0, |c| c as i64);
+            let to = (from + delta).rem_euclid(total) as usize;
+            select(to);
+        }
+    ));
+
+    entry.connect_search_changed(glib::clone!(
+        #[strong]
+        recompute,
+        move |_| recompute()
+    ));
+    entry.connect_activate(glib::clone!(
+        #[strong]
+        step,
+        move |_| step(1)
+    ));
+    entry.connect_next_match(glib::clone!(
+        #[strong]
+        step,
+        move |_| step(1)
+    ));
+    entry.connect_previous_match(glib::clone!(
+        #[strong]
+        step,
+        move |_| step(-1)
+    ));
+    next_button.connect_clicked(glib::clone!(
+        #[strong]
+        step,
+        move |_| step(1)
+    ));
+    prev_button.connect_clicked(glib::clone!(
+        #[strong]
+        step,
+        move |_| step(-1)
+    ));
+
+    scope.connect_active_notify(glib::clone!(
+        #[weak]
+        view_toggle,
+        #[strong]
+        recompute,
+        move |scope| {
+            // Whole-thread search must be able to reach every message, which
+            // only the threaded model exposes.
+            if scope.active() == 1 && view_toggle.active() == 0 {
+                view_toggle.set_active(1);
+            }
+            recompute();
+        }
+    ));
+
+    entry.connect_stop_search(glib::clone!(
+        #[weak]
+        search_bar,
+        move |_| search_bar.set_search_mode(false)
+    ));
+    // Opening captures the current reading position as the anchor and searches
+    // any leftover text; closing drops the highlight.
+    search_bar.connect_search_mode_enabled_notify(glib::clone!(
+        #[weak]
+        list_view,
+        #[strong]
+        recompute,
+        move |bar| {
+            if bar.is_search_mode() {
+                recompute();
+            } else {
+                clear_all_search_highlight(&list_view);
+            }
+        }
+    ));
+
+    search_bar
 }
 
 /// The overview sidebar: a heading over one activatable row per message,
@@ -3031,5 +3551,31 @@ mod tests {
             strip_rfc5322_comments(r#""quoted (not comment)" <a@b.com>"#),
             r#""quoted (not comment)" <a@b.com>"#
         );
+    }
+
+    #[test]
+    fn body_matches_are_case_insensitive_and_non_overlapping() {
+        let ranges = body_matches("Fix the Frobnicator, frob it.", &fold_query("frob"));
+        // "Frob" at char 8 and "frob" at char 21, ignoring case.
+        assert_eq!(ranges, [(8, 12), (21, 25)]);
+
+        // Overlapping needle only matches once per stride.
+        assert_eq!(body_matches("aaaa", &fold_query("aa")), [(0, 2), (2, 4)]);
+
+        // An empty query and a no-hit query both yield nothing.
+        assert!(body_matches("anything", &fold_query("")).is_empty());
+        assert!(body_matches("anything", &fold_query("zzz")).is_empty());
+    }
+
+    #[test]
+    fn body_matches_offsets_count_characters_not_bytes() {
+        // A multi-byte char before the hit must not shift its character offset:
+        // "é" is two bytes but one character, so "beta" starts at char 5.
+        let ranges = body_matches("café beta", &fold_query("beta"));
+        assert_eq!(ranges, [(5, 9)]);
+
+        // Case folding on non-ASCII stays one-to-one, keeping offsets aligned.
+        let ranges = body_matches("Straße ödipus", &fold_query("Ödipus"));
+        assert_eq!(ranges, [(7, 13)]);
     }
 }

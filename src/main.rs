@@ -22,7 +22,7 @@ use favorites_page::{FAVORITES_PAGE_NAME, build_favorites_page};
 use inbox_page::{INBOX_LIST_TITLE, build_inbox_page};
 use profile_menu::build_profile_button;
 use thread_list_page::{build_search_page, build_thread_list_page};
-use thread_page::{THREAD_PAGE_NAME, build_thread_page, toggle_overview};
+use thread_page::{THREAD_PAGE_NAME, build_thread_page, start_thread_search, toggle_overview};
 
 const APP_ID: &str = "moe.nikableh.Koshi";
 
@@ -104,6 +104,18 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
         }
     ));
 
+    let find_in_thread = gio::SimpleAction::new("find-in-thread", None);
+    find_in_thread.set_enabled(false);
+    find_in_thread.connect_activate(glib::clone!(
+        #[weak]
+        tab_view,
+        move |_, _| {
+            if let Some(page) = selected_nav(&tab_view).and_then(|nav| nav.visible_page()) {
+                start_thread_search(&page);
+            }
+        }
+    ));
+
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&build_header_bar(
         &search_entry,
@@ -129,10 +141,14 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
         go_back,
         #[strong]
         thread_overview,
+        #[strong]
+        find_in_thread,
         move |view| {
             let nav = selected_nav(view);
             go_back.set_enabled(nav.as_ref().is_some_and(nav_can_pop));
-            thread_overview.set_enabled(nav.as_ref().is_some_and(nav_shows_thread));
+            let on_thread = nav.as_ref().is_some_and(nav_shows_thread);
+            thread_overview.set_enabled(on_thread);
+            find_in_thread.set_enabled(on_thread);
         }
     ));
 
@@ -160,6 +176,7 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
 
     window.add_action(&go_back);
     window.add_action(&thread_overview);
+    window.add_action(&find_in_thread);
 
     // Ctrl-W closes the current tab; on the last tab there is nothing left to
     // fall back to, so it closes the window (quitting the app with it).
@@ -518,11 +535,18 @@ fn update_go_back_action(nav: &adw::NavigationView) {
     {
         action.set_enabled(nav_can_pop(nav));
     }
+    let on_thread = nav_shows_thread(nav);
     if let Some(action) = window
         .lookup_action("toggle-thread-overview")
         .and_downcast::<gio::SimpleAction>()
     {
-        action.set_enabled(nav_shows_thread(nav));
+        action.set_enabled(on_thread);
+    }
+    if let Some(action) = window
+        .lookup_action("find-in-thread")
+        .and_downcast::<gio::SimpleAction>()
+    {
+        action.set_enabled(on_thread);
     }
 }
 
@@ -671,6 +695,7 @@ fn setup_actions(
     app.set_accels_for_action("win.focus-search", &["<Control>l"]);
     app.set_accels_for_action("win.close-tab", &["<Control>w"]);
     app.set_accels_for_action("win.toggle-thread-overview", &["F9"]);
+    app.set_accels_for_action("win.find-in-thread", &["<Control>f"]);
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
     app.set_accels_for_action("app.shortcuts", &["<Control>question"]);
     app.set_accels_for_action("app.quit", &["<Control>q"]);
@@ -701,6 +726,10 @@ fn show_shortcuts(app: &adw::Application) {
     section.add(adw::ShortcutsItem::from_action(
         "Thread overview",
         "win.toggle-thread-overview",
+    ));
+    section.add(adw::ShortcutsItem::from_action(
+        "Find in thread",
+        "win.find-in-thread",
     ));
     section.add(adw::ShortcutsItem::from_action(
         "Preferences",

@@ -262,6 +262,14 @@ const ALL_TAGS: [&str; 6] = [
     QUOTE_TAG, ADD_TAG, REMOVE_TAG, HUNK_TAG, HEADER_TAG, META_TAG,
 ];
 
+/// Find-in-thread highlight tags. Deliberately kept out of ALL_TAGS: the
+/// quote/diff refresh must not strip them, and they paint a background (not a
+/// foreground), so a match keeps its line's quote/diff coloring underneath.
+/// The current-match tag is created after the plain match tag so it wins where
+/// they overlap (tag priority defaults to creation order).
+const SEARCH_TAG: &str = "koshi-search";
+const SEARCH_CURRENT_TAG: &str = "koshi-search-current";
+
 /// GNOME palette colors per scheme: quote, then add, remove, hunk, header,
 /// meta.
 struct Palette {
@@ -271,6 +279,9 @@ struct Palette {
     hunk: &'static str,
     header: &'static str,
     meta: &'static str,
+    /// Backgrounds for the search match and the current search match.
+    search: &'static str,
+    search_current: &'static str,
 }
 
 const LIGHT: Palette = Palette {
@@ -280,6 +291,8 @@ const LIGHT: Palette = Palette {
     hunk: "#1a5fb4",
     header: "#813d9c",
     meta: "#5e5c64",
+    search: "#f9f06b",
+    search_current: "#ffbe6f",
 };
 
 const DARK: Palette = Palette {
@@ -289,6 +302,8 @@ const DARK: Palette = Palette {
     hunk: "#62a0ea",
     header: "#c061cb",
     meta: "#9a9996",
+    search: "#665c00",
+    search_current: "#a15d00",
 };
 
 fn tag_name(kind: Kind) -> &'static str {
@@ -316,6 +331,9 @@ pub fn attach(buffer: &gtk::TextBuffer) {
     }
     for name in [HUNK_TAG, HEADER_TAG] {
         buffer.create_tag(Some(name), &[("weight", &700i32)]);
+    }
+    for name in [SEARCH_TAG, SEARCH_CURRENT_TAG] {
+        buffer.create_tag(Some(name), &[]);
     }
 
     let style = adw::StyleManager::default();
@@ -355,6 +373,53 @@ fn apply_colors(buffer: &gtk::TextBuffer, dark: bool) {
         if let Some(tag) = table.lookup(name) {
             let rgba = gdk::RGBA::parse(hex).expect("palette hex is valid");
             tag.set_property("foreground-rgba", rgba);
+        }
+    }
+    // Search tags carry a background rather than a foreground.
+    for (name, hex) in [
+        (SEARCH_TAG, palette.search),
+        (SEARCH_CURRENT_TAG, palette.search_current),
+    ] {
+        if let Some(tag) = table.lookup(name) {
+            let rgba = gdk::RGBA::parse(hex).expect("palette hex is valid");
+            tag.set_property("background-rgba", rgba);
+        }
+    }
+}
+
+/// Paint find-in-thread matches over a body buffer: every `ranges` entry gets
+/// the match background, and the entry at `current` (if any) the stronger
+/// current-match background on top. Any previous search highlight is cleared
+/// first. Offsets are character offsets, the same addressing classify uses.
+pub fn mark_search(buffer: &gtk::TextBuffer, ranges: &[(i32, i32)], current: Option<usize>) {
+    clear_search(buffer);
+    let table = buffer.tag_table();
+    let (Some(match_tag), Some(current_tag)) =
+        (table.lookup(SEARCH_TAG), table.lookup(SEARCH_CURRENT_TAG))
+    else {
+        return;
+    };
+    for &(start, end) in ranges {
+        let from = buffer.iter_at_offset(start);
+        let to = buffer.iter_at_offset(end);
+        buffer.apply_tag(&match_tag, &from, &to);
+    }
+    if let Some(idx) = current
+        && let Some(&(start, end)) = ranges.get(idx)
+    {
+        let from = buffer.iter_at_offset(start);
+        let to = buffer.iter_at_offset(end);
+        buffer.apply_tag(&current_tag, &from, &to);
+    }
+}
+
+/// Drop any find-in-thread highlight from a body buffer.
+pub fn clear_search(buffer: &gtk::TextBuffer) {
+    let (start, end) = buffer.bounds();
+    let table = buffer.tag_table();
+    for name in [SEARCH_TAG, SEARCH_CURRENT_TAG] {
+        if let Some(tag) = table.lookup(name) {
+            buffer.remove_tag(&tag, &start, &end);
         }
     }
 }

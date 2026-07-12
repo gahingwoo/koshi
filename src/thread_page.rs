@@ -1273,11 +1273,12 @@ fn build_thread_content(
         .margin_start(12)
         .margin_end(12)
         .build();
+    // An empty hexpanding filler pushes the controls to the trailing edge now
+    // that no subject label spans the row; Reply and the star sit just left of
+    // the view toggle.
+    title_row.append(&gtk::Box::builder().hexpand(true).build());
     title_row.append(&reply_button);
     title_row.append(&star_button);
-    // An empty hexpanding filler pushes the view toggle to the trailing edge
-    // now that no subject label spans the row.
-    title_row.append(&gtk::Box::builder().hexpand(true).build());
     title_row.append(&view_toggle);
     // Match the bodies' reading width so the row lines up with them.
     let title_clamp = adw::Clamp::builder()

@@ -233,20 +233,20 @@ fn assemble_raw(to: &str, cc: &str, subject: &str, in_reply_to: &str, body: &str
     raw
 }
 
-/// A handle to a built composer: the clamped widget to insert into the
+/// A handle to a built composer: the bottom-bar widget to insert into the
 /// page, plus the hooks a per-mail Reply button needs to retarget the
 /// draft at another message in the thread.
 #[derive(Clone)]
 pub struct Composer {
-    widget: adw::Clamp,
+    widget: gtk::Box,
     state: ComposerState,
-    expander: adw::ExpanderRow,
+    expand_toggle: gtk::ToggleButton,
     body_view: gtk::TextView,
     preview_toggle: gtk::ToggleButton,
 }
 
 impl Composer {
-    pub fn widget(&self) -> &adw::Clamp {
+    pub fn widget(&self) -> &gtk::Box {
         &self.widget
     }
 
@@ -255,7 +255,7 @@ impl Composer {
     /// shown and focused.
     pub fn start_reply(&self, reply: ReplyContext) {
         self.state.retarget(reply);
-        self.expander.set_expanded(true);
+        self.expand_toggle.set_active(true);
         // Leave an active Raw Preview: replying means editing, and the
         // focus grab below only lands once the editor page is mapped.
         self.preview_toggle.set_active(false);
@@ -279,7 +279,7 @@ impl Composer {
         buffer.insert(&mut iter, &text);
         buffer.place_cursor(&iter);
 
-        self.expander.set_expanded(true);
+        self.expand_toggle.set_active(true);
         self.preview_toggle.set_active(false);
         self.body_view.grab_focus();
         // Bring the cursor into view once the editor has a real allocation:
@@ -296,8 +296,11 @@ impl Composer {
     }
 }
 
-/// Build the sticky reply composer, clamped to the same width as the mail
-/// page content so the two columns align.
+/// Build the reply composer: one click-anywhere bar that is the bottom bar
+/// when collapsed and the editor's header when open, toggling the editor
+/// either way with a chevron that flips to match. The bar's label and the
+/// open editor are clamped to the mail page's reading width so they line up
+/// with the message column.
 pub fn build_composer(reply: ReplyContext) -> Composer {
     let state = ComposerState::new(reply);
 
@@ -422,12 +425,9 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         .margin_end(12)
         .build();
 
-    // The composer collapses into a single "Reply" expander row; expanding
-    // it reveals the editor and Discard folds it back shut. The row lives
-    // in its own boxed-list ListBox because an ExpanderRow needs a list
-    // around it for its .card styling and click handling.
-    let expander = adw::ExpanderRow::builder().title("Reply").build();
-    expander.add_prefix(&gtk::Image::from_icon_name("mail-reply-sender-symbolic"));
+    // Expansion state lives on a headless toggle so start_reply/insert_quote/
+    // Discard can flip it directly; the header bar below binds to it.
+    let expand_toggle = gtk::ToggleButton::new();
 
     // The subject row is a one-row grid sharing the headers grid's column
     // spacing, with its label in the same SizeGroup: the label column and
@@ -452,7 +452,7 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         &state,
         &details_toggle,
         &preview_toggle,
-        &expander,
+        &expand_toggle,
     ));
     subject_grid.attach(&toolbar, 2, 0, 1, 1);
 
@@ -460,47 +460,96 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
     root.append(&revealer);
     root.append(&stack);
 
-    // Wrap the content in an explicit non-activatable row: add_row would
-    // otherwise auto-wrap the box in a default GtkListBoxRow, giving the
-    // whole editor list-row hover and press styling.
-    let content_row = gtk::ListBoxRow::builder()
-        .activatable(false)
-        .selectable(false)
+    // The open editor keeps the mail column's reading width so its fields
+    // line up with the message bodies above it.
+    let editor_clamp = adw::Clamp::builder()
+        .maximum_size(1100)
+        .tightening_threshold(800)
         .child(&root)
         .build();
-    expander.add_row(&content_row);
-    // Focus the body whenever the row is expanded by hand, mirroring what
-    // start_reply does for the per-mail Reply buttons.
-    expander.connect_expanded_notify(glib::clone!(
+    let editor_revealer = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideUp)
+        .child(&editor_clamp)
+        .build();
+
+    // One full-width flat button is the whole composer's face: the bottom
+    // bar when collapsed, the editor's header when open. A click anywhere on
+    // it toggles the editor, and the chevron flips to show which way it
+    // goes. Its icon and label sit in the same reading-width clamp as the
+    // thread, so they line up with the message column rather than hugging
+    // the window edge.
+    let chevron = gtk::Image::from_icon_name("pan-up-symbolic");
+    let header_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_top(9)
+        .margin_bottom(9)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    header_content.append(&gtk::Image::from_icon_name("mail-reply-sender-symbolic"));
+    header_content.append(
+        &gtk::Label::builder()
+            .label("Reply")
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .xalign(0.0)
+            .build(),
+    );
+    header_content.append(&chevron);
+    let header_clamp = adw::Clamp::builder()
+        .maximum_size(1100)
+        .tightening_threshold(800)
+        .hexpand(true)
+        .child(&header_content)
+        .build();
+    let header_bar = gtk::Button::builder()
+        .css_classes(["flat"])
+        .tooltip_text("Expand")
+        .child(&header_clamp)
+        .build();
+    header_bar.connect_clicked(glib::clone!(
+        #[weak]
+        expand_toggle,
+        move |_| expand_toggle.set_active(!expand_toggle.is_active())
+    ));
+
+    // The one switch reveals the editor, flips the chevron and retitles the
+    // bar; opening also focuses the body, mirroring what start_reply does
+    // for per-mail Reply buttons.
+    expand_toggle
+        .bind_property("active", &editor_revealer, "reveal-child")
+        .sync_create()
+        .build();
+    expand_toggle.connect_toggled(glib::clone!(
         #[weak]
         body_view,
-        move |expander| {
-            if expander.is_expanded() {
+        #[weak]
+        chevron,
+        #[weak]
+        header_bar,
+        move |toggle| {
+            let open = toggle.is_active();
+            chevron.set_icon_name(Some(if open {
+                "pan-down-symbolic"
+            } else {
+                "pan-up-symbolic"
+            }));
+            header_bar.set_tooltip_text(Some(if open { "Collapse" } else { "Expand" }));
+            if open {
                 body_view.grab_focus();
             }
         }
     ));
 
-    let list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .margin_top(6)
-        .margin_bottom(6)
-        .margin_start(12)
-        .margin_end(12)
-        .css_classes(["boxed-list"])
-        .build();
-    list.append(&expander);
-
-    let widget = adw::Clamp::builder()
-        .maximum_size(1100)
-        .tightening_threshold(800)
-        .child(&list)
-        .build();
+    let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    widget.append(&header_bar);
+    widget.append(&editor_revealer);
 
     Composer {
         widget,
         state,
-        expander,
+        expand_toggle,
         body_view,
         preview_toggle,
     }
@@ -768,7 +817,7 @@ fn build_discard_button(
     state: &ComposerState,
     details_toggle: &gtk::ToggleButton,
     preview_toggle: &gtk::ToggleButton,
-    expander: &adw::ExpanderRow,
+    expand_toggle: &gtk::ToggleButton,
 ) -> gtk::Button {
     let button = gtk::Button::builder()
         .icon_name("user-trash-symbolic")
@@ -784,7 +833,7 @@ fn build_discard_button(
         #[weak]
         preview_toggle,
         #[weak]
-        expander,
+        expand_toggle,
         move |button| {
             let dialog = adw::AlertDialog::new(
                 Some("Discard Draft?"),
@@ -804,12 +853,12 @@ fn build_discard_button(
                     #[weak]
                     preview_toggle,
                     #[weak]
-                    expander,
+                    expand_toggle,
                     move |_, _| {
                         state.reset();
                         details_toggle.set_active(false);
                         preview_toggle.set_active(false);
-                        expander.set_expanded(false);
+                        expand_toggle.set_active(false);
                     }
                 ),
             );

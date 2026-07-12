@@ -147,6 +147,9 @@ fn build_window(app: &adw::Application) -> (adw::ApplicationWindow, adw::TabView
         .content(&toolbar_view)
         .build();
 
+    // Never let the window shrink below a usable minimum.
+    window.set_size_request(900, 700);
+
     apply_window_state(&window, saved);
     persist_window_state_on_close(&window);
 

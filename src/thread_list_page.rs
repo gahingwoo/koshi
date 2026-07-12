@@ -9,6 +9,14 @@ use crate::lore::{self, Sort, ThreadSummary};
 use crate::remote_page::RemoteContent;
 use crate::thread_page::{build_thread_page, launch_uri};
 
+/// Rows shown per Load More step. lore hands over 200 threads per fetch, but
+/// hundreds of live rows make every switch back to the tab re-shape all their
+/// labels (Pango/fontconfig work, a stalled frame or three per switch — worse
+/// the more such tabs are open), so the fetched tail stays unbuilt until the
+/// user asks for it: Load More reveals locally first and only fetches once
+/// everything fetched is showing.
+const VISIBLE_CHUNK: usize = 50;
+
 #[derive(Clone)]
 enum Mode {
     /// Recent thread roots of one list.
@@ -211,14 +219,18 @@ fn build_thread_list(
 
     let menu = RowMenu::new(&container, &["Open in New _Tab", "Open on _Web"]);
 
-    let full_page = threads.len() >= lore::PAGE_SIZE;
-    for thread in &threads {
+    let shown = threads.len().min(VISIBLE_CHUNK);
+    for thread in &threads[..shown] {
         list.append(&build_thread_row(thread, &menu, mode.list()));
     }
-    if full_page {
+    // lore has nothing further once it answers with a partial page.
+    let exhausted = threads.len() < lore::PAGE_SIZE;
+    if shown < threads.len() || !exhausted {
         list.append(&build_load_more_row());
     }
 
+    let shown = Rc::new(Cell::new(shown));
+    let exhausted = Rc::new(Cell::new(exhausted));
     let threads = Rc::new(RefCell::new(threads));
     // The cancellable is captured instead of the whole RemoteContent: this
     // closure lives inside the stack, and a strong stack reference here would
@@ -229,6 +241,10 @@ fn build_thread_list(
         #[strong]
         threads,
         #[strong]
+        shown,
+        #[strong]
+        exhausted,
+        #[strong]
         cancellable,
         #[strong]
         mode,
@@ -236,7 +252,7 @@ fn build_thread_list(
         menu,
         move |list, row| {
             let index = row.index() as usize;
-            if index < threads.borrow().len() {
+            if index < shown.get() {
                 let message_id = threads.borrow()[index].message_id.clone();
                 nav.push(&build_thread_page(&nav, mode.list(), &message_id));
             } else {
@@ -245,6 +261,8 @@ fn build_thread_list(
                     row,
                     &menu,
                     threads.clone(),
+                    shown.clone(),
+                    exhausted.clone(),
                     mode.clone(),
                     sort,
                     cancellable.clone(),
@@ -256,16 +274,24 @@ fn build_thread_list(
     container
 }
 
-/// Fetch the next page and splice it in where the Load More row sits.
+/// The Load More row: reveal the next chunk of already-fetched threads, or —
+/// once everything fetched is showing — fetch the next page first.
 fn load_more(
     list: &gtk::ListBox,
     row: &gtk::ListBoxRow,
     menu: &RowMenu,
     threads: Rc<RefCell<Vec<ThreadSummary>>>,
+    shown: Rc<Cell<usize>>,
+    exhausted: Rc<Cell<bool>>,
     mode: Mode,
     sort: Sort,
     cancellable: gio::Cancellable,
 ) {
+    if shown.get() < threads.borrow().len() {
+        reveal_chunk(list, row, menu, &threads.borrow(), &shown, &exhausted, mode.list());
+        return;
+    }
+
     if !row.is_sensitive() {
         return; // already loading
     }
@@ -277,21 +303,38 @@ fn load_more(
         let offset = threads.borrow().len();
         match mode.fetch(offset, sort, &cancellable).await {
             Ok(more) => {
-                list.remove(&row);
-                let full_page = more.len() >= lore::PAGE_SIZE;
-                for thread in &more {
-                    list.append(&build_thread_row(thread, &menu, mode.list()));
-                }
+                row.set_sensitive(true);
+                exhausted.set(more.len() < lore::PAGE_SIZE);
                 threads.borrow_mut().extend(more);
-                if full_page {
-                    list.append(&build_load_more_row());
-                }
+                reveal_chunk(&list, &row, &menu, &threads.borrow(), &shown, &exhausted, mode.list());
             }
             Err(error) if error.is_cancelled() => {}
             // Make the row clickable again; activating it retries.
             Err(_) => row.set_sensitive(true),
         }
     });
+}
+
+/// Insert the next chunk's rows above the Load More row; the row itself goes
+/// away once there is nothing left to reveal or fetch.
+fn reveal_chunk(
+    list: &gtk::ListBox,
+    load_more_row: &gtk::ListBoxRow,
+    menu: &RowMenu,
+    threads: &[ThreadSummary],
+    shown: &Cell<usize>,
+    exhausted: &Cell<bool>,
+    slug: &str,
+) {
+    let start = shown.get();
+    let end = threads.len().min(start + VISIBLE_CHUNK);
+    for thread in &threads[start..end] {
+        list.insert(&build_thread_row(thread, menu, slug), load_more_row.index());
+    }
+    shown.set(end);
+    if end == threads.len() && exhausted.get() {
+        list.remove(load_more_row);
+    }
 }
 
 fn build_load_more_row() -> adw::ButtonRow {

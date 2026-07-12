@@ -1237,11 +1237,6 @@ fn build_thread_content(
     let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory));
     list_view.set_single_click_activate(false);
 
-    // The overview sidebar rides the split view the page was built with; once
-    // it is set, the F9 shortcut and the header-bar button (toggle_overview)
-    // come alive. It jumps by driving this list_view, so it is wired after it.
-    split.set_sidebar(Some(&build_overview_sidebar(&mails, &list_view, &view_toggle)));
-
     let scrolled = gtk::ScrolledWindow::builder()
         .child(&list_view)
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -1299,6 +1294,19 @@ fn build_thread_content(
             );
         }
     ));
+
+    // The overview sidebar rides the split view the page was built with; once
+    // it is set, the F9 shortcut and the header-bar button (toggle_overview)
+    // come alive. It drives this list_view to jump and follows its scroll to
+    // highlight, and its own view-switch handler must run after the model swap
+    // above, so it is wired here — after the toggle and the scroller exist.
+    split.set_sidebar(Some(&build_overview_sidebar(
+        &mails,
+        &list_view,
+        &view_toggle,
+        &scrolled,
+        opened,
+    )));
 
     // Background warmup. GtkListView keeps every row of a <=205-item model
     // realized (a hardcoded widget window), so the expensive part — body
@@ -1717,6 +1725,46 @@ fn message_row_offset(list_view: &gtk::ListView, mail: &Rc<Mail>) -> Option<f64>
     None
 }
 
+/// The index (into `mails`) of the message whose row occupies the top of
+/// the message viewport — the one the reader is looking at. None while no
+/// realized row straddles the top (between frames, or mid-relayout right
+/// after a model swap), so the caller keeps the current highlight rather
+/// than clearing it. Only rows near the viewport are realized, so the walk
+/// is over a handful of widgets.
+fn message_at_viewport_top(list_view: &gtk::ListView, mails: &[Rc<Mail>]) -> Option<usize> {
+    let mut fallback: Option<(f64, usize)> = None;
+    let mut child = list_view.first_child();
+    while let Some(item_widget) = child {
+        child = item_widget.next_sibling();
+        let Some(row) = item_widget.first_child().and_downcast::<MessageRow>() else {
+            continue;
+        };
+        if !item_widget.is_child_visible() {
+            continue;
+        }
+        let Some(bounds) = item_widget.compute_bounds(list_view) else {
+            continue;
+        };
+        let (y, height) = (f64::from(bounds.y()), f64::from(bounds.height()));
+        if height <= 0.0 {
+            continue;
+        }
+        let Some(index) = mails.iter().position(|mail| row.holds(mail)) else {
+            continue;
+        };
+        // The row spanning y = 0 is the one at the top of the viewport.
+        if y <= 0.0 && y + height > 0.0 {
+            return Some(index);
+        }
+        // No straddler yet (e.g. the frames right after a jump): fall back to
+        // the closest row below the top edge.
+        if y >= 0.0 && fallback.is_none_or(|(best, _)| y < best) {
+            fallback = Some((y, index));
+        }
+    }
+    fallback.map(|(_, index)| index)
+}
+
 /// The overview sidebar: a heading over one activatable row per message,
 /// laid out as a collapsible reply tree indented by depth. Activating a row
 /// jumps the message list to that message; the disclosure button on a row
@@ -1725,9 +1773,15 @@ fn build_overview_sidebar(
     thread: &[Rc<Mail>],
     list_view: &gtk::ListView,
     view_toggle: &adw::ToggleGroup,
+    scrolled: &gtk::ScrolledWindow,
+    opened: usize,
 ) -> gtk::Widget {
+    // Single selection is the highlight: the row of the message on screen is
+    // selected, so the "navigation-sidebar" style marks it. Selecting a row
+    // in code fires row-selected, not row-activated, so it never triggers a
+    // jump of its own.
     let list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
+        .selection_mode(gtk::SelectionMode::Single)
         .css_classes(["navigation-sidebar"])
         .build();
 
@@ -1776,20 +1830,24 @@ fn build_overview_sidebar(
             .margin_start(6 + row.depth.min(OVERVIEW_MAX_DEPTH) as i32 * OVERVIEW_INDENT)
             .build();
 
-        // A disclosure toggle for a row with replies, or an equal-width
-        // placeholder so every avatar at a given depth still lines up.
-        let button = row.has_children.then(|| {
-            gtk::Button::builder()
-                .icon_name("pan-down-symbolic")
-                .tooltip_text("Collapse replies")
-                .valign(gtk::Align::Center)
-                .css_classes(["flat"])
-                .build()
-        });
-        match &button {
-            Some(button) => content.append(button),
-            None => content.append(&gtk::Box::builder().width_request(34).build()),
+        // Every row reserves the same disclosure column so avatars line up
+        // straight down the tree. A row with replies gets a live toggle; a
+        // leaf gets the identical button kept invisible (opacity, not
+        // visibility, so it still takes its exact width) and inert.
+        let button = gtk::Button::builder()
+            .icon_name("pan-down-symbolic")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        if row.has_children {
+            button.set_tooltip_text(Some("Collapse replies"));
+        } else {
+            button.set_opacity(0.0);
+            button.set_can_focus(false);
+            button.set_can_target(false);
+            button.set_sensitive(false);
         }
+        content.append(&button);
 
         content.append(&avatar);
         content.append(&texts);
@@ -1801,7 +1859,7 @@ fn build_overview_sidebar(
         list.append(&row_widget);
 
         let row_pos = rows.len();
-        if let Some(button) = button {
+        if row.has_children {
             disclosures.push((row_pos, button));
         }
         rows.push(OverviewRow {
@@ -1857,6 +1915,13 @@ fn build_overview_sidebar(
         ));
     }
 
+    // Message index -> the sidebar row that shows it, so the on-screen
+    // message's row can be selected. Every message appears once in the tree.
+    let mut row_of_message = vec![0i32; thread.len()];
+    for (row_pos, &message) in message_of_row.iter().enumerate() {
+        row_of_message[message] = row_pos as i32;
+    }
+
     // A generation counter so a new activation supersedes any correction
     // loop still running from a previous click.
     let scroll_generation = Rc::new(Cell::new(0u64));
@@ -1890,6 +1955,60 @@ fn build_overview_sidebar(
             }
         }
     ));
+
+    // Keep the row of the message on screen selected. In single view that is
+    // always the opened message; in threaded view it follows the scroll, so
+    // the highlight tracks whichever message the reader has scrolled to.
+    let mails: Vec<Rc<Mail>> = thread.to_vec();
+    let refresh_highlight: Rc<dyn Fn()> = Rc::new({
+        let list = list.downgrade();
+        let list_view = list_view.downgrade();
+        let view_toggle = view_toggle.downgrade();
+        move || {
+            let (Some(list), Some(list_view), Some(view_toggle)) =
+                (list.upgrade(), list_view.upgrade(), view_toggle.upgrade())
+            else {
+                return;
+            };
+            let target = if view_toggle.active() == 0 {
+                opened
+            } else if let Some(index) = message_at_viewport_top(&list_view, &mails) {
+                index
+            } else {
+                // Nothing has settled at the top yet (mid-relayout after a
+                // model swap or jump); keep the current highlight.
+                return;
+            };
+            let Some(&row_pos) = row_of_message.get(target) else {
+                return;
+            };
+            if let Some(row) = list.row_at_index(row_pos)
+                && !row.is_selected()
+            {
+                list.select_row(Some(&row));
+            }
+        }
+    });
+
+    let vadjustment = scrolled.vadjustment();
+    vadjustment.connect_value_changed(glib::clone!(
+        #[strong]
+        refresh_highlight,
+        move |_| refresh_highlight()
+    ));
+    // A view switch swaps the model and resizes the content; catch the
+    // relayout so the highlight settles onto the newly shown message.
+    vadjustment.connect_changed(glib::clone!(
+        #[strong]
+        refresh_highlight,
+        move |_| refresh_highlight()
+    ));
+    view_toggle.connect_active_notify(glib::clone!(
+        #[strong]
+        refresh_highlight,
+        move |_| refresh_highlight()
+    ));
+    refresh_highlight();
 
     let heading = gtk::Label::builder()
         .label("Thread Overview")

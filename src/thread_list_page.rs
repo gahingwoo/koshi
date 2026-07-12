@@ -4,7 +4,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use crate::list_page::{build_list_page, build_row_menu};
+use crate::list_page::{RowMenu, build_list_page};
 use crate::lore::{self, Sort, ThreadSummary};
 use crate::remote_page::RemoteContent;
 use crate::thread_page::{build_thread_page, launch_uri};
@@ -194,18 +194,26 @@ fn build_thread_list(
     mode: &Mode,
     sort: Sort,
     threads: Vec<ThreadSummary>,
-) -> gtk::ListBox {
-    let list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
+) -> gtk::Box {
+    // The box exists to host the shared context-menu popover: RowMenu must not
+    // parent it to the ListBox itself (see RowMenu's docs).
+    let container = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
         // The list sits inside a vexpanding stack; without this it stretches
         // and the boxed-list shadow outlines the empty space below the rows.
         .valign(gtk::Align::Start)
+        .build();
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
+    container.append(&list);
+
+    let menu = RowMenu::new(&container, &["Open in New _Tab", "Open on _Web"]);
 
     let full_page = threads.len() >= lore::PAGE_SIZE;
     for thread in &threads {
-        list.append(&build_thread_row(thread, mode.list()));
+        list.append(&build_thread_row(thread, &menu, mode.list()));
     }
     if full_page {
         list.append(&build_load_more_row());
@@ -224,24 +232,35 @@ fn build_thread_list(
         cancellable,
         #[strong]
         mode,
+        #[strong]
+        menu,
         move |list, row| {
             let index = row.index() as usize;
             if index < threads.borrow().len() {
                 let message_id = threads.borrow()[index].message_id.clone();
                 nav.push(&build_thread_page(&nav, mode.list(), &message_id));
             } else {
-                load_more(list, row, threads.clone(), mode.clone(), sort, cancellable.clone());
+                load_more(
+                    list,
+                    row,
+                    &menu,
+                    threads.clone(),
+                    mode.clone(),
+                    sort,
+                    cancellable.clone(),
+                );
             }
         }
     ));
 
-    list
+    container
 }
 
 /// Fetch the next page and splice it in where the Load More row sits.
 fn load_more(
     list: &gtk::ListBox,
     row: &gtk::ListBoxRow,
+    menu: &RowMenu,
     threads: Rc<RefCell<Vec<ThreadSummary>>>,
     mode: Mode,
     sort: Sort,
@@ -253,6 +272,7 @@ fn load_more(
     row.set_sensitive(false);
     let list = list.clone();
     let row = row.clone();
+    let menu = menu.clone();
     glib::spawn_future_local(async move {
         let offset = threads.borrow().len();
         match mode.fetch(offset, sort, &cancellable).await {
@@ -260,7 +280,7 @@ fn load_more(
                 list.remove(&row);
                 let full_page = more.len() >= lore::PAGE_SIZE;
                 for thread in &more {
-                    list.append(&build_thread_row(thread, mode.list()));
+                    list.append(&build_thread_row(thread, &menu, mode.list()));
                 }
                 threads.borrow_mut().extend(more);
                 if full_page {
@@ -278,7 +298,7 @@ fn build_load_more_row() -> adw::ButtonRow {
     adw::ButtonRow::builder().title("Load More").build()
 }
 
-fn build_thread_row(thread: &ThreadSummary, list: &str) -> adw::ActionRow {
+fn build_thread_row(thread: &ThreadSummary, menu: &RowMenu, list: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(format!("<tt>{}</tt>", glib::markup_escape_text(&thread.subject)))
         .title_lines(1)
@@ -308,15 +328,15 @@ fn build_thread_row(thread: &ThreadSummary, list: &str) -> adw::ActionRow {
     );
     row.add_suffix(&timestamp);
 
-    add_row_actions(&row, list, &thread.message_id);
+    add_row_actions(&row, menu, list, &thread.message_id);
 
     row
 }
 
 /// Wire a thread row's secondary-click context menu ("Open in New Tab", "Open
-/// on Web") and its middle-click shortcut for opening the thread in a
-/// background tab.
-fn add_row_actions(row: &adw::ActionRow, list: &str, message_id: &str) {
+/// on Web" — handlers in the shared menu's label order) and its middle-click
+/// shortcut for opening the thread in a background tab.
+fn add_row_actions(row: &adw::ActionRow, menu: &RowMenu, list: &str, message_id: &str) {
     // `message_id` arrives already stripped of angle brackets, but trim to be
     // safe and match the /r/ redirect URL used in the message reading view.
     let bare = message_id.trim().trim_start_matches('<').trim_end_matches('>');
@@ -324,51 +344,27 @@ fn add_row_actions(row: &adw::ActionRow, list: &str, message_id: &str) {
     let list = list.to_string();
     let message_id = message_id.to_string();
 
-    let secondary = gtk::GestureClick::new();
-    secondary.set_button(gdk::BUTTON_SECONDARY);
-    secondary.connect_pressed(glib::clone!(
-        #[weak]
+    menu.attach(
         row,
-        #[strong]
-        list,
-        #[strong]
-        message_id,
-        #[strong]
-        url,
-        move |gesture, _, x, y| {
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            let popover = build_row_menu(
-                &row,
-                vec![
-                    (
-                        "Open in New _Tab",
-                        Box::new(glib::clone!(
-                            #[weak]
-                            row,
-                            #[strong]
-                            list,
-                            #[strong]
-                            message_id,
-                            move || open_in_new_tab(&row, &list, &message_id)
-                        )),
-                    ),
-                    (
-                        "Open on _Web",
-                        Box::new(glib::clone!(
-                            #[weak]
-                            row,
-                            #[strong]
-                            url,
-                            move || launch_uri(&row, &url)
-                        )),
-                    ),
-                ],
-            );
-            popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-            popover.popup();
-        }
-    ));
-    row.add_controller(secondary);
+        vec![
+            Rc::new(glib::clone!(
+                #[weak]
+                row,
+                #[strong]
+                list,
+                #[strong]
+                message_id,
+                move || open_in_new_tab(&row, &list, &message_id)
+            )) as Rc<dyn Fn()>,
+            Rc::new(glib::clone!(
+                #[weak]
+                row,
+                #[strong]
+                url,
+                move || launch_uri(&row, &url)
+            )),
+        ],
+    );
 
     // Middle-click opens the thread in a background tab, matching the web
     // convention of middle-clicking a link.

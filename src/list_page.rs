@@ -1,55 +1,109 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gdk, gio, glib};
 
-/// A right-click context menu for a list row: a popover of flat buttons, one
-/// per `(label, action)`. Parented to `anchor` and unparented when it closes.
+/// A right-click context menu shared by every row of one list: a single stock
+/// `gtk::PopoverMenu` popped at the pointer.
 ///
-/// Plain buttons with direct click handlers are used rather than a
-/// `gtk::PopoverMenu` backed by a `gio` action group: as a transient child of a
-/// stock `adw::ActionRow`, the PopoverMenu's items do not reliably bind their
-/// actions, so clicking them would silently do nothing. `label` uses `_` for
-/// its mnemonic.
-pub fn build_row_menu(
-    anchor: &impl IsA<gtk::Widget>,
-    actions: Vec<(&str, Box<dyn Fn()>)>,
-) -> gtk::Popover {
-    let items = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .build();
-    let popover = gtk::Popover::builder()
-        .has_arrow(false)
-        .halign(gtk::Align::Start)
-        .child(&items)
-        .build();
-    // The stock menu style: tighter padding and full-width row highlight.
-    popover.add_css_class("menu");
+/// One popover per list, parented to `host` with its action group inserted
+/// there too, so the menu items resolve their actions through real, permanent
+/// ancestry — a popover conjured per press on a stock row has none, and its
+/// items go inert. [`attach`](Self::attach) swaps the target row's handlers in
+/// before popping, the same shape GNOME Resources uses for its process list.
+///
+/// `host` must be an ancestor of the rows, and must NOT be the `GtkListBox`
+/// itself: ListBox's dispose remove()s its children in a loop, and remove()
+/// rejects non-row children without unparenting them, so a popover child spins
+/// that loop forever ("Tried to remove non-child" every iteration) and hangs
+/// the app. A plain `gtk::Box` around or above the list is the right host —
+/// its teardown unparents any child, and box layout skips popover children.
+///
+/// No strong host reference lives here (the host is reached as the popover's
+/// parent): rows and list-signal closures capture the RowMenu, and a strong
+/// handle would cycle the host alive.
+#[derive(Clone)]
+pub struct RowMenu {
+    popover: gtk::PopoverMenu,
+    handlers: Rc<RefCell<Vec<Rc<dyn Fn()>>>>,
+}
 
-    for (label, action) in actions {
-        let button = gtk::Button::builder()
-            .css_classes(["flat"])
-            .child(
-                &gtk::Label::builder()
-                    .label(label)
-                    .use_underline(true)
-                    .xalign(0.0)
-                    .hexpand(true)
-                    .build(),
-            )
-            .build();
-        button.connect_clicked(glib::clone!(
+impl RowMenu {
+    /// One menu item per label (`_` marks the mnemonic), in the order the
+    /// handlers are later passed to [`attach`](Self::attach).
+    pub fn new(host: &impl IsA<gtk::Widget>, labels: &[&str]) -> Self {
+        let menu = gio::Menu::new();
+        let group = gio::SimpleActionGroup::new();
+        let handlers: Rc<RefCell<Vec<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(Vec::new()));
+        for (index, label) in labels.iter().enumerate() {
+            let action = gio::SimpleAction::new(&format!("item{index}"), None);
+            action.connect_activate(glib::clone!(
+                #[strong]
+                handlers,
+                move |_, _| {
+                    // Cloned out so the handler runs with the borrow released.
+                    let handler = handlers.borrow().get(index).cloned();
+                    if let Some(handler) = handler {
+                        handler();
+                    }
+                }
+            ));
+            group.add_action(&action);
+            menu.append(Some(label), Some(&format!("row-menu.item{index}")));
+        }
+        host.insert_action_group("row-menu", Some(&group));
+
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(host);
+        popover.set_has_arrow(false);
+        popover.set_halign(gtk::Align::Start);
+        // A stock host has no dispose hook for a manually parented child, so
+        // detach the popover when the host is torn down; left attached it
+        // would warn at finalize.
+        host.connect_destroy(glib::clone!(
             #[weak]
             popover,
-            move |_| {
-                popover.popdown();
-                action();
-            }
+            move |_| popover.unparent()
         ));
-        items.append(&button);
+
+        Self { popover, handlers }
     }
 
-    popover.set_parent(anchor);
-    popover.connect_closed(|popover| popover.unparent());
-    popover
+    /// Open the menu on `row` on right-click, with `row_handlers` (one per
+    /// label, same order) as its actions.
+    pub fn attach(&self, row: &impl IsA<gtk::Widget>, row_handlers: Vec<Rc<dyn Fn()>>) {
+        let gesture = gtk::GestureClick::new();
+        gesture.set_button(gdk::BUTTON_SECONDARY);
+        gesture.connect_pressed(glib::clone!(
+            #[weak(rename_to = row)]
+            row.as_ref(),
+            #[weak(rename_to = popover)]
+            self.popover,
+            #[strong(rename_to = handlers)]
+            self.handlers,
+            move |gesture, _, x, y| {
+                let Some(host) = popover.parent() else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                *handlers.borrow_mut() = row_handlers.clone();
+                // The popover is parented to the host, so the press point is
+                // translated from row to host coordinates before pointing.
+                let point = row
+                    .compute_point(&host, &gtk::graphene::Point::new(x as f32, y as f32))
+                    .unwrap_or_else(|| gtk::graphene::Point::new(x as f32, y as f32));
+                popover.set_pointing_to(Some(&gdk::Rectangle::new(
+                    point.x().round() as i32,
+                    point.y().round() as i32,
+                    1,
+                    1,
+                )));
+                popover.popup();
+            }
+        ));
+        row.add_controller(gesture);
+    }
 }
 
 /// Shared scaffold for list-style pages: a scrolled, clamped column holding a

@@ -10,6 +10,10 @@ pub struct ThreadSummary {
     pub updated: glib::DateTime,
     /// Without angle brackets.
     pub message_id: String,
+    /// Message-ID this entry replies to, taken from the Atom `thr:in-reply-to`
+    /// element (without angle brackets); `None` for a thread root. Used to nest
+    /// patch-series parts under their cover letter when browsing a list.
+    pub in_reply_to: Option<String>,
 }
 
 /// Entries per Atom results page (fixed by lore; paginate with `o=`).
@@ -73,6 +77,7 @@ struct EntryBuilder {
     email: String,
     updated: String,
     link: Option<String>,
+    in_reply_to: Option<String>,
 }
 
 impl EntryBuilder {
@@ -90,6 +95,7 @@ impl EntryBuilder {
             },
             updated,
             message_id: message_id_from_url(&self.link?)?,
+            in_reply_to: self.in_reply_to,
         })
     }
 }
@@ -171,6 +177,15 @@ pub fn parse_atom(xml: &str) -> Result<Vec<ThreadSummary>, Error> {
                     b"link" => {
                         if let Some(entry) = entry.as_mut() {
                             entry.link = attribute(e, b"href");
+                        }
+                    }
+                    // <thr:in-reply-to href=".../parent-msg-id/"> — the parent's
+                    // own href, kept separate from the entry's <link> so it can
+                    // seed threading without clobbering the entry's Message-ID.
+                    b"in-reply-to" => {
+                        if let Some(entry) = entry.as_mut() {
+                            entry.in_reply_to =
+                                attribute(e, b"href").as_deref().and_then(message_id_from_url);
                         }
                     }
                     _ => {}
@@ -267,6 +282,18 @@ type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml"><pre>hi</pre></div></cont
         // clobber the entry's own <link>.
         let entries = parse_atom(FEED).unwrap();
         assert_eq!(entries[0].message_id, "20260705200723.66564929@pumpkin");
+    }
+
+    #[test]
+    fn in_reply_to_is_taken_from_thr_element_href() {
+        let entries = parse_atom(FEED).unwrap();
+        // entry[0] carries a thr:in-reply-to pointing at its parent's message.
+        assert_eq!(
+            entries[0].in_reply_to.as_deref(),
+            Some("20260705172054.339425-2-thorsten.blum@linux.dev")
+        );
+        // entry[1] is a root: no thr:in-reply-to element.
+        assert_eq!(entries[1].in_reply_to, None);
     }
 
     #[test]

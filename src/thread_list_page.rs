@@ -32,6 +32,13 @@ impl Mode {
         }
     }
 
+    /// Whether to nest replies under their parent. List browsing groups a patch
+    /// series beneath its cover letter; search stays flat, matching lore's
+    /// (ungrouped) search results.
+    fn groups(&self) -> bool {
+        matches!(self, Mode::Recent { .. })
+    }
+
     async fn fetch(
         &self,
         offset: usize,
@@ -201,6 +208,115 @@ fn build_sort_button(on_change: impl Fn(Sort) + 'static) -> gtk::MenuButton {
     button
 }
 
+/// Pixels of extra indent per nesting level for a grouped reply.
+const INDENT_STEP: i32 = 24;
+/// Indent stops growing past this depth, so a deeply threaded series can't
+/// march its rows off the right edge.
+const MAX_DEPTH: usize = 6;
+
+/// One list row: a thread summary plus its nesting depth. Depth 0 is a thread
+/// root or standalone message; a greater depth is a reply (a patch under its
+/// cover letter) shown indented and dimmed beneath its parent.
+struct Row {
+    thread: ThreadSummary,
+    depth: usize,
+}
+
+/// Arrange a freshly fetched page into display order. When `group` is set (list
+/// browsing), a message whose parent is *also on this page* is nested beneath
+/// it, so a patch series collapses under its cover letter; siblings are ordered
+/// oldest-first so a series reads 0, 1, 2, … Each group is emitted where its
+/// newest member first appears, so groups keep lore's newest-first order and
+/// already-shown rows never reshuffle when a later page arrives. When `group`
+/// is unset (search), rows stay flat in lore's order.
+///
+/// Grouping is deliberately page-local and pointer-only: it never fabricates a
+/// missing parent and never reaches across a page boundary. A series split by
+/// pagination simply shows its overflow as plain rows rather than misgrouping.
+fn arrange(threads: Vec<ThreadSummary>, group: bool) -> Vec<Row> {
+    if !group {
+        return threads.into_iter().map(|thread| Row { thread, depth: 0 }).collect();
+    }
+
+    let n = threads.len();
+    // Message-ID -> first index on this page.
+    let mut index_of = std::collections::HashMap::with_capacity(n);
+    for (i, thread) in threads.iter().enumerate() {
+        index_of.entry(thread.message_id.as_str()).or_insert(i);
+    }
+    // parent[i] = index of i's in-reply-to target on this page, if present and
+    // not i itself.
+    let parent: Vec<Option<usize>> = threads
+        .iter()
+        .enumerate()
+        .map(|(i, thread)| {
+            let pid = thread.in_reply_to.as_deref()?;
+            let p = *index_of.get(pid)?;
+            (p != i).then_some(p)
+        })
+        .collect();
+    // Children of each message, ordered oldest-first (lore lists newest-first,
+    // which would otherwise reverse a series into N, …, 1, 0).
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, p) in parent.iter().enumerate() {
+        if let Some(p) = *p {
+            children[p].push(i);
+        }
+    }
+    for kids in &mut children {
+        kids.sort_by_key(|&c| threads[c].updated.to_unix());
+    }
+
+    // Emit each group's whole subtree the first time any member is reached
+    // (scanning in lore's order), depth-first from the root.
+    let mut slots: Vec<Option<ThreadSummary>> = threads.into_iter().map(Some).collect();
+    let mut emitted = vec![false; n];
+    let mut rows = Vec::with_capacity(n);
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for start in 0..n {
+        let root = root_of(start, &parent);
+        if emitted[root] {
+            continue;
+        }
+        stack.push((root, 0));
+        while let Some((i, depth)) = stack.pop() {
+            if emitted[i] {
+                continue;
+            }
+            emitted[i] = true;
+            if let Some(thread) = slots[i].take() {
+                rows.push(Row { thread, depth });
+            }
+            // Reversed so the sorted children pop back in oldest-first order.
+            for &c in children[i].iter().rev() {
+                if !emitted[c] {
+                    stack.push((c, depth + 1));
+                }
+            }
+        }
+    }
+    // Safety net for any node stranded in a reference cycle (never reached from
+    // an acyclic root): surface it as its own row rather than dropping it.
+    for slot in &mut slots {
+        if let Some(thread) = slot.take() {
+            rows.push(Row { thread, depth: 0 });
+        }
+    }
+    rows
+}
+
+/// Walk in-reply-to pointers up to the thread root, bounded by the page length
+/// so a pathological cycle terminates instead of looping forever.
+fn root_of(mut i: usize, parent: &[Option<usize>]) -> usize {
+    for _ in 0..parent.len() {
+        match parent[i] {
+            Some(p) => i = p,
+            None => break,
+        }
+    }
+    i
+}
+
 fn build_thread_list(
     nav: &adw::NavigationView,
     cancellable: &gio::Cancellable,
@@ -224,19 +340,22 @@ fn build_thread_list(
 
     let menu = RowMenu::new(&container, &["Open in New _Tab", "Open on _Web"]);
 
-    let shown = threads.len().min(VISIBLE_CHUNK);
-    for thread in &threads[..shown] {
-        list.append(&build_thread_row(thread, &menu, mode.list()));
-    }
-    // lore has nothing further once it answers with a partial page.
+    // lore has nothing further once it answers with a partial page (checked on
+    // the raw count, which arranging into groups preserves).
     let exhausted = threads.len() < lore::PAGE_SIZE;
-    if shown < threads.len() || !exhausted {
+    let rows = arrange(threads, mode.groups());
+
+    let shown = rows.len().min(VISIBLE_CHUNK);
+    for row in &rows[..shown] {
+        list.append(&build_thread_row(row, &menu, mode.list()));
+    }
+    if shown < rows.len() || !exhausted {
         list.append(&build_load_more_row());
     }
 
     let shown = Rc::new(Cell::new(shown));
     let exhausted = Rc::new(Cell::new(exhausted));
-    let threads = Rc::new(RefCell::new(threads));
+    let threads = Rc::new(RefCell::new(rows));
     // The cancellable is captured instead of the whole RemoteContent: this
     // closure lives inside the stack, and a strong stack reference here would
     // be a leaky cycle.
@@ -258,7 +377,7 @@ fn build_thread_list(
         move |list, row| {
             let index = row.index() as usize;
             if index < shown.get() {
-                let message_id = threads.borrow()[index].message_id.clone();
+                let message_id = threads.borrow()[index].thread.message_id.clone();
                 nav.push(&build_thread_page(&nav, mode.list(), &message_id));
             } else {
                 load_more(
@@ -285,7 +404,7 @@ fn load_more(
     list: &gtk::ListBox,
     row: &gtk::ListBoxRow,
     menu: &RowMenu,
-    threads: Rc<RefCell<Vec<ThreadSummary>>>,
+    threads: Rc<RefCell<Vec<Row>>>,
     shown: Rc<Cell<usize>>,
     exhausted: Rc<Cell<bool>>,
     mode: Mode,
@@ -318,7 +437,9 @@ fn load_more(
             Ok(more) => {
                 row.set_sensitive(true);
                 exhausted.set(more.len() < lore::PAGE_SIZE);
-                threads.borrow_mut().extend(more);
+                // Group the new page on its own; groups never cross a page
+                // boundary, so this never disturbs rows already on screen.
+                threads.borrow_mut().extend(arrange(more, mode.groups()));
                 reveal_chunk(
                     &list,
                     &row,
@@ -342,15 +463,15 @@ fn reveal_chunk(
     list: &gtk::ListBox,
     load_more_row: &gtk::ListBoxRow,
     menu: &RowMenu,
-    threads: &[ThreadSummary],
+    threads: &[Row],
     shown: &Cell<usize>,
     exhausted: &Cell<bool>,
     slug: &str,
 ) {
     let start = shown.get();
     let end = threads.len().min(start + VISIBLE_CHUNK);
-    for thread in &threads[start..end] {
-        list.insert(&build_thread_row(thread, menu, slug), load_more_row.index());
+    for row in &threads[start..end] {
+        list.insert(&build_thread_row(row, menu, slug), load_more_row.index());
     }
     shown.set(end);
     if end == threads.len() && exhausted.get() {
@@ -362,7 +483,8 @@ fn build_load_more_row() -> adw::ButtonRow {
     adw::ButtonRow::builder().title("Load More").build()
 }
 
-fn build_thread_row(thread: &ThreadSummary, menu: &RowMenu, list: &str) -> adw::ActionRow {
+fn build_thread_row(row_data: &Row, menu: &RowMenu, list: &str) -> adw::ActionRow {
+    let thread = &row_data.thread;
     let row = adw::ActionRow::builder()
         .title(format!(
             "<tt>{}</tt>",
@@ -374,6 +496,29 @@ fn build_thread_row(thread: &ThreadSummary, menu: &RowMenu, list: &str) -> adw::
         .subtitle_lines(1)
         .activatable(true)
         .build();
+
+    // A nested reply (a patch under its cover) is indented and dimmed with the
+    // stock `dim-label` class, and carries a corner connector glyph tying it to
+    // the parent above — so a series reads as one group without hiding any part
+    // of it. The prefix indents one step per level (bar the connector's own),
+    // and the row's dim-label class dims the glyph along with the text.
+    if row_data.depth > 0 {
+        row.add_css_class("dim-label");
+        let depth = row_data.depth.min(MAX_DEPTH) as i32;
+        let prefix = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        spacer.set_size_request((depth - 1) * INDENT_STEP, -1);
+        prefix.append(&spacer);
+        prefix.append(
+            &gtk::Label::builder()
+                .label("↳")
+                .valign(gtk::Align::Center)
+                .margin_start(16)
+                .tooltip_text("Reply in this thread")
+                .build(),
+        );
+        row.add_prefix(&prefix);
+    }
 
     let timestamp = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -471,4 +616,85 @@ pub fn format_date(date: &glib::DateTime) -> String {
     let same_year = glib::DateTime::now_local().is_ok_and(|now| now.year() == date.year());
     let format = if same_year { "%b %-e" } else { "%b %-e %Y" };
     date.format(format).map(Into::into).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A summary with the given Message-ID, optional parent, and a received
+    /// time of `unix` seconds (drives sibling ordering).
+    fn summary(id: &str, in_reply_to: Option<&str>, unix: i64) -> ThreadSummary {
+        ThreadSummary {
+            subject: id.to_string(),
+            author: "someone".to_string(),
+            updated: glib::DateTime::from_unix_utc(unix).unwrap(),
+            message_id: id.to_string(),
+            in_reply_to: in_reply_to.map(str::to_string),
+        }
+    }
+
+    fn shape(rows: &[Row]) -> Vec<(&str, usize)> {
+        rows.iter().map(|r| (r.thread.subject.as_str(), r.depth)).collect()
+    }
+
+    #[test]
+    fn ungrouped_keeps_order_and_flat_depth() {
+        // Search mode: even a reply keeps lore's order and stays at depth 0.
+        let page = vec![summary("a", None, 3), summary("b", Some("a"), 2), summary("c", None, 1)];
+        assert_eq!(shape(&arrange(page, false)), vec![("a", 0), ("b", 0), ("c", 0)]);
+    }
+
+    #[test]
+    fn shallow_series_nests_under_cover_oldest_first() {
+        // lore returns newest-first: 2/2, 1/2, then the 0/2 cover (oldest).
+        // All patches reply to the cover.
+        let page = vec![
+            summary("p2", Some("cover"), 30),
+            summary("p1", Some("cover"), 20),
+            summary("cover", None, 10),
+        ];
+        // Cover on top, patches indented and in send order.
+        assert_eq!(shape(&arrange(page, true)), vec![("cover", 0), ("p1", 1), ("p2", 1)]);
+    }
+
+    #[test]
+    fn deep_thread_indents_stepwise() {
+        // 0 <- 1 <- 2 chain (each replies to the previous).
+        let page = vec![
+            summary("m2", Some("m1"), 30),
+            summary("m1", Some("m0"), 20),
+            summary("m0", None, 10),
+        ];
+        assert_eq!(shape(&arrange(page, true)), vec![("m0", 0), ("m1", 1), ("m2", 2)]);
+    }
+
+    #[test]
+    fn missing_parent_stays_a_root() {
+        // The cover is not on this page; its child cannot nest and stays flat.
+        let page = vec![summary("orphan", Some("absent-cover"), 10)];
+        assert_eq!(shape(&arrange(page, true)), vec![("orphan", 0)]);
+    }
+
+    #[test]
+    fn independent_groups_keep_newest_first_order() {
+        // Two series interleaved by time; each group is anchored where its
+        // newest member appears, so the newer group leads.
+        let page = vec![
+            summary("bp1", Some("bcover"), 50), // newer series' patch
+            summary("bcover", None, 40),
+            summary("acover", None, 20),
+            summary("ap1", Some("acover"), 25),
+        ];
+        assert_eq!(
+            shape(&arrange(page, true)),
+            vec![("bcover", 0), ("bp1", 1), ("acover", 0), ("ap1", 1)]
+        );
+    }
+
+    #[test]
+    fn self_referential_parent_does_not_loop() {
+        let page = vec![summary("x", Some("x"), 10)];
+        assert_eq!(shape(&arrange(page, true)), vec![("x", 0)]);
+    }
 }

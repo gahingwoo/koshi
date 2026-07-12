@@ -2044,12 +2044,23 @@ fn build_header_list(
         .css_classes(["boxed-list"])
         .build();
 
+    // Two title columns, each sized to the widest field name it holds so the
+    // gap before the value is the same small margin in every row. Kept
+    // separate — the always-visible rows never widen to fit the collapsed
+    // Details names — so opening Details doesn't push the visible rows'
+    // values across. These groups are built fresh with the card and thrown
+    // away with it, so they sidestep the cross-card recycling hazard that
+    // ruled a shared SizeGroup out (a persistent group re-negotiates every
+    // card's layout as rows join and leave it on rebind).
+    let visible_titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    let detail_titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+
     // A reply's Subject row doubles as its toolbar: the Reply button trails
     // the hexpanding value label. The OP's subject already heads the page as
     // its title, so its Subject row is omitted and its Reply button sits in
     // the title row instead.
     if !is_op {
-        let subject_row = build_single_line_row("Subject", &mail.subject);
+        let subject_row = build_single_line_row("Subject", &mail.subject, &visible_titles);
         subject_row.set_tooltip_text(Some(&mail.subject));
         if let Some(content) = subject_row.child().and_downcast::<gtk::Box>() {
             content.append(&build_reply_button(mail, composer));
@@ -2057,42 +2068,40 @@ fn build_header_list(
         list.append(&subject_row);
     }
 
-    list.append(&build_single_line_row("Author", &mail.from));
-    list.append(&build_single_line_row("Date", &mail.date));
+    list.append(&build_single_line_row("Author", &mail.from, &visible_titles));
+    list.append(&build_single_line_row("Date", &mail.date, &visible_titles));
 
     // The remaining headers are collapsed by default: recipients are almost
     // always the same as the OP's and the ids only matter for debugging, so
     // the Message-Id/In-Reply-To/To/Cc rows only show up on request.
     let details = adw::ExpanderRow::builder().title("Details").build();
     if let Some(id) = &mail.message_id {
-        details.add_row(&build_text_row("Message-Id", id));
+        details.add_row(&build_text_row("Message-Id", id, &detail_titles));
     }
     if let Some(id) = &mail.in_reply_to {
-        details.add_row(&build_text_row("In-Reply-To", id));
+        details.add_row(&build_text_row("In-Reply-To", id, &detail_titles));
     }
-    details.add_row(&build_address_row("To", &mail.to, &mail.to_addrs, overlay));
+    details.add_row(&build_address_row("To", &mail.to, &mail.to_addrs, overlay, &detail_titles));
     if let Some(cc) = &mail.cc {
-        details.add_row(&build_address_row("Cc", cc, &mail.cc_addrs, overlay));
+        details.add_row(&build_address_row("Cc", cc, &mail.cc_addrs, overlay, &detail_titles));
     }
     list.append(&details);
 
     list
 }
 
-/// The header cards' title column, in characters: wide enough for the
-/// longest field name ("In-Reply-To"), so the value columns line up across
-/// rows and cards. A fixed width does the job a cross-card SizeGroup did
-/// before the ListView migration — a shared group can't survive row
-/// recycling (possible past 205 messages), where widgets joining and
-/// leaving it on every rebind would re-negotiate every card's layout.
-const HEADER_TITLE_WIDTH_CHARS: i32 = 12;
-
 /// A non-activatable row laying the field name and its value out on one
-/// line: [title | value].
+/// line: [title | value]. The title joins `title_group`, a per-card
+/// SizeGroup that widens every member to its widest field name — so the
+/// gap before the value is the box's fixed spacing, the same in every row
+/// of the group, with no per-name slack. The always-visible rows and the
+/// collapsed Details rows carry separate groups so opening Details never
+/// shifts the visible values.
 fn build_row(
     name: &str,
     value: &impl IsA<gtk::Widget>,
     title_valign: gtk::Align,
+    title_group: &gtk::SizeGroup,
 ) -> gtk::ListBoxRow {
     // Top-aligned titles (wrapping chip rows) get nudged onto the first
     // value line; centered ones need no offset.
@@ -2106,10 +2115,10 @@ fn build_row(
         .halign(gtk::Align::Start)
         .valign(title_valign)
         .margin_top(title_margin_top)
-        .width_chars(HEADER_TITLE_WIDTH_CHARS)
         .xalign(0.0)
         .css_classes(["heading"])
         .build();
+    title_group.add_widget(&title);
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -2117,7 +2126,7 @@ fn build_row(
         .margin_bottom(12)
         .margin_start(12)
         .margin_end(12)
-        .spacing(12)
+        .spacing(24)
         .build();
     content.append(&title);
     content.append(value);
@@ -2130,7 +2139,7 @@ fn build_row(
         .build()
 }
 
-fn build_text_row(name: &str, value: &str) -> gtk::ListBoxRow {
+fn build_text_row(name: &str, value: &str, title_group: &gtk::SizeGroup) -> gtk::ListBoxRow {
     // A wrapping label's natural width is far narrower than its full text,
     // so it must fill its allocation (halign Fill, the default) — with
     // halign Start it would shrink to that natural width and wrap long
@@ -2149,13 +2158,17 @@ fn build_text_row(name: &str, value: &str) -> gtk::ListBoxRow {
         .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
-    build_row(name, &label, gtk::Align::Center)
+    build_row(name, &label, gtk::Align::Center, title_group)
 }
 
 /// Like a text row, but the value never wraps: overlong values (subjects,
 /// author display names, dates) ellipsize instead of growing the row, which
 /// keeps every card of a kind the same height for the row seeds.
-fn build_single_line_row(name: &str, value: &str) -> gtk::ListBoxRow {
+fn build_single_line_row(
+    name: &str,
+    value: &str,
+    title_group: &gtk::SizeGroup,
+) -> gtk::ListBoxRow {
     let label = gtk::Label::builder()
         .use_markup(true)
         .label(format!("<tt>{}</tt>", glib::markup_escape_text(value)))
@@ -2165,7 +2178,7 @@ fn build_single_line_row(name: &str, value: &str) -> gtk::ListBoxRow {
         .xalign(0.0)
         .css_classes(["dim-label"])
         .build();
-    build_row(name, &label, gtk::Align::Center)
+    build_row(name, &label, gtk::Align::Center, title_group)
 }
 
 /// Address rows show parsed pills; if parsing produced nothing but the raw
@@ -2175,9 +2188,10 @@ fn build_address_row(
     raw: &str,
     addrs: &[String],
     overlay: &adw::ToastOverlay,
+    title_group: &gtk::SizeGroup,
 ) -> gtk::ListBoxRow {
     if addrs.is_empty() {
-        return build_text_row(name, raw);
+        return build_text_row(name, raw, title_group);
     }
 
     let wrap = adw::WrapBox::builder()
@@ -2188,7 +2202,7 @@ fn build_address_row(
         wrap.append(&build_address_pill(addr, overlay));
     }
 
-    let row = build_row(name, &wrap, gtk::Align::Start);
+    let row = build_row(name, &wrap, gtk::Align::Start, title_group);
     // Nudge the title down so it baseline-aligns with the first chip line.
     if let Some(title) = wrap
         .parent()

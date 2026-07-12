@@ -348,7 +348,7 @@ fn open_in_new_tab(widget: &impl IsA<gtk::Widget>, slug: &str, description: &str
 /// A plain button rather than a ToggleButton: the starred/unstarred state
 /// already shows through the icon, and a checked ToggleButton would keep a
 /// pressed background.
-fn new_star_button(starred: bool) -> gtk::Button {
+pub(crate) fn new_star_button(starred: bool) -> gtk::Button {
     let button = gtk::Button::builder()
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
@@ -357,7 +357,7 @@ fn new_star_button(starred: bool) -> gtk::Button {
     button
 }
 
-fn apply_star_state(button: &gtk::Button, starred: bool) {
+pub(crate) fn apply_star_state(button: &gtk::Button, starred: bool) {
     button.set_icon_name(if starred {
         "starred-symbolic"
     } else {

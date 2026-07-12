@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -9,6 +9,7 @@ use mailparse::MailHeaderMap;
 
 use crate::composer;
 use crate::favorites::{self, Favorite};
+use crate::inbox_page::{apply_star_state, new_star_button};
 use crate::highlight;
 use crate::lore;
 use crate::remote_page::RemoteContent;
@@ -126,12 +127,14 @@ impl MessageRow {
         composer: &composer::Composer,
         overlay: &adw::ToastOverlay,
         list: &str,
+        fav_hub: &FavoriteHub,
     ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         imp.nav.set(nav.clone()).ok();
         imp.composer.set(composer.clone()).ok();
         imp.list.set(list.to_string()).ok();
+        imp.fav_hub.set(fav_hub.clone()).ok();
         // Weak: the overlay is this row's ancestor, and a strong handle here
         // would cycle the whole page tree alive after it is popped.
         imp.overlay.set(Some(overlay));
@@ -251,7 +254,8 @@ impl MessageRow {
             // as action-missing).
             if let Some(overlay) = imp.overlay.upgrade() {
                 let list = imp.list.get().expect("MessageRow list set");
-                for action in build_favorite_actions(&mail, list, &overlay) {
+                let hub = imp.fav_hub.get().expect("MessageRow fav_hub set");
+                for action in build_favorite_actions(&mail, list, &overlay, hub) {
                     group.add_action(&action);
                 }
             }
@@ -283,7 +287,7 @@ impl MessageRow {
         let composer = imp.composer.get().expect("MessageRow composer set");
         let is_op = imp.is_op.get();
 
-        let header = build_header_list(mail, is_op, &overlay, composer);
+        let header = build_header_list(mail, &overlay, composer);
         // Selectable header labels replace right-clicks with their own stock
         // menu, shadowing the row's; hand them the mail actions as an extra
         // section. The action names resolve against the "mailview" group the
@@ -385,6 +389,9 @@ mod imp {
         /// The lore list slug the thread was opened from, keyed into
         /// favorites so they can be fetched again.
         pub(super) list: OnceCell<String>,
+        /// The page's favorite hub, so this row's Add/Remove context actions
+        /// stay in step with the header star (see FavoriteHub).
+        pub(super) fav_hub: OnceCell<super::FavoriteHub>,
         /// The page's toast overlay, for the header card's address pills.
         /// Weak — it is an ancestor of this row.
         pub(super) overlay: glib::WeakRef<adw::ToastOverlay>,
@@ -394,8 +401,9 @@ mod imp {
         pub(super) header: RefCell<Option<gtk::ListBox>>,
         /// The currently bound message, filled into the buffer on demand.
         pub(super) mail: RefCell<Option<Rc<super::Mail>>>,
-        /// Whether this row shows the thread's first message, whose header
-        /// card omits the Subject row (the pinned title already shows it).
+        /// Whether this row shows the thread's first message. Kept per object
+        /// (not derived from position) because the single view can put a reply
+        /// at position 0; it picks the OP/reply header-height seed slot.
         pub(super) is_op: Cell<bool>,
         /// The bound body's line count, counted once per bind.
         pub(super) body_lines: Cell<i32>,
@@ -1120,26 +1128,142 @@ fn build_thread_content(
     split: &adw::OverlaySplitView,
 ) -> gtk::Box {
     let op = &thread[0];
+    // The single view opens on this message; the header star and Reply act on
+    // it too, so clamp it into range up front.
+    let opened = opened.min(thread.len().saturating_sub(1));
 
     let overlay = adw::ToastOverlay::new();
     // The composer opens targeting the OP; each mail's Reply button can
     // retarget it later.
     let composer = composer::build_composer(build_reply_context(op));
 
-    let title = gtk::Label::builder()
-        .label(&op.subject)
-        .halign(gtk::Align::Start)
-        .hexpand(true)
-        .selectable(true)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .xalign(0.0)
-        .css_classes(["title-2", "monospace"])
+    // Favorites toggled through the header star and through a message's
+    // context menu must agree; the hub keeps every view of a Message-ID in
+    // step. It rides the page, so its listeners drop with it.
+    let hub = FavoriteHub::default();
+
+    // The header star and Reply act on the message in focus: the opened
+    // message in single view, the thread's first message in threaded view.
+    let favorite_of = |mail: &Mail| {
+        mail.message_id.as_ref().map(|id| Favorite {
+            message_id: id.clone(),
+            subject: mail.subject.clone(),
+            date: mail.date.clone(),
+            list: list.to_string(),
+        })
+    };
+    let opened_fav = favorite_of(&thread[opened]);
+    let op_fav = favorite_of(op);
+    let opened_reply = build_reply_context(&thread[opened]);
+    let op_reply = build_reply_context(op);
+
+    // Single view is the default, so both start on the opened message.
+    let star_target = Rc::new(RefCell::new(opened_fav.clone()));
+    let reply_target = Rc::new(RefCell::new(opened_reply.clone()));
+
+    let star_button = new_star_button(false);
+    let refresh_star: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        star_button,
+        #[strong]
+        star_target,
+        move || match star_target.borrow().as_ref() {
+            Some(fav) => {
+                star_button.set_sensitive(true);
+                apply_star_state(&star_button, favorites::is_favorite(&fav.message_id));
+            }
+            // No Message-ID to key a favorite by.
+            None => {
+                star_button.set_sensitive(false);
+                apply_star_state(&star_button, false);
+            }
+        }
+    ));
+    refresh_star();
+    star_button.connect_clicked(glib::clone!(
+        #[weak]
+        overlay,
+        #[strong]
+        star_target,
+        #[strong]
+        hub,
+        move |_| {
+            let Some(fav) = star_target.borrow().clone() else {
+                return;
+            };
+            let added = !favorites::is_favorite(&fav.message_id);
+            hub.toggle(fav);
+            overlay.add_toast(adw::Toast::new(if added {
+                "Added to Favorites"
+            } else {
+                "Removed from Favorites"
+            }));
+        }
+    ));
+    hub.subscribe(Rc::new(glib::clone!(
+        #[strong]
+        star_target,
+        #[strong]
+        refresh_star,
+        move |changed: &str| {
+            if star_target
+                .borrow()
+                .as_ref()
+                .is_some_and(|fav| fav.message_id == changed)
+            {
+                refresh_star();
+            }
+        }
+    )));
+
+    let reply_button = gtk::Button::builder()
+        .icon_name("mail-reply-sender-symbolic")
+        .tooltip_text("Reply")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
         .build();
+    reply_button.connect_clicked(glib::clone!(
+        #[strong]
+        composer,
+        #[strong]
+        reply_target,
+        move |_| composer.start_reply(reply_target.borrow().clone())
+    ));
 
     // Switches the message pane between the single opened message and the
     // whole thread; wired to swap the ListView's model once both are built.
     let view_toggle = build_view_toggle();
+    // Move the star and Reply onto the right message when the view flips.
+    view_toggle.connect_active_notify(glib::clone!(
+        #[strong]
+        star_target,
+        #[strong]
+        reply_target,
+        #[strong]
+        opened_fav,
+        #[strong]
+        op_fav,
+        #[strong]
+        opened_reply,
+        #[strong]
+        op_reply,
+        #[strong]
+        refresh_star,
+        move |toggle| {
+            let single = toggle.active() == 0;
+            *star_target.borrow_mut() = if single {
+                opened_fav.clone()
+            } else {
+                op_fav.clone()
+            };
+            *reply_target.borrow_mut() = if single {
+                opened_reply.clone()
+            } else {
+                op_reply.clone()
+            };
+            refresh_star();
+        }
+    ));
 
     let title_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1149,9 +1273,13 @@ fn build_thread_content(
         .margin_start(12)
         .margin_end(12)
         .build();
-    title_row.append(&title);
+    title_row.append(&reply_button);
+    title_row.append(&star_button);
+    // An empty hexpanding filler pushes the view toggle to the trailing edge
+    // now that no subject label spans the row.
+    title_row.append(&gtk::Box::builder().hexpand(true).build());
     title_row.append(&view_toggle);
-    // Match the bodies' reading width so the title lines up with them.
+    // Match the bodies' reading width so the row lines up with them.
     let title_clamp = adw::Clamp::builder()
         .maximum_size(1100)
         .tightening_threshold(800)
@@ -1175,6 +1303,8 @@ fn build_thread_content(
         overlay,
         #[strong]
         list,
+        #[strong]
+        hub,
         move |_, item| {
             let item = item
                 .downcast_ref::<gtk::ListItem>()
@@ -1188,7 +1318,7 @@ fn build_thread_content(
             item.set_activatable(false);
             item.set_selectable(false);
             item.set_focusable(false);
-            let row = MessageRow::new(&nav, &composer, &overlay, &list);
+            let row = MessageRow::new(&nav, &composer, &overlay, &list, &hub);
             item.set_child(Some(&row));
         }
     ));
@@ -1223,7 +1353,6 @@ fn build_thread_content(
         .enumerate()
         .map(|(index, mail)| MessageObject::new(mail.clone(), index == 0))
         .collect();
-    let opened = opened.min(objects.len().saturating_sub(1));
     for object in &objects {
         model.append(object);
     }
@@ -1812,6 +1941,9 @@ fn build_overview_sidebar(
             .orientation(gtk::Orientation::Vertical)
             .valign(gtk::Align::Center)
             .spacing(2)
+            // A few pixels past the row's own spacing so the text sits a
+            // little clear of the avatar.
+            .margin_start(4)
             .build();
         texts.append(&title_label);
         texts.append(&subtitle_label);
@@ -2096,6 +2228,43 @@ fn build_reply_context(mail: &Mail) -> composer::ReplyContext {
     }
 }
 
+/// A page-scoped hub that keeps every view of a mail's favorite state in
+/// agreement: the header star button and each message's context-menu Add/
+/// Remove actions. Toggling through any of them mutates the store and then
+/// notifies the hub, so the others re-read the new state. It rides the page
+/// (held by its subscribers in the widget tree) and drops with it, so its
+/// listeners never accumulate across thread opens.
+/// A view's callback: refresh yourself, the mail with this Message-ID just
+/// had its favorite state toggled.
+type FavoriteListener = Rc<dyn Fn(&str)>;
+
+#[derive(Clone, Default)]
+struct FavoriteHub {
+    listeners: Rc<RefCell<Vec<FavoriteListener>>>,
+}
+
+impl FavoriteHub {
+    fn subscribe(&self, listener: FavoriteListener) {
+        self.listeners.borrow_mut().push(listener);
+    }
+
+    /// Flip `fav` in the store and tell every view of that Message-ID.
+    fn toggle(&self, fav: Favorite) {
+        let id = fav.message_id.clone();
+        favorites::toggle(fav);
+        self.notify(&id);
+    }
+
+    fn notify(&self, message_id: &str) {
+        // Snapshot first: a listener could, in principle, subscribe another
+        // while running, and mutating a borrowed Vec would panic.
+        let listeners = self.listeners.borrow().clone();
+        for listener in listeners {
+            listener(message_id);
+        }
+    }
+}
+
 /// The "mailview" favorite actions for one message: Add and Remove as a pair,
 /// exactly one enabled at a time (their menu items hide via hidden-when, so
 /// together they read as a single toggling entry). Both stay disabled when the
@@ -2104,6 +2273,7 @@ fn build_favorite_actions(
     mail: &Mail,
     list: &str,
     overlay: &adw::ToastOverlay,
+    hub: &FavoriteHub,
 ) -> [gio::SimpleAction; 2] {
     let fav = mail.message_id.as_ref().map(|id| Favorite {
         message_id: id.clone(),
@@ -2111,36 +2281,60 @@ fn build_favorite_actions(
         date: mail.date.clone(),
         list: list.to_string(),
     });
-    let starred = fav
-        .as_ref()
-        .is_some_and(|fav| favorites::is_favorite(&fav.message_id));
 
     let add = gio::SimpleAction::new("favorite-add", None);
-    add.set_enabled(fav.is_some() && !starred);
     let remove = gio::SimpleAction::new("favorite-remove", None);
-    remove.set_enabled(fav.is_some() && starred);
 
-    // Each action drives the store toward its own named state rather than
-    // blindly flipping: another view of the same mail may have changed the
-    // store since these actions were enabled, and a blind flip would then do
-    // the opposite of what the click asked for.
+    // Both states derive from the store. `refresh` recomputes them, and the
+    // hub calls it whenever this mail's favorite is toggled anywhere on the
+    // page (this menu, or the header star), so the menu never goes stale.
+    let refresh: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        add,
+        #[weak]
+        remove,
+        #[strong]
+        fav,
+        move || {
+            let starred = fav
+                .as_ref()
+                .is_some_and(|fav| favorites::is_favorite(&fav.message_id));
+            add.set_enabled(fav.is_some() && !starred);
+            remove.set_enabled(fav.is_some() && starred);
+        }
+    ));
+    refresh();
+    if let Some(fav) = &fav {
+        let id = fav.message_id.clone();
+        hub.subscribe(Rc::new(glib::clone!(
+            #[strong]
+            refresh,
+            move |changed: &str| {
+                if changed == id {
+                    refresh();
+                }
+            }
+        )));
+    }
+
+    // Each action drives the store toward its own named state (rather than
+    // blindly flipping) and then notifies the hub, which resyncs this menu
+    // and the header star.
     let activate = |target: bool| {
         glib::clone!(
-            #[weak]
-            add,
-            #[weak]
-            remove,
             #[weak]
             overlay,
             #[strong]
             fav,
+            #[strong]
+            hub,
             move |_: &gio::SimpleAction, _: Option<&glib::Variant>| {
                 let Some(fav) = &fav else { return };
                 if favorites::is_favorite(&fav.message_id) != target {
-                    favorites::toggle(fav.clone());
+                    hub.toggle(fav.clone());
+                } else {
+                    hub.notify(&fav.message_id);
                 }
-                add.set_enabled(!target);
-                remove.set_enabled(target);
                 overlay.add_toast(adw::Toast::new(if target {
                     "Added to Favorites"
                 } else {
@@ -2221,7 +2415,6 @@ fn build_reply_button(mail: &Mail, composer: &composer::Composer) -> gtk::Button
 /// exact (see header_height).
 fn build_header_list(
     mail: &Mail,
-    is_op: bool,
     overlay: &adw::ToastOverlay,
     composer: &composer::Composer,
 ) -> gtk::ListBox {
@@ -2243,18 +2436,15 @@ fn build_header_list(
     let visible_titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
     let detail_titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
 
-    // A reply's Subject row doubles as its toolbar: the Reply button trails
-    // the hexpanding value label. The OP's subject already heads the page as
-    // its title, so its Subject row is omitted and its Reply button sits in
-    // the title row instead.
-    if !is_op {
-        let subject_row = build_single_line_row("Subject", &mail.subject, &visible_titles);
-        subject_row.set_tooltip_text(Some(&mail.subject));
-        if let Some(content) = subject_row.child().and_downcast::<gtk::Box>() {
-            content.append(&build_reply_button(mail, composer));
-        }
-        list.append(&subject_row);
+    // The Subject row doubles as the card's toolbar: the Reply button trails
+    // the hexpanding value label. Every card carries it now — the OP's too,
+    // since the page no longer heads itself with the subject.
+    let subject_row = build_single_line_row("Subject", &mail.subject, &visible_titles);
+    subject_row.set_tooltip_text(Some(&mail.subject));
+    if let Some(content) = subject_row.child().and_downcast::<gtk::Box>() {
+        content.append(&build_reply_button(mail, composer));
     }
+    list.append(&subject_row);
 
     list.append(&build_single_line_row("Author", &mail.from, &visible_titles));
     list.append(&build_single_line_row("Date", &mail.date, &visible_titles));

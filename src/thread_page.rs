@@ -247,13 +247,13 @@ impl MessageRow {
 
             let nav = imp.nav.get().expect("MessageRow nav set");
             let composer = imp.composer.get().expect("MessageRow composer set");
-            let group = build_body_action_group(&mail, &view, nav, composer);
+            let list = imp.list.get().expect("MessageRow list set");
+            let group = build_body_action_group(&mail, &view, nav, composer, list);
             // Added here rather than in build_body_action_group because they
             // need the toast overlay, which only the row holds (weakly — it
             // may already be gone during page teardown; the items then hide
             // as action-missing).
             if let Some(overlay) = imp.overlay.upgrade() {
-                let list = imp.list.get().expect("MessageRow list set");
                 let hub = imp.fav_hub.get().expect("MessageRow fav_hub set");
                 for action in build_favorite_actions(&mail, list, &overlay, hub) {
                     group.add_action(&action);
@@ -573,6 +573,7 @@ fn build_body_menu() -> gio::Menu {
 
     let mail_section = gio::Menu::new();
     mail_section.append(Some("_Reply"), Some("mailview.reply"));
+    mail_section.append(Some("Open in New _Tab"), Some("mailview.open-new-tab"));
     mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
     mail_section.append(Some("View _Raw"), Some("mailview.raw"));
 
@@ -592,6 +593,7 @@ fn build_body_action_group(
     view: &gtk::TextView,
     nav: &adw::NavigationView,
     composer: &composer::Composer,
+    list: &str,
 ) -> gio::SimpleActionGroup {
     let insert_quoted = |prefix: Option<String>| {
         glib::clone!(
@@ -651,7 +653,7 @@ fn build_body_action_group(
     group.add_action(&quote_with_date);
     group.add_action(&copy);
     group.add_action(&select_all);
-    for action in build_mail_actions(mail, view.upcast_ref(), nav, composer) {
+    for action in build_mail_actions(mail, view.upcast_ref(), nav, composer, list) {
         group.add_action(&action);
     }
     group
@@ -2102,16 +2104,16 @@ fn scroll_to_match(
     });
 }
 
-/// The find-in-thread bar: a search entry with a match counter, prev/next
-/// buttons, and a scope toggle (this message vs the whole thread). Revealed by
-/// Ctrl+F (start_thread_search); Enter / Shift+Enter (and Ctrl+G / Ctrl+Shift+G)
-/// step through matches, Escape closes it.
+/// The find-in-thread bar: a search entry with a match counter and prev/next
+/// buttons. Revealed by Ctrl+F (start_thread_search); the buttons (reachable by
+/// Tab) step through matches, Escape closes it.
 ///
-/// Matches are found in the raw body strings — no need to have filled every
-/// row's TextView — so the counter is exact across the whole thread; the hit
-/// itself is painted only in the message it lands in, when the scroll fills
-/// that row. Whole-thread scope reaches messages the single view can't show,
-/// so selecting a hit outside the opened message flips to threaded view first.
+/// Search follows the current view — only the opened message in single view,
+/// the whole thread in threaded view — mirroring the view toggle rather than
+/// carrying a scope control of its own. Matches are found in the raw body
+/// strings (no need to have filled every row's TextView), so the counter is
+/// exact; the hit itself is painted only in the message it lands in, when the
+/// scroll fills that row.
 fn build_thread_search(
     list_view: &gtk::ListView,
     view_toggle: &adw::ToggleGroup,
@@ -2132,11 +2134,11 @@ fn build_thread_search(
 
     let prev_button = gtk::Button::builder()
         .icon_name("go-up-symbolic")
-        .tooltip_text("Previous match (Shift+Enter)")
+        .tooltip_text("Previous match")
         .build();
     let next_button = gtk::Button::builder()
         .icon_name("go-down-symbolic")
-        .tooltip_text("Next match (Enter)")
+        .tooltip_text("Next match")
         .build();
     let nav_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -2145,21 +2147,6 @@ fn build_thread_search(
     nav_box.append(&prev_button);
     nav_box.append(&next_button);
 
-    let scope = adw::ToggleGroup::builder().css_classes(["flat"]).build();
-    scope.add(
-        adw::Toggle::builder()
-            .label("Message")
-            .tooltip("Search the message you're reading")
-            .build(),
-    );
-    scope.add(
-        adw::Toggle::builder()
-            .label("Thread")
-            .tooltip("Search every message in the thread")
-            .build(),
-    );
-    scope.set_active(0);
-
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -2167,7 +2154,6 @@ fn build_thread_search(
     row.append(&entry);
     row.append(&count_label);
     row.append(&nav_box);
-    row.append(&scope);
     let clamp = adw::Clamp::builder()
         .maximum_size(1100)
         .tightening_threshold(800)
@@ -2219,12 +2205,10 @@ fn build_thread_search(
             current.set(Some(index));
             count_label.set_text(&format!("{} of {}", index + 1, total));
 
-            let position = if view_toggle.active() == 0 && hit.msg != opened {
-                // Single view holds only the opened message; the whole-thread
-                // hit needs the threaded model under the ListView first.
-                view_toggle.set_active(1);
-                hit.msg as u32
-            } else if view_toggle.active() == 0 {
+            // Search follows the current view: single view shows only the
+            // opened message (position 0), threaded shows every message in
+            // thread order, so a hit's position is its message index.
+            let position = if view_toggle.active() == 0 {
                 0
             } else {
                 hit.msg as u32
@@ -2250,8 +2234,6 @@ fn build_thread_search(
         #[weak]
         entry,
         #[weak]
-        scope,
-        #[weak]
         list_view,
         #[weak]
         view_toggle,
@@ -2274,23 +2256,23 @@ fn build_thread_search(
         move || {
             let query = entry.text().to_string();
             let needle = fold_query(&query);
-            let thread_scope = scope.active() == 1;
+            let single = view_toggle.active() == 0;
 
-            // The "this message" anchor tracks where the reader is: the opened
-            // message in single view, the one at the viewport top in threaded.
-            if !thread_scope {
-                let here = if view_toggle.active() == 0 {
-                    opened
-                } else {
-                    message_at_viewport_top(&list_view, &mails).unwrap_or_else(|| anchor.get())
-                };
-                anchor.set(here);
-            }
-
-            let indices: Vec<usize> = if thread_scope {
-                (0..mails.len()).collect()
+            // The landing anchor tracks where the reader is: the opened message
+            // in single view, the message at the viewport top in threaded.
+            let here = if single {
+                opened
             } else {
-                vec![anchor.get()]
+                message_at_viewport_top(&list_view, &mails).unwrap_or_else(|| anchor.get())
+            };
+            anchor.set(here);
+
+            // Search follows the current view: only the opened message in
+            // single view, the whole thread in threaded view.
+            let indices: Vec<usize> = if single {
+                vec![opened]
+            } else {
+                (0..mails.len()).collect()
             };
             let mut found = Vec::new();
             if !needle.is_empty() {
@@ -2350,21 +2332,8 @@ fn build_thread_search(
         recompute,
         move |_| recompute()
     ));
-    entry.connect_activate(glib::clone!(
-        #[strong]
-        step,
-        move |_| step(1)
-    ));
-    entry.connect_next_match(glib::clone!(
-        #[strong]
-        step,
-        move |_| step(1)
-    ));
-    entry.connect_previous_match(glib::clone!(
-        #[strong]
-        step,
-        move |_| step(-1)
-    ));
+    // No Enter/Ctrl+G stepping on the entry: stepping is the two buttons,
+    // reachable by Tab, so there is one obvious way to move between matches.
     next_button.connect_clicked(glib::clone!(
         #[strong]
         step,
@@ -2376,18 +2345,17 @@ fn build_thread_search(
         move |_| step(-1)
     ));
 
-    scope.connect_active_notify(glib::clone!(
+    // Search scope mirrors the view toggle, so re-run the search when the user
+    // switches between single and threaded while the bar is open.
+    view_toggle.connect_active_notify(glib::clone!(
         #[weak]
-        view_toggle,
+        search_bar,
         #[strong]
         recompute,
-        move |scope| {
-            // Whole-thread search must be able to reach every message, which
-            // only the threaded model exposes.
-            if scope.active() == 1 && view_toggle.active() == 0 {
-                view_toggle.set_active(1);
+        move |_| {
+            if search_bar.is_search_mode() {
+                recompute();
             }
-            recompute();
         }
     ));
 
@@ -2700,6 +2668,7 @@ fn build_overview_sidebar(
 fn build_header_extra_menu() -> gio::Menu {
     let mail_section = gio::Menu::new();
     mail_section.append(Some("_Reply"), Some("mailview.reply"));
+    mail_section.append(Some("Open in New _Tab"), Some("mailview.open-new-tab"));
     mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
     mail_section.append(Some("View _Raw"), Some("mailview.raw"));
 
@@ -3143,7 +3112,8 @@ fn build_mail_actions(
     widget: &gtk::Widget,
     nav: &adw::NavigationView,
     composer: &composer::Composer,
-) -> [gio::SimpleAction; 3] {
+    list: &str,
+) -> [gio::SimpleAction; 4] {
     let reply = gio::SimpleAction::new("reply", None);
     let reply_context = build_reply_context(mail);
     reply.connect_activate(glib::clone!(
@@ -3152,11 +3122,19 @@ fn build_mail_actions(
         move |_, _| composer.start_reply(reply_context.clone())
     ));
 
-    let open_web = gio::SimpleAction::new("open-web", None);
-    let lore_url = mail.message_id.as_deref().map(|id| {
-        let bare = id.trim().trim_start_matches('<').trim_end_matches('>');
-        format!("https://lore.kernel.org/r/{bare}/")
+    // The bare Message-ID (angle brackets stripped), shared by the lore URL
+    // and the new-tab open, which both address a message by it.
+    let bare_id = mail.message_id.as_deref().map(|id| {
+        id.trim()
+            .trim_start_matches('<')
+            .trim_end_matches('>')
+            .to_string()
     });
+
+    let open_web = gio::SimpleAction::new("open-web", None);
+    let lore_url = bare_id
+        .as_deref()
+        .map(|bare| format!("https://lore.kernel.org/r/{bare}/"));
     open_web.set_enabled(lore_url.is_some());
     open_web.connect_activate(glib::clone!(
         #[weak]
@@ -3164,6 +3142,25 @@ fn build_mail_actions(
         move |_, _| {
             if let Some(url) = &lore_url {
                 launch_uri(&widget, url);
+            }
+        }
+    ));
+
+    // Open this message on its own in a new tab: build_thread_page opens single
+    // view on the given Message-ID, so the new tab lands showing just it.
+    let open_new_tab = gio::SimpleAction::new("open-new-tab", None);
+    open_new_tab.set_enabled(bare_id.is_some());
+    let list = list.to_string();
+    open_new_tab.connect_activate(glib::clone!(
+        #[weak]
+        widget,
+        move |_, _| {
+            let Some(bare) = &bare_id else { return };
+            if let Some(tab_view) = widget
+                .ancestor(adw::TabView::static_type())
+                .and_downcast::<adw::TabView>()
+            {
+                crate::open_thread_in_new_tab(&tab_view, &list, bare);
             }
         }
     ));
@@ -3177,7 +3174,7 @@ fn build_mail_actions(
         move |_, _| nav.push(&build_raw_page(&raw_text, &subject))
     ));
 
-    [reply, open_web, raw]
+    [reply, open_web, open_new_tab, raw]
 }
 
 fn build_raw_page(raw: &str, subject: &str) -> adw::NavigationPage {

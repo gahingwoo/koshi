@@ -1193,11 +1193,38 @@ fn build_thread_content(
     let selection = gtk::NoSelection::new(Some(single_model.clone()));
     let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory));
     list_view.set_single_click_activate(false);
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .child(&list_view)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .build();
+
+    // A brief blank cover over the message pane on every view switch. The
+    // model swap itself is instant, and when the opened message is the OP the
+    // two views start out pixel-identical — without a visible beat the toggle
+    // looks like it did nothing. Same overlay-above-content shape as
+    // RemoteContent's loading cover, but bare: the beat is far below the
+    // show-a-spinner threshold, so it reads as a page flicker, not a load.
+    let switch_cover = adw::Bin::builder()
+        .css_classes(["background"])
+        .visible(false)
+        .build();
+    let pane = gtk::Overlay::builder().child(&scrolled).build();
+    pane.add_overlay(&switch_cover);
+
+    // Generation counter so a toggle during the cover's beat extends it
+    // rather than letting the earlier timeout cut the new beat short.
+    let switch_generation = Rc::new(Cell::new(0u32));
     view_toggle.connect_active_notify(glib::clone!(
         #[strong]
         model,
         #[strong]
         single_model,
+        #[strong]
+        switch_generation,
+        #[weak]
+        switch_cover,
         move |toggle| {
             // Toggle index 0 is Single, 1 is Threaded (see build_view_toggle).
             if toggle.active() == 0 {
@@ -1205,14 +1232,25 @@ fn build_thread_content(
             } else {
                 selection.set_model(Some(&model));
             }
+            switch_cover.set_visible(true);
+            let generation = switch_generation.get() + 1;
+            switch_generation.set(generation);
+            glib::timeout_add_local_once(
+                std::time::Duration::from_millis(200),
+                glib::clone!(
+                    #[strong]
+                    switch_generation,
+                    #[weak]
+                    switch_cover,
+                    move || {
+                        if switch_generation.get() == generation {
+                            switch_cover.set_visible(false);
+                        }
+                    }
+                ),
+            );
         }
     ));
-
-    let scrolled = gtk::ScrolledWindow::builder()
-        .child(&list_view)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .build();
 
     // Background warmup. GtkListView keeps every row of a <=205-item model
     // realized (a hardcoded widget window), so the expensive part — body
@@ -1278,7 +1316,7 @@ fn build_thread_content(
     // away with it, so the subject and view toggle stay reachable.
     let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
     inner.append(&title_clamp);
-    inner.append(&scrolled);
+    inner.append(&pane);
     overlay.set_child(Some(&inner));
 
     // The composer sits below the scrolling mail body in a plain box, so it

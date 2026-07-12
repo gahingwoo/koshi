@@ -542,7 +542,16 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         }
     ));
 
-    let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    // The composer floats over the bottom of the mail pane (see thread_page),
+    // so it needs an opaque background and a top divider of its own: bottom-
+    // anchored, it is the collapsed bar while shut and grows up over the
+    // content when open.
+    let widget = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .valign(gtk::Align::End)
+        .css_classes(["background"])
+        .build();
+    widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     widget.append(&header_bar);
     widget.append(&editor_revealer);
 

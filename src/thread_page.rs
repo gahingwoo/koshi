@@ -1319,14 +1319,32 @@ fn build_thread_content(
     inner.append(&pane);
     overlay.set_child(Some(&inner));
 
-    // The composer sits below the scrolling mail body in a plain box, so it
-    // stays visible without living in a ToolbarView bottom bar (whose
-    // GtkWindowHandle wrapper would turn clicks and drags on the composer
-    // padding into window move/maximize gestures).
+    // The composer floats over the bottom of the mail pane rather than living
+    // below it in the layout. If it shared the layout, expanding it would
+    // shrink the scroller's viewport, and GtkListView re-anchors on a resize
+    // — so a partially-scrolled message would jump. Instead a fixed strip is
+    // reserved at the bottom of the scroller for the collapsed bar (measured
+    // once, when the bar first maps), and the expanded editor overlays the
+    // bottom of the content. The viewport never changes size, so the scroll
+    // position — the top line the reader is looking at — stays put.
+    let composer_widget = composer.widget().clone();
+    pane.add_overlay(&composer_widget);
+    pane.set_measure_overlay(&composer_widget, false);
+
+    let reserved = Cell::new(false);
+    composer_widget.connect_map(glib::clone!(
+        #[weak]
+        scrolled,
+        move |bar| {
+            if reserved.replace(true) {
+                return;
+            }
+            scrolled.set_margin_bottom(bar.measure(gtk::Orientation::Vertical, -1).1);
+        }
+    ));
+
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.append(&overlay);
-    content_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    content_box.append(composer.widget());
 
     // This content is mounted underneath RemoteContent's loading cover, so
     // the rows can lay out, fill and paint while the spinner keeps spinning;

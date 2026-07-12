@@ -58,7 +58,10 @@ pub fn save(state: WindowState) {
         "fullscreen": state.fullscreen,
     });
     if let Err(err) = write_atomically(&path, &value.to_string()) {
-        eprintln!("koshi: failed to save window state to {}: {err}", path.display());
+        eprintln!(
+            "koshi: failed to save window state to {}: {err}",
+            path.display()
+        );
     }
 }
 
@@ -85,7 +88,8 @@ mod tests {
 
     impl ScratchStore {
         fn new(test_name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!("koshi-{test_name}-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("koshi-{test_name}-{}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
             Self { dir }
         }

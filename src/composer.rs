@@ -654,8 +654,8 @@ fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> (gtk::Overlay, 
         scrolled,
         move || {
             let layout = view.create_pango_layout(Some(&"0".repeat(WRAP_WIDTH)));
-            let offset = view.left_margin() + layout.pixel_size().0
-                - scrolled.hadjustment().value() as i32;
+            let offset =
+                view.left_margin() + layout.pixel_size().0 - scrolled.hadjustment().value() as i32;
             ruler.set_visible(offset >= 0);
             ruler.set_margin_start(offset.max(0));
         }
@@ -691,7 +691,9 @@ fn build_trailer_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::
                 return;
             };
             let trailer = format!("{kind}: {IDENTITY}");
-            state.body.set_text(&append_trailer(&state.body_text(), &trailer));
+            state
+                .body
+                .set_text(&append_trailer(&state.body_text(), &trailer));
         }
     ));
     let group = gio::SimpleActionGroup::new();
@@ -925,7 +927,10 @@ mod tests {
         let url = format!("https://example.com/{}", "x".repeat(80));
         let input = format!("see {url} for details");
         let wrapped = rewrap(&input, 72);
-        assert!(wrapped.lines().any(|line| line == url), "URL broken: {wrapped:?}");
+        assert!(
+            wrapped.lines().any(|line| line == url),
+            "URL broken: {wrapped:?}"
+        );
     }
 
     #[test]
@@ -949,7 +954,10 @@ mod tests {
     fn append_trailer_manages_newlines() {
         let trailer = "Reviewed-by: nika <nika@nikableh.moe>";
         assert_eq!(append_trailer("", trailer), format!("{trailer}\n"));
-        assert_eq!(append_trailer("body", trailer), format!("body\n{trailer}\n"));
+        assert_eq!(
+            append_trailer("body", trailer),
+            format!("body\n{trailer}\n")
+        );
         assert_eq!(
             append_trailer("body\n", trailer),
             format!("body\n{trailer}\n")

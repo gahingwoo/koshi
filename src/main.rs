@@ -34,8 +34,7 @@ const APP_ICON: &str = std::cfg_select! {
 };
 
 fn main() -> glib::ExitCode {
-    gio::resources_register_include!("koshi.gresource")
-        .expect("failed to register resources");
+    gio::resources_register_include!("koshi.gresource").expect("failed to register resources");
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_startup(|_| {
@@ -224,7 +223,11 @@ fn setup_search(search_entry: &gtk::SearchEntry, tab_view: &adw::TabView) {
             // into single spaces so the query stays one line — both for the
             // search request and for the header/status labels that display it,
             // where embedded newlines would defeat their ellipsization.
-            let text = entry.text().split_whitespace().collect::<Vec<_>>().join(" ");
+            let text = entry
+                .text()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
             if text.is_empty() {
                 return;
             }
@@ -359,8 +362,9 @@ fn setup_tab_context_menu(tab_view: &adw::TabView) {
         #[weak]
         tab_view,
         move |_, _| {
-            let pages: Vec<adw::TabPage> =
-                (0..tab_view.n_pages()).map(|i| tab_view.nth_page(i)).collect();
+            let pages: Vec<adw::TabPage> = (0..tab_view.n_pages())
+                .map(|i| tab_view.nth_page(i))
+                .collect();
             for page in pages {
                 if page.is_pinned() {
                     tab_view.set_page_pinned(&page, false);
@@ -757,7 +761,9 @@ mod tests {
     #[test]
     fn message_ids_are_recognized_but_queries_are_not() {
         assert!(looks_like_message_id("<some-id@example.org>"));
-        assert!(looks_like_message_id("20260705200723.66564929@pumpkin.example"));
+        assert!(looks_like_message_id(
+            "20260705200723.66564929@pumpkin.example"
+        ));
         assert!(!looks_like_message_id("f:torvalds@linux-foundation.org"));
         assert!(!looks_like_message_id("sched fix regression"));
     }

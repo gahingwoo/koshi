@@ -34,7 +34,10 @@ enum State {
     /// After a diff header, before the first hunk: meta lines are expected.
     Preamble,
     /// Inside a hunk with this many old/new lines still unaccounted for.
-    Hunk { old: u64, new: u64 },
+    Hunk {
+        old: u64,
+        new: u64,
+    },
     /// Hunk counts exhausted: only a new hunk, a new header or a
     /// "\ No newline..." marker may continue the diff.
     AfterHunk,
@@ -93,7 +96,13 @@ pub fn classify(text: &str) -> Vec<Span> {
         let line_chars = line.chars().count();
         match outcome {
             Outcome::InDiff(kind) => {
-                push(&mut spans, n, 0, prefix, (depth > 0).then_some(Kind::Quote(depth)));
+                push(
+                    &mut spans,
+                    n,
+                    0,
+                    prefix,
+                    (depth > 0).then_some(Kind::Quote(depth)),
+                );
                 push(&mut spans, n, prefix, line_chars, kind);
             }
             Outcome::NotDiff => {
@@ -109,7 +118,12 @@ fn push(spans: &mut Vec<Span>, line: usize, start: usize, end: usize, kind: Opti
     if let Some(kind) = kind
         && start < end
     {
-        spans.push(Span { line, start, end, kind });
+        spans.push(Span {
+            line,
+            start,
+            end,
+            kind,
+        });
     }
 }
 
@@ -149,13 +163,22 @@ fn step(state: State, content: &str, next_is_plus: bool, quoted: bool) -> (State
             // Some mail systems strip the lone leading space from blank
             // context lines, so an empty content line counts as context.
             if content.starts_with('\\') {
-                (State::Hunk { old, new }, Outcome::InDiff(Some(Kind::DiffMeta)))
+                (
+                    State::Hunk { old, new },
+                    Outcome::InDiff(Some(Kind::DiffMeta)),
+                )
             } else if (content.starts_with(' ') || content.is_empty()) && old > 0 && new > 0 {
                 (hunk_state(old - 1, new - 1), Outcome::InDiff(None))
             } else if content.starts_with('-') && old > 0 {
-                (hunk_state(old - 1, new), Outcome::InDiff(Some(Kind::DiffRemove)))
+                (
+                    hunk_state(old - 1, new),
+                    Outcome::InDiff(Some(Kind::DiffRemove)),
+                )
             } else if content.starts_with('+') && new > 0 {
-                (hunk_state(old, new - 1), Outcome::InDiff(Some(Kind::DiffAdd)))
+                (
+                    hunk_state(old, new - 1),
+                    Outcome::InDiff(Some(Kind::DiffAdd)),
+                )
             } else {
                 // Truncated or trimmed diff: stop here, keep what was tagged.
                 (State::None, Outcome::NotDiff)
@@ -235,7 +258,9 @@ const REMOVE_TAG: &str = "koshi-diff-remove";
 const HUNK_TAG: &str = "koshi-diff-hunk";
 const HEADER_TAG: &str = "koshi-diff-header";
 const META_TAG: &str = "koshi-diff-meta";
-const ALL_TAGS: [&str; 6] = [QUOTE_TAG, ADD_TAG, REMOVE_TAG, HUNK_TAG, HEADER_TAG, META_TAG];
+const ALL_TAGS: [&str; 6] = [
+    QUOTE_TAG, ADD_TAG, REMOVE_TAG, HUNK_TAG, HEADER_TAG, META_TAG,
+];
 
 /// GNOME palette colors per scheme: quote, then add, remove, hunk, header,
 /// meta.
@@ -366,7 +391,9 @@ pub fn refresh(buffer: &gtk::TextBuffer) {
 
     let spans = classify(&text);
     let key = buffer.as_ptr() as usize;
-    let old = SPAN_CACHE.with_borrow(|cache| cache.get(&key).cloned()).unwrap_or_default();
+    let old = SPAN_CACHE
+        .with_borrow(|cache| cache.get(&key).cloned())
+        .unwrap_or_default();
 
     let by_line = |spans: &[Span], lines: usize| {
         let mut per: Vec<Vec<Span>> = vec![Vec::new(); lines];
@@ -525,7 +552,10 @@ nika";
         let lines = kinds_by_line(body);
         assert!(lines[0].is_empty());
         assert!(lines[2].is_empty(), "git-email --- separator tagged");
-        assert!(lines[3].is_empty() && lines[4].is_empty(), "diffstat tagged");
+        assert!(
+            lines[3].is_empty() && lines[4].is_empty(),
+            "diffstat tagged"
+        );
         assert_eq!(lines[6], [Kind::DiffHeader]);
         assert_eq!(lines[7], [Kind::DiffMeta]);
         assert_eq!(lines[8], [Kind::DiffHeader]);
@@ -582,8 +612,14 @@ a --> b";
 >> +not a diff line";
         let spans: Vec<Span> = classify(body).into_iter().filter(|s| s.line == 6).collect();
         assert_eq!(spans.len(), 2);
-        assert_eq!((spans[0].kind, spans[0].start, spans[0].end), (Kind::Quote(1), 0, 2));
-        assert_eq!((spans[1].kind, spans[1].start, spans[1].end), (Kind::DiffAdd, 2, 8));
+        assert_eq!(
+            (spans[0].kind, spans[0].start, spans[0].end),
+            (Kind::Quote(1), 0, 2)
+        );
+        assert_eq!(
+            (spans[1].kind, spans[1].start, spans[1].end),
+            (Kind::DiffAdd, 2, 8)
+        );
 
         // Depth change resets diff state: the depth-2 line is quote-only.
         let lines = kinds_by_line(body);
@@ -679,12 +715,17 @@ diff --git a/f b/f
 
     #[test]
     fn crlf_body_classifies_like_lf() {
-        let body = "diff --git a/f b/f\r\n--- a/f\r\n+++ b/f\r\n@@ -1,3 +1,3 @@\r\n-old\r\n\r\n+new\r\n";
+        let body =
+            "diff --git a/f b/f\r\n--- a/f\r\n+++ b/f\r\n@@ -1,3 +1,3 @@\r\n-old\r\n\r\n+new\r\n";
         let lines = kinds_by_line(body);
         assert_eq!(lines[0], [Kind::DiffHeader]);
         assert_eq!(lines[3], [Kind::DiffHunk]);
         assert_eq!(lines[4], [Kind::DiffRemove]);
-        assert!(lines[5].is_empty(), "stripped blank context line tagged: {:?}", lines[5]);
+        assert!(
+            lines[5].is_empty(),
+            "stripped blank context line tagged: {:?}",
+            lines[5]
+        );
         assert_eq!(lines[6], [Kind::DiffAdd]);
     }
 }

@@ -105,7 +105,10 @@ fn save() {
     });
     let value = serde_json::json!({ "mails": mails, "inboxes": inboxes });
     if let Err(err) = write_atomically(&path, &value.to_string()) {
-        eprintln!("koshi: failed to save favorites to {}: {err}", path.display());
+        eprintln!(
+            "koshi: failed to save favorites to {}: {err}",
+            path.display()
+        );
     }
 }
 
@@ -263,8 +266,8 @@ mod tests {
 
     impl ScratchStore {
         fn new(test_name: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("koshi-{test_name}-{}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("koshi-{test_name}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             Self { dir }
         }
@@ -299,7 +302,10 @@ mod tests {
         assert_eq!(reloaded[0].subject, "subject for <p@example>");
         assert_eq!(reloaded[0].date, "Thu, 3 Jul 2026 12:00:00 +0000");
         assert_eq!(reloaded[0].list, "lkml");
-        assert_eq!(all_inboxes()[0].description, "description for rust-for-linux");
+        assert_eq!(
+            all_inboxes()[0].description,
+            "description for rust-for-linux"
+        );
     }
 
     #[test]

@@ -82,7 +82,11 @@ fn load(remote: RemoteContent, nav: adw::NavigationView, entry: gtk::SearchEntry
 /// The full list is built exactly once — regenerating its hundreds of rows
 /// on every star click stalls noticeably — so a toggle only updates star
 /// icons in place and regenerates the small favorites section.
-fn build_content(nav: &adw::NavigationView, inboxes: Vec<Inbox>, entry: &gtk::SearchEntry) -> gtk::Box {
+fn build_content(
+    nav: &adw::NavigationView,
+    inboxes: Vec<Inbox>,
+    entry: &gtk::SearchEntry,
+) -> gtk::Box {
     let container = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -155,7 +159,11 @@ fn build_content(nav: &adw::NavigationView, inboxes: Vec<Inbox>, entry: &gtk::Se
         nav,
         move |_, row| {
             let inbox = &inboxes[row.index() as usize];
-            nav.push(&build_thread_list_page(&nav, &inbox.slug, &inbox.description));
+            nav.push(&build_thread_list_page(
+                &nav,
+                &inbox.slug,
+                &inbox.description,
+            ));
         }
     ));
 

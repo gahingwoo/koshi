@@ -64,7 +64,11 @@ pub fn build_profile_button() -> gtk::MenuButton {
     button
 }
 
-fn build_content(popover: &gtk::Popover, button: &gtk::MenuButton, profile: &Profile) -> gtk::Widget {
+fn build_content(
+    popover: &gtk::Popover,
+    button: &gtk::MenuButton,
+    profile: &Profile,
+) -> gtk::Widget {
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)

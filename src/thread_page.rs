@@ -45,7 +45,11 @@ impl MessageObject {
     }
 
     fn message(&self) -> Rc<Mail> {
-        self.imp().mail.get().expect("MessageObject mail set").clone()
+        self.imp()
+            .mail
+            .get()
+            .expect("MessageObject mail set")
+            .clone()
     }
 
     /// Whether this message is the thread's OP. Tracked on the object rather
@@ -273,7 +277,10 @@ impl MessageRow {
         // section. The action names resolve against the "mailview" group the
         // fill just inserted on this row.
         add_label_extra_menus(header.upcast_ref(), &build_header_extra_menu());
-        let content = imp.content.get().expect("ensure_view built the content box");
+        let content = imp
+            .content
+            .get()
+            .expect("ensure_view built the content box");
         content.prepend(&header);
 
         // First card of this kind anywhere: learn its exact height so every
@@ -337,7 +344,7 @@ mod imp {
     use adw::subclass::prelude::*;
     use gtk::{gdk, gio, glib};
 
-    use super::{build_body_menu, Mail};
+    use super::{Mail, build_body_menu};
     use crate::composer;
     use crate::highlight;
 
@@ -521,11 +528,7 @@ mod imp {
             self.view.get().expect("view just set")
         }
 
-        pub fn set_selection_actions_enabled(
-            &self,
-            group: &gio::SimpleActionGroup,
-            enabled: bool,
-        ) {
+        pub fn set_selection_actions_enabled(&self, group: &gio::SimpleActionGroup, enabled: bool) {
             for name in ["quote-selection", "quote-with-date", "copy"] {
                 if let Some(action) = group.lookup_action(name)
                     && let Ok(action) = action.downcast::<gio::SimpleAction>()
@@ -703,7 +706,10 @@ fn message_fill_step(
             if distance == 0.0 {
                 ready = false;
             }
-            if paint.as_ref().is_none_or(|(nearest, _)| distance < *nearest) {
+            if paint
+                .as_ref()
+                .is_none_or(|(nearest, _)| distance < *nearest)
+            {
                 paint = Some((distance, row));
             }
         }
@@ -976,7 +982,14 @@ pub fn build_thread_page(
 
     let page = adw::NavigationPage::new(&split, "Loading…");
     page.set_widget_name(THREAD_PAGE_NAME);
-    spawn_thread_load(remote, split, nav.clone(), page.clone(), list.to_string(), message_id.to_string());
+    spawn_thread_load(
+        remote,
+        split,
+        nav.clone(),
+        page.clone(),
+        list.to_string(),
+        message_id.to_string(),
+    );
     page
 }
 
@@ -1062,9 +1075,12 @@ fn show_thread_error(
     remote.show_error(
         error,
         move || {
-            let (Some(remote), Some(split), Some(nav), Some(page)) =
-                (weak.upgrade(), split.upgrade(), nav.upgrade(), page.upgrade())
-            else {
+            let (Some(remote), Some(split), Some(nav), Some(page)) = (
+                weak.upgrade(),
+                split.upgrade(),
+                nav.upgrade(),
+                page.upgrade(),
+            ) else {
                 return;
             };
             spawn_thread_load(remote, split, nav, page, list.clone(), message_id.clone());
@@ -1427,7 +1443,11 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
     let mut stack: Vec<Pending> = roots
         .iter()
         .rev()
-        .map(|&index| Pending { index, depth: 0, parent_row: None })
+        .map(|&index| Pending {
+            index,
+            depth: 0,
+            parent_row: None,
+        })
         .collect();
     loop {
         while let Some(pending) = stack.pop() {
@@ -1456,7 +1476,11 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
         // Messages caught in a reference cycle have no root to be reached
         // from; surface the first stranded one as a root and keep going.
         match emitted.iter().position(|&done| !done) {
-            Some(index) => stack.push(Pending { index, depth: 0, parent_row: None }),
+            Some(index) => stack.push(Pending {
+                index,
+                depth: 0,
+                parent_row: None,
+            }),
             None => return rows,
         }
     }
@@ -1524,10 +1548,18 @@ fn overview_date(date: &str) -> String {
 /// subject never has to be dropped to signal it.
 fn overview_row_texts(mail: &Mail) -> (String, String) {
     let title = mail.subject.trim();
-    let title = if title.is_empty() { "(no subject)" } else { title };
+    let title = if title.is_empty() {
+        "(no subject)"
+    } else {
+        title
+    };
     (
         title.to_string(),
-        format!("{} · {}", author_name(&mail.from), overview_date(&mail.date)),
+        format!(
+            "{} · {}",
+            author_name(&mail.from),
+            overview_date(&mail.date)
+        ),
     )
 }
 
@@ -2064,7 +2096,11 @@ fn build_row(
 ) -> gtk::ListBoxRow {
     // Top-aligned titles (wrapping chip rows) get nudged onto the first
     // value line; centered ones need no offset.
-    let title_margin_top = if title_valign == gtk::Align::Start { 6 } else { 0 };
+    let title_margin_top = if title_valign == gtk::Align::Start {
+        6
+    } else {
+        0
+    };
     let title = gtk::Label::builder()
         .label(name)
         .halign(gtk::Align::Start)
@@ -2493,7 +2529,10 @@ mod tests {
         let mut b = mail("y@y", None, "b", "B");
         b.in_reply_to = Some(String::new());
         let rows = thread_tree(&[a, b]);
-        assert!(rows.iter().all(|row| row.depth == 0 && row.parent_row.is_none()));
+        assert!(
+            rows.iter()
+                .all(|row| row.depth == 0 && row.parent_row.is_none())
+        );
     }
 
     #[test]
@@ -2529,7 +2568,12 @@ mod tests {
     #[test]
     fn overview_rows_show_the_subject_and_author() {
         let op = mail("op@x", None, "[PATCH 0/2] series", "Nika Krasnova <nika@x>");
-        let reply = mail("a@x", Some("op@x"), "Re: [PATCH 0/2] series", "Miguel Ojeda <m@x>");
+        let reply = mail(
+            "a@x",
+            Some("op@x"),
+            "Re: [PATCH 0/2] series",
+            "Miguel Ojeda <m@x>",
+        );
 
         // Every row is titled by its own subject with author and date below.
         assert_eq!(
@@ -2597,4 +2641,3 @@ mod tests {
         );
     }
 }
-

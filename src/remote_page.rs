@@ -164,7 +164,10 @@ impl RemoteContent {
             } else {
                 &["pill"]
             };
-            let button = gtk::Button::builder().label(label).css_classes(classes).build();
+            let button = gtk::Button::builder()
+                .label(label)
+                .css_classes(classes)
+                .build();
             button.connect_clicked(move |_| action());
             button
         });

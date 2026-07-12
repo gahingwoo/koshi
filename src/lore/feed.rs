@@ -58,7 +58,10 @@ pub async fn search(
     cancellable: &gio::Cancellable,
 ) -> Result<Vec<ThreadSummary>, Error> {
     let escaped = glib::Uri::escape_string(query, None, true);
-    let url = format!("{BASE_URL}/{list}/?q={escaped}&x=A&o={offset}{}", sort.query_flag());
+    let url = format!(
+        "{BASE_URL}/{list}/?q={escaped}&x=A&o={offset}{}",
+        sort.query_flag()
+    );
     let bytes = fetch(&url, cancellable).await?;
     parse_atom(&String::from_utf8_lossy(&bytes))
 }
@@ -80,7 +83,11 @@ impl EntryBuilder {
             .ok()?;
         Some(ThreadSummary {
             subject: self.title,
-            author: if self.name.is_empty() { self.email } else { self.name },
+            author: if self.name.is_empty() {
+                self.email
+            } else {
+                self.name
+            },
             updated,
             message_id: message_id_from_url(&self.link?)?,
         })

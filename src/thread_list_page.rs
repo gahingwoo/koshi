@@ -56,7 +56,9 @@ pub fn build_thread_list_page(
 ) -> adw::NavigationPage {
     build_page(
         nav,
-        Mode::Recent { list: inbox_name.to_string() },
+        Mode::Recent {
+            list: inbox_name.to_string(),
+        },
         inbox_name,
         inbox_name,
         inbox_description,
@@ -66,7 +68,10 @@ pub fn build_thread_list_page(
 pub fn build_search_page(nav: &adw::NavigationView, query: &str) -> adw::NavigationPage {
     build_page(
         nav,
-        Mode::Search { list: "all".to_string(), query: query.to_string() },
+        Mode::Search {
+            list: "all".to_string(),
+            query: query.to_string(),
+        },
         &format!("Search: {query}"),
         "Search results",
         &format!("Matches for “{query}” across all of lore.kernel.org"),
@@ -288,7 +293,15 @@ fn load_more(
     cancellable: gio::Cancellable,
 ) {
     if shown.get() < threads.borrow().len() {
-        reveal_chunk(list, row, menu, &threads.borrow(), &shown, &exhausted, mode.list());
+        reveal_chunk(
+            list,
+            row,
+            menu,
+            &threads.borrow(),
+            &shown,
+            &exhausted,
+            mode.list(),
+        );
         return;
     }
 
@@ -306,7 +319,15 @@ fn load_more(
                 row.set_sensitive(true);
                 exhausted.set(more.len() < lore::PAGE_SIZE);
                 threads.borrow_mut().extend(more);
-                reveal_chunk(&list, &row, &menu, &threads.borrow(), &shown, &exhausted, mode.list());
+                reveal_chunk(
+                    &list,
+                    &row,
+                    &menu,
+                    &threads.borrow(),
+                    &shown,
+                    &exhausted,
+                    mode.list(),
+                );
             }
             Err(error) if error.is_cancelled() => {}
             // Make the row clickable again; activating it retries.
@@ -343,7 +364,10 @@ fn build_load_more_row() -> adw::ButtonRow {
 
 fn build_thread_row(thread: &ThreadSummary, menu: &RowMenu, list: &str) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(format!("<tt>{}</tt>", glib::markup_escape_text(&thread.subject)))
+        .title(format!(
+            "<tt>{}</tt>",
+            glib::markup_escape_text(&thread.subject)
+        ))
         .title_lines(1)
         .tooltip_text(&thread.subject)
         .subtitle(glib::markup_escape_text(&thread.author))
@@ -382,7 +406,10 @@ fn build_thread_row(thread: &ThreadSummary, menu: &RowMenu, list: &str) -> adw::
 fn add_row_actions(row: &adw::ActionRow, menu: &RowMenu, list: &str, message_id: &str) {
     // `message_id` arrives already stripped of angle brackets, but trim to be
     // safe and match the /r/ redirect URL used in the message reading view.
-    let bare = message_id.trim().trim_start_matches('<').trim_end_matches('>');
+    let bare = message_id
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>');
     let url = format!("https://lore.kernel.org/r/{bare}/");
     let list = list.to_string();
     let message_id = message_id.to_string();

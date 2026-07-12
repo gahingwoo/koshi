@@ -238,10 +238,7 @@ fn display_rank(key: &str) -> usize {
         "transferEncoding",
         "thread",
     ];
-    ORDER
-        .iter()
-        .position(|k| *k == key)
-        .unwrap_or(ORDER.len())
+    ORDER.iter().position(|k| *k == key).unwrap_or(ORDER.len())
 }
 
 /// The canonical camelCase spelling git documents for a lowercased send-email
@@ -291,10 +288,7 @@ mod tests {
     /// Build the NUL-terminated form `git config --list -z` emits from
     /// `(key, value)` pairs.
     fn config_z(pairs: &[(&str, &str)]) -> String {
-        pairs
-            .iter()
-            .map(|(k, v)| format!("{k}\n{v}\0"))
-            .collect()
+        pairs.iter().map(|(k, v)| format!("{k}\n{v}\0")).collect()
     }
 
     #[test]
@@ -329,7 +323,11 @@ mod tests {
         assert_eq!(profile.active_identity.as_deref(), Some("work"));
         assert_eq!(profile.identities.len(), 2);
 
-        let work = profile.identities.iter().find(|i| i.name == "work").unwrap();
+        let work = profile
+            .identities
+            .iter()
+            .find(|i| i.name == "work")
+            .unwrap();
         assert_eq!(work.email.as_deref(), Some("nika.bleh@baylibre.com"));
 
         // No `from`, so the personal identity's email falls back to smtpUser.
@@ -344,7 +342,10 @@ mod tests {
     #[test]
     fn subsection_casing_is_preserved() {
         // git preserves subsection case while lowercasing section/variable.
-        let profile = parse(&config_z(&[("sendemail.Work.smtpserver", "smtp.example.com")]));
+        let profile = parse(&config_z(&[(
+            "sendemail.Work.smtpserver",
+            "smtp.example.com",
+        )]));
         assert_eq!(profile.identities[0].name, "Work");
         assert_eq!(profile.identities[0].settings[0].key, "smtpServer");
     }
@@ -371,7 +372,10 @@ mod tests {
         assert_eq!(get("smtpServer"), Some("smtp.baylibre.com"));
         assert_eq!(get("smtpServerPort"), Some("465"));
         assert_eq!(get("smtpEncryption"), Some("tls"));
-        assert_eq!(profile.effective_transport().as_deref(), Some("smtp.baylibre.com"));
+        assert_eq!(
+            profile.effective_transport().as_deref(),
+            Some("smtp.baylibre.com")
+        );
     }
 
     #[test]

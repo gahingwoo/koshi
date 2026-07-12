@@ -199,6 +199,18 @@ impl MessageRow {
         self.imp().highlighted.get()
     }
 
+    /// Whether this row currently holds `mail`. Compared by Rc identity, not
+    /// value: the overview's jump re-finds its target row across recycling
+    /// (only possible past 205 messages), where two distinct messages could
+    /// share a subject and author but never the same allocation.
+    fn holds(&self, mail: &Rc<Mail>) -> bool {
+        self.imp()
+            .mail
+            .borrow()
+            .as_ref()
+            .is_some_and(|held| Rc::ptr_eq(held, mail))
+    }
+
     /// Give the row its header card and body text (or, on rebind, take the
     /// stale ones back). Rows fill once, from the warmup chain, and keep
     /// their content: the seeded height (reseed) stands in exactly until
@@ -1035,8 +1047,14 @@ fn spawn_thread_load(
                     // Mounted under RemoteContent's still-spinning cover; the
                     // content itself lifts it once the visible rows are
                     // filled and painted (see build_thread_content).
-                    let content =
-                        build_thread_content(&nav, thread, &list, opened, remote.downgrade());
+                    let content = build_thread_content(
+                        &nav,
+                        thread,
+                        &list,
+                        opened,
+                        remote.downgrade(),
+                        &split,
+                    );
                     remote.show_content_covered(&content);
                 }
             }
@@ -1055,6 +1073,10 @@ fn show_thread_error(
     list: String,
     message_id: String,
 ) {
+    // A prior successful load may have left a sidebar on the split; drop it so
+    // the error page (and any retry) never shows a stale tree.
+    split.set_sidebar(None::<&gtk::Widget>);
+
     let weak = remote.downgrade();
     let split = split.downgrade();
     let nav = nav.downgrade();
@@ -1095,6 +1117,7 @@ fn build_thread_content(
     list: &str,
     opened: usize,
     remote: crate::remote_page::RemoteContentWeak,
+    split: &adw::OverlaySplitView,
 ) -> gtk::Box {
     let op = &thread[0];
 
@@ -1191,10 +1214,14 @@ fn build_thread_content(
     // Both views draw from the same message objects; only which of them the
     // ListView is pointed at differs. The threaded model holds every message
     // in thread order; the single model holds just the opened one.
-    let objects: Vec<MessageObject> = thread
-        .into_iter()
+    // Each message moves into an Rc once (no body clone); the objects share
+    // those handles and so does the overview sidebar's reply tree, so nothing
+    // re-parses or re-copies the thread to render it twice.
+    let mails: Vec<Rc<Mail>> = thread.into_iter().map(Rc::new).collect();
+    let objects: Vec<MessageObject> = mails
+        .iter()
         .enumerate()
-        .map(|(index, mail)| MessageObject::new(Rc::new(mail), index == 0))
+        .map(|(index, mail)| MessageObject::new(mail.clone(), index == 0))
         .collect();
     let opened = opened.min(objects.len().saturating_sub(1));
     for object in &objects {
@@ -1209,6 +1236,11 @@ fn build_thread_content(
     let selection = gtk::NoSelection::new(Some(single_model.clone()));
     let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory));
     list_view.set_single_click_activate(false);
+
+    // The overview sidebar rides the split view the page was built with; once
+    // it is set, the F9 shortcut and the header-bar button (toggle_overview)
+    // come alive. It jumps by driving this list_view, so it is wired after it.
+    split.set_sidebar(Some(&build_overview_sidebar(&mails, &list_view, &view_toggle)));
 
     let scrolled = gtk::ScrolledWindow::builder()
         .child(&list_view)
@@ -1402,10 +1434,10 @@ struct TreeRow {
 /// is missing from the thread starts at depth zero; a parent may well appear
 /// later in the mbox than its reply (lore serves cover letters after the
 /// first patch), so linking is by id, not by file position.
-fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
+fn thread_tree<M: std::borrow::Borrow<Mail>>(thread: &[M]) -> Vec<TreeRow> {
     let mut position: HashMap<&str, usize> = HashMap::new();
     for (index, mail) in thread.iter().enumerate() {
-        if let Some(id) = &mail.message_id {
+        if let Some(id) = &mail.borrow().message_id {
             let id = normalize_message_id(id);
             // An empty Message-ID must not become a key: any message with
             // an empty In-Reply-To would then "reply" to it.
@@ -1419,6 +1451,7 @@ fn thread_tree(thread: &[Mail]) -> Vec<TreeRow> {
     let mut roots: Vec<usize> = Vec::new();
     for (index, mail) in thread.iter().enumerate() {
         let parent = mail
+            .borrow()
             .in_reply_to
             .as_deref()
             .map(normalize_message_id)
@@ -1594,35 +1627,104 @@ fn refresh_overview_visibility(rows: &[OverviewRow]) {
     }
 }
 
-/// Scroll the message pane so `section`'s top aligns with the top of the
-/// view. Returns the adjustment value it set, or None if the widgets aren't
-/// laid out yet — the caller re-applies until that value holds steady.
-fn scroll_section_to_top(scrolled: &gtk::ScrolledWindow, section: &gtk::Widget) -> Option<f64> {
-    // scrolled -> auto Viewport -> the scrollable content (the Clamp). A
-    // section's offset within that content is independent of the current
-    // scroll, so it is exactly the adjustment value that lifts it to the top.
-    let content = scrolled.child().and_downcast::<gtk::Viewport>()?.child()?;
-    let top = f64::from(section.compute_bounds(&content)?.y());
-    let vadjustment = scrolled.vadjustment();
-    let max = (vadjustment.upper() - vadjustment.page_size()).max(vadjustment.lower());
-    let value = top.clamp(vadjustment.lower(), max);
-    vadjustment.set_value(value);
-    Some(value)
+/// Scroll the message list so the row at `position` starts at the top of
+/// the viewport. GtkListView's scroll_to is the only primitive that can
+/// reach a parked row (parked rows have no geometry to compute a target
+/// from), but it only scrolls the minimum needed to bring the row into
+/// view; the follow-up tick aligns the row's top edge once the ListView
+/// has placed it. Exact row seeds mean nothing shifts underneath, so the
+/// loop converges within a few frames; the frame cap and the generation
+/// counter (a newer jump supersedes a running one) bound it anyway.
+fn jump_to_message(list_view: &gtk::ListView, position: u32, generation: &Rc<Cell<u64>>) {
+    let this_jump = generation.get().wrapping_add(1);
+    generation.set(this_jump);
+    list_view.scroll_to(position, gtk::ListScrollFlags::NONE, None);
+
+    // The tick callback re-finds the row by its message each frame: rows
+    // can be recycled (>205 messages), so holding the row widget itself
+    // would risk aligning to a rebound row.
+    let Some(target) = list_view
+        .model()
+        .and_then(|model| model.item(position))
+        .and_downcast::<MessageObject>()
+    else {
+        return;
+    };
+    let mail = target.message();
+    let generation = generation.clone();
+    let steady = Cell::new(0u32);
+    let frames = Cell::new(0u32);
+    list_view.add_tick_callback(move |list_view, _| {
+        if generation.get() != this_jump {
+            return glib::ControlFlow::Break;
+        }
+        frames.set(frames.get() + 1);
+        let Some(scrolled) = list_view
+            .ancestor(gtk::ScrolledWindow::static_type())
+            .and_downcast::<gtk::ScrolledWindow>()
+        else {
+            return glib::ControlFlow::Break;
+        };
+        // None while scroll_to hasn't placed the row yet — keep waiting
+        // within the frame budget.
+        if let Some(offset) = message_row_offset(list_view, &mail) {
+            let vadjustment = scrolled.vadjustment();
+            let max = (vadjustment.upper() - vadjustment.page_size()).max(vadjustment.lower());
+            let desired = (vadjustment.value() + offset).clamp(vadjustment.lower(), max);
+            // "Done" is the clamped target holding steady, which also covers
+            // the last messages, whose tops can never reach the viewport top.
+            if (desired - vadjustment.value()).abs() < 0.5 {
+                steady.set(steady.get() + 1);
+                if steady.get() >= 3 {
+                    return glib::ControlFlow::Break;
+                }
+            } else {
+                steady.set(0);
+                vadjustment.set_value(desired);
+            }
+        }
+        if frames.get() >= 60 {
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+}
+
+/// The vertical offset of `mail`'s row from the top of the ListView's
+/// visible area, or None while the row is parked or not laid out. The
+/// ListView is the scrollable itself, so bounds relative to it are viewport
+/// coordinates: offset 0 means the row starts exactly at the top.
+fn message_row_offset(list_view: &gtk::ListView, mail: &Rc<Mail>) -> Option<f64> {
+    let mut child = list_view.first_child();
+    while let Some(item_widget) = child {
+        child = item_widget.next_sibling();
+        let Some(row) = item_widget.first_child().and_downcast::<MessageRow>() else {
+            continue;
+        };
+        if !row.holds(mail) {
+            continue;
+        }
+        if !item_widget.is_child_visible() {
+            return None;
+        }
+        let bounds = item_widget.compute_bounds(list_view)?;
+        if bounds.height() <= 0.0 {
+            return None;
+        }
+        return Some(f64::from(bounds.y()));
+    }
+    None
 }
 
 /// The overview sidebar: a heading over one activatable row per message,
 /// laid out as a collapsible reply tree indented by depth. Activating a row
-/// scrolls the message stack to that message; the disclosure button on a row
+/// jumps the message list to that message; the disclosure button on a row
 /// with replies hides or shows its subtree.
-// Retained (dead for now) for the follow-up pass that restores the overview
-// on top of the virtualized message list. Note for that pass: `sections` and
-// scroll_section_to_top predate the ListView — jumping must become
-// list_view.scroll_to(position), since parked rows have no geometry.
-#[allow(dead_code)]
 fn build_overview_sidebar(
-    thread: &[Mail],
-    sections: Vec<gtk::Box>,
-    scrolled: &gtk::ScrolledWindow,
+    thread: &[Rc<Mail>],
+    list_view: &gtk::ListView,
+    view_toggle: &adw::ToggleGroup,
 ) -> gtk::Widget {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -1760,55 +1862,22 @@ fn build_overview_sidebar(
     let scroll_generation = Rc::new(Cell::new(0u64));
     list.connect_row_activated(glib::clone!(
         #[weak]
-        scrolled,
+        list_view,
+        #[weak]
+        view_toggle,
         #[strong]
         scroll_generation,
         move |_, row| {
             let Some(&index) = message_of_row.get(row.index() as usize) else {
                 return;
             };
-            let Some(section) = sections.get(index).cloned() else {
-                return;
-            };
-            let section: gtk::Widget = section.upcast();
-
-            // Aligning once at click time lands on the wrong message: the
-            // message bodies are GtkTextViews whose heights finish validating
-            // over the next few frames, and each correction shifts every
-            // section below it. So re-align on every frame until the target
-            // position stops moving (or a bounded number of frames pass).
-            let generation = scroll_generation.get().wrapping_add(1);
-            scroll_generation.set(generation);
-            let previous = Cell::new(f64::NAN);
-            let steady = Cell::new(0u32);
-            let frames = Cell::new(0u32);
-            scrolled.add_tick_callback(glib::clone!(
-                #[strong]
-                scroll_generation,
-                move |scrolled, _| {
-                    if scroll_generation.get() != generation {
-                        return glib::ControlFlow::Break;
-                    }
-                    let Some(value) = scroll_section_to_top(scrolled, &section) else {
-                        return glib::ControlFlow::Break;
-                    };
-                    frames.set(frames.get() + 1);
-                    if (value - previous.get()).abs() < 0.5 {
-                        steady.set(steady.get() + 1);
-                        if steady.get() >= 3 {
-                            return glib::ControlFlow::Break;
-                        }
-                    } else {
-                        steady.set(0);
-                        previous.set(value);
-                    }
-                    if frames.get() >= 60 {
-                        glib::ControlFlow::Break
-                    } else {
-                        glib::ControlFlow::Continue
-                    }
-                }
-            ));
+            // The overview lists the whole thread, so a jump only lands
+            // somewhere in the single view when it happens to be showing that
+            // one message. Switch to the threaded view first (a no-op when
+            // already there); its model holds every message in thread order,
+            // so the message index is the row's list position.
+            view_toggle.set_active(1);
+            jump_to_message(&list_view, index as u32, &scroll_generation);
 
             // The overview has done its job once a message is picked; dismiss
             // it so the message it jumps to is actually visible — open, it

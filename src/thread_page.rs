@@ -2134,11 +2134,11 @@ fn build_thread_search(
 
     let prev_button = gtk::Button::builder()
         .icon_name("go-up-symbolic")
-        .tooltip_text("Previous match")
+        .tooltip_text("Previous Match")
         .build();
     let next_button = gtk::Button::builder()
         .icon_name("go-down-symbolic")
-        .tooltip_text("Next match")
+        .tooltip_text("Next Match")
         .build();
     let nav_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)

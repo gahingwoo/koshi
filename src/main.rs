@@ -448,10 +448,21 @@ fn open_new_tab(tab_view: &adw::TabView) {
 }
 
 /// Open `message_id` (of `list`) as a thread page in a new background tab —
-/// used by the thread list's "Open in New Tab" menu item and middle-click.
+/// used by the thread list's and a message's "Open in New Tab" menu items and
+/// middle-click.
 pub(crate) fn open_thread_in_new_tab(tab_view: &adw::TabView, list: &str, message_id: &str) {
     let nav = adw::NavigationView::new();
-    nav.push(&build_thread_page(&nav, list, message_id));
+    // Reconstruct the back stack a normal drill-in would build — inbox → the
+    // thread's list → the thread — so a tab opened straight into a thread can
+    // navigate back through its natural parents instead of stranding on a
+    // single page with no back button. The parent pages load their own content
+    // (as they would if navigated to), so back lands on a live list, not a
+    // blank. The list description isn't known here; the list page shows just
+    // its name until refreshed.
+    let inbox = build_inbox_page(&nav);
+    let thread_list = build_thread_list_page(&nav, list, "");
+    let thread = build_thread_page(&nav, list, message_id);
+    nav.replace(&[inbox, thread_list, thread]);
     append_tab(tab_view, &nav, "Loading…");
 }
 

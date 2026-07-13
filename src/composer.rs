@@ -5,6 +5,7 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::highlight;
+use crate::settings;
 
 /// Placeholder identity until account support exists.
 const IDENTITY: &str = "nika <nika@nikableh.moe>";
@@ -39,6 +40,9 @@ struct ComposerState {
 impl ComposerState {
     fn new(reply: ReplyContext) -> Self {
         let body = gtk::TextBuffer::new(None);
+        // Prefill the signature before enabling undo so it is part of the
+        // baseline document rather than an undoable edit.
+        prefill_signature(&body);
         body.set_enable_undo(true);
         Self {
             subject: gtk::EntryBuffer::new(Some(&reply.subject)),
@@ -91,7 +95,9 @@ impl ComposerState {
         self.to.set_text(&initial.to);
         self.cc.set_text(&initial.cc);
         self.in_reply_to.set_text(&initial.in_reply_to);
-        self.body.set_text("");
+        // Re-read the signature so a change made in Preferences takes effect on
+        // the next fresh reply, without waiting for a restart.
+        prefill_signature(&self.body);
     }
 
     /// Swap in a new reply target: the header fields follow the new context
@@ -175,6 +181,33 @@ fn append_trailer(body: &str, trailer: &str) -> String {
         out.push('\n');
     }
     out.push_str(trailer);
+    out.push('\n');
+    out
+}
+
+/// Fill `body` with the current reply signature, read live from settings so a
+/// Preferences edit reaches the next fresh reply without a restart. The cursor
+/// is left on the empty line above it; when no signature is configured the body
+/// is simply cleared.
+fn prefill_signature(body: &gtk::TextBuffer) {
+    let signature = settings::reply_signature();
+    if signature.is_empty() {
+        body.set_text("");
+    } else {
+        body.set_text(&format!("\n\n{signature}\n"));
+        body.place_cursor(&body.start_iter());
+    }
+}
+
+/// Append `signature` (which carries its own `-- ` separator) at the end of
+/// `body`, set off from any typed text by one blank line, the way a signature
+/// conventionally sits below a mail, and ending with a trailing newline.
+fn append_signature(body: &str, signature: &str) -> String {
+    let mut out = body.trim_end_matches('\n').to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(signature);
     out.push('\n');
     out
 }
@@ -464,7 +497,7 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         .margin_start(6)
         .build();
     toolbar.append(&details_toggle);
-    toolbar.append(&build_trailer_button(&state, &root));
+    toolbar.append(&build_insert_button(&state, &root));
     toolbar.append(&build_rewrap_button(&state));
     toolbar.append(&preview_toggle);
     toolbar.append(&build_fullscreen_toggle(&state));
@@ -696,14 +729,19 @@ fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> (gtk::Overlay, 
     (overlay, view)
 }
 
-fn build_trailer_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::MenuButton {
+fn build_insert_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::MenuButton {
     let menu = gio::Menu::new();
-    for kind in TRAILERS {
-        menu.append(Some(kind), Some(&format!("composer.trailer('{kind}')")));
-    }
 
-    let action = gio::SimpleAction::new("trailer", Some(glib::VariantTy::STRING));
-    action.connect_activate(glib::clone!(
+    let trailers = gio::Menu::new();
+    for kind in TRAILERS {
+        trailers.append(Some(kind), Some(&format!("composer.trailer('{kind}')")));
+    }
+    menu.append_section(None, &trailers);
+
+    let group = gio::SimpleActionGroup::new();
+
+    let trailer = gio::SimpleAction::new("trailer", Some(glib::VariantTy::STRING));
+    trailer.connect_activate(glib::clone!(
         #[strong]
         state,
         move |_, param| {
@@ -714,13 +752,35 @@ fn build_trailer_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::
             state.replace_body_text(&append_trailer(&state.body_text(), &trailer));
         }
     ));
-    let group = gio::SimpleActionGroup::new();
-    group.add_action(&action);
+    group.add_action(&trailer);
+
+    // A signature is unlike a trailer, so it gets its own section in the same
+    // menu rather than a button of its own — shown only when one is configured.
+    // The action re-reads it so a Preferences edit is reflected right away.
+    if !settings::reply_signature().is_empty() {
+        let section = gio::Menu::new();
+        section.append(Some("Signature"), Some("composer.signature"));
+        menu.append_section(None, &section);
+
+        let action = gio::SimpleAction::new("signature", None);
+        action.connect_activate(glib::clone!(
+            #[strong]
+            state,
+            move |_, _| {
+                let signature = settings::reply_signature();
+                if !signature.is_empty() {
+                    state.replace_body_text(&append_signature(&state.body_text(), &signature));
+                }
+            }
+        ));
+        group.add_action(&action);
+    }
+
     action_scope.insert_action_group("composer", Some(&group));
 
     gtk::MenuButton::builder()
         .icon_name("list-add-symbolic")
-        .tooltip_text("Insert Trailer")
+        .tooltip_text("Insert")
         .menu_model(&menu)
         .css_classes(["flat"])
         .build()
@@ -979,6 +1039,24 @@ mod tests {
         assert_eq!(
             append_trailer("body\n", trailer),
             format!("body\n{trailer}\n")
+        );
+    }
+
+    #[test]
+    fn append_signature_separates_with_blank_line() {
+        // The signature already carries its own `-- ` separator; append only
+        // handles the spacing. Onto an empty body it stands alone; onto typed
+        // text it is set off by exactly one blank line regardless of the body's
+        // trailing newlines.
+        let sig = "-- \nNika Krasnova";
+        assert_eq!(append_signature("", sig), "-- \nNika Krasnova\n");
+        assert_eq!(
+            append_signature("body", sig),
+            "body\n\n-- \nNika Krasnova\n"
+        );
+        assert_eq!(
+            append_signature("body\n\n\n", sig),
+            "body\n\n-- \nNika Krasnova\n"
         );
     }
 

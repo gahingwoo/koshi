@@ -88,6 +88,17 @@ impl Profile {
         };
         get("smtpServer").or_else(|| get("sendmailCmd"))
     }
+
+    /// The out-of-the-box reply signature for someone who has never set one in
+    /// Preferences: the standard `-- ` separator line followed by the git
+    /// `user.name`, so a fresh install already signs replies. Empty when git
+    /// has no name to sign with.
+    pub fn default_signature(&self) -> String {
+        match &self.user_name {
+            Some(name) if !name.trim().is_empty() => format!("-- \n{name}"),
+            _ => String::new(),
+        }
+    }
 }
 
 /// Read the merged git configuration (system + global + local) and build a
@@ -418,6 +429,17 @@ mod tests {
     #[test]
     fn empty_config_yields_empty_profile() {
         assert!(parse("").is_empty());
+    }
+
+    #[test]
+    fn default_signature_is_separator_and_name() {
+        let profile = parse(&config_z(&[("user.name", "Nika Krasnova")]));
+        assert_eq!(profile.default_signature(), "-- \nNika Krasnova");
+    }
+
+    #[test]
+    fn default_signature_is_empty_without_a_name() {
+        assert_eq!(Profile::default().default_signature(), "");
     }
 
     #[test]

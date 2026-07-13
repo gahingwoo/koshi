@@ -8,6 +8,7 @@ mod lore;
 mod profile;
 mod profile_menu;
 mod remote_page;
+mod settings;
 mod thread_list_page;
 mod thread_page;
 mod window_state;
@@ -41,6 +42,9 @@ fn main() -> glib::ExitCode {
         let data_dir = glib::user_data_dir().join("koshi");
         favorites::init(data_dir.join("favorites.json"));
         window_state::init(data_dir.join("window-state.json"));
+        // Preferences are user configuration, so they live in the config dir
+        // ($XDG_CONFIG_HOME), not the data dir used for window state above.
+        settings::init(glib::user_config_dir().join("koshi").join("settings.json"));
         load_css();
         register_bundled_icons();
         // Use the bundled app icon for window/taskbar decorations. When Koshi
@@ -717,11 +721,59 @@ fn show_preferences(app: &adw::Application) {
         .title("General")
         .icon_name("emblem-system-symbolic")
         .build();
-    page.add(&adw::PreferencesGroup::builder().title("General").build());
+    page.add(&build_signature_group());
 
     let dialog = adw::PreferencesDialog::new();
     dialog.add(&page);
     dialog.present(app.active_window().as_ref());
+}
+
+/// The Preferences group for the reply signature: a multi-line editor
+/// prefilled with the effective signature (the saved one, or the default of
+/// the `-- ` separator plus the git user.name). Whatever the user types is
+/// saved verbatim, so the separator is theirs to keep or delete; an empty box
+/// records a deliberate "no signature".
+fn build_signature_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Signature")
+        .description("Added to the bottom of your replies.")
+        .build();
+
+    let buffer = gtk::TextBuffer::new(None);
+    buffer.set_text(&settings::reply_signature());
+    let view = gtk::TextView::builder()
+        .buffer(&buffer)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .monospace(true)
+        .top_margin(8)
+        .bottom_margin(8)
+        .left_margin(8)
+        .right_margin(8)
+        .build();
+    // A ScrolledWindow with its own frame, sized to its content between a
+    // floor and a ceiling — the same shape as the composer's body editor. Its
+    // built-in frame avoids wrapping it in a GtkFrame, whose internal gizmo is
+    // a known source of spurious "snapshot without allocation" warnings.
+    let scrolled = gtk::ScrolledWindow::builder()
+        .child(&view)
+        .has_frame(true)
+        .min_content_height(96)
+        .max_content_height(200)
+        .propagate_natural_height(true)
+        .build();
+    group.add(&scrolled);
+
+    // Persist on edit: the JSON write is cheap, and the initial set_text above
+    // ran before this handler was connected, so merely opening Preferences
+    // never fires it — the default keeps tracking user.name until the user
+    // actually types something, at which point their text (or an empty box) is
+    // saved verbatim.
+    buffer.connect_changed(move |buffer| {
+        let (start, end) = buffer.bounds();
+        settings::set_signature(&buffer.text(&start, &end, false));
+    });
+
+    group
 }
 
 fn show_shortcuts(app: &adw::Application) {

@@ -184,8 +184,9 @@ pub fn parse_atom(xml: &str) -> Result<Vec<ThreadSummary>, Error> {
                     // seed threading without clobbering the entry's Message-ID.
                     b"in-reply-to" => {
                         if let Some(entry) = entry.as_mut() {
-                            entry.in_reply_to =
-                                attribute(e, b"href").as_deref().and_then(message_id_from_url);
+                            entry.in_reply_to = attribute(e, b"href")
+                                .as_deref()
+                                .and_then(message_id_from_url);
                         }
                     }
                     _ => {}

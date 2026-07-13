@@ -235,7 +235,10 @@ struct Row {
 /// pagination simply shows its overflow as plain rows rather than misgrouping.
 fn arrange(threads: Vec<ThreadSummary>, group: bool) -> Vec<Row> {
     if !group {
-        return threads.into_iter().map(|thread| Row { thread, depth: 0 }).collect();
+        return threads
+            .into_iter()
+            .map(|thread| Row { thread, depth: 0 })
+            .collect();
     }
 
     let n = threads.len();
@@ -635,14 +638,23 @@ mod tests {
     }
 
     fn shape(rows: &[Row]) -> Vec<(&str, usize)> {
-        rows.iter().map(|r| (r.thread.subject.as_str(), r.depth)).collect()
+        rows.iter()
+            .map(|r| (r.thread.subject.as_str(), r.depth))
+            .collect()
     }
 
     #[test]
     fn ungrouped_keeps_order_and_flat_depth() {
         // Search mode: even a reply keeps lore's order and stays at depth 0.
-        let page = vec![summary("a", None, 3), summary("b", Some("a"), 2), summary("c", None, 1)];
-        assert_eq!(shape(&arrange(page, false)), vec![("a", 0), ("b", 0), ("c", 0)]);
+        let page = vec![
+            summary("a", None, 3),
+            summary("b", Some("a"), 2),
+            summary("c", None, 1),
+        ];
+        assert_eq!(
+            shape(&arrange(page, false)),
+            vec![("a", 0), ("b", 0), ("c", 0)]
+        );
     }
 
     #[test]
@@ -655,7 +667,10 @@ mod tests {
             summary("cover", None, 10),
         ];
         // Cover on top, patches indented and in send order.
-        assert_eq!(shape(&arrange(page, true)), vec![("cover", 0), ("p1", 1), ("p2", 1)]);
+        assert_eq!(
+            shape(&arrange(page, true)),
+            vec![("cover", 0), ("p1", 1), ("p2", 1)]
+        );
     }
 
     #[test]
@@ -666,7 +681,10 @@ mod tests {
             summary("m1", Some("m0"), 20),
             summary("m0", None, 10),
         ];
-        assert_eq!(shape(&arrange(page, true)), vec![("m0", 0), ("m1", 1), ("m2", 2)]);
+        assert_eq!(
+            shape(&arrange(page, true)),
+            vec![("m0", 0), ("m1", 1), ("m2", 2)]
+        );
     }
 
     #[test]

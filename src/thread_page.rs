@@ -2935,7 +2935,11 @@ fn build_header_list(
     }
     list.append(&subject_row);
 
-    list.append(&build_single_line_row("Author", &mail.from, &visible_titles));
+    list.append(&build_single_line_row(
+        "Author",
+        &mail.from,
+        &visible_titles,
+    ));
     list.append(&build_single_line_row("Date", &mail.date, &visible_titles));
 
     // The remaining headers are collapsed by default: recipients are almost
@@ -2948,9 +2952,21 @@ fn build_header_list(
     if let Some(id) = &mail.in_reply_to {
         details.add_row(&build_text_row("In-Reply-To", id, &detail_titles));
     }
-    details.add_row(&build_address_row("To", &mail.to, &mail.to_addrs, overlay, &detail_titles));
+    details.add_row(&build_address_row(
+        "To",
+        &mail.to,
+        &mail.to_addrs,
+        overlay,
+        &detail_titles,
+    ));
     if let Some(cc) = &mail.cc {
-        details.add_row(&build_address_row("Cc", cc, &mail.cc_addrs, overlay, &detail_titles));
+        details.add_row(&build_address_row(
+            "Cc",
+            cc,
+            &mail.cc_addrs,
+            overlay,
+            &detail_titles,
+        ));
     }
     list.append(&details);
 
@@ -3031,11 +3047,7 @@ fn build_text_row(name: &str, value: &str, title_group: &gtk::SizeGroup) -> gtk:
 /// Like a text row, but the value never wraps: overlong values (subjects,
 /// author display names, dates) ellipsize instead of growing the row, which
 /// keeps every card of a kind the same height for the row seeds.
-fn build_single_line_row(
-    name: &str,
-    value: &str,
-    title_group: &gtk::SizeGroup,
-) -> gtk::ListBoxRow {
+fn build_single_line_row(name: &str, value: &str, title_group: &gtk::SizeGroup) -> gtk::ListBoxRow {
     let label = gtk::Label::builder()
         .use_markup(true)
         .label(format!("<tt>{}</tt>", glib::markup_escape_text(value)))

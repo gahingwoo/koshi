@@ -55,6 +55,26 @@ impl ComposerState {
         self.body.text(&start, &end, false).into()
     }
 
+    /// Replace the body in one undoable step. `TextBuffer::set_text` wraps its
+    /// delete+insert in an *irreversible* action, which drops the undo stack
+    /// entirely, so edits the user should be able to take back (rewrap,
+    /// trailers) run the two halves inside a user action instead.
+    fn replace_body_text(&self, text: &str) {
+        let caret = self
+            .body
+            .iter_at_mark(&self.body.get_insert())
+            .offset()
+            .clamp(0, text.chars().count() as i32);
+
+        self.body.begin_user_action();
+        let (mut start, mut end) = self.body.bounds();
+        self.body.delete(&mut start, &mut end);
+        self.body.insert(&mut start, text);
+        self.body.end_user_action();
+
+        self.body.place_cursor(&self.body.iter_at_offset(caret));
+    }
+
     fn raw_message(&self) -> String {
         assemble_raw(
             &self.to.text(),
@@ -691,9 +711,7 @@ fn build_trailer_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::
                 return;
             };
             let trailer = format!("{kind}: {IDENTITY}");
-            state
-                .body
-                .set_text(&append_trailer(&state.body_text(), &trailer));
+            state.replace_body_text(&append_trailer(&state.body_text(), &trailer));
         }
     ));
     let group = gio::SimpleActionGroup::new();
@@ -720,7 +738,7 @@ fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
         #[strong]
         state,
         move |_| {
-            state.body.set_text(&rewrap(&state.body_text(), WRAP_WIDTH));
+            state.replace_body_text(&rewrap(&state.body_text(), WRAP_WIDTH));
         }
     ));
     button

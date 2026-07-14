@@ -760,20 +760,43 @@ fn message_fill_step(
     }
 }
 
-/// Parse an mboxrd thread into its messages, in file order (lore serves
-/// `t.mbox.gz` already in thread order). mboxrd ">From " escaping is undone
-/// on the raw message text before MIME parsing: the mbox writer escapes raw
-/// file lines, so unescaping must happen before any Content-Transfer-Encoding
-/// decoding, not after.
+/// Parse an mboxrd thread into its messages, ordered as lore's web view shows
+/// them: depth-first over the reply graph. lore serves `t.mbox.gz` in
+/// chronological order, not thread order — a reply written months after the
+/// message it answers sits at the end of the file, nowhere near it — so the
+/// messages are re-threaded here, once, and the message list, the overview
+/// sidebar and the opened-message lookup all share the one order.
+///
+/// mboxrd ">From " escaping is undone on the raw message text before MIME
+/// parsing: the mbox writer escapes raw file lines, so unescaping must happen
+/// before any Content-Transfer-Encoding decoding, not after.
 ///
 /// The whole pipeline works on bytes: messages carry their own charsets, and
 /// only mailparse — which reads each part's declaration — may turn them into
 /// text. A premature whole-file UTF-8 conversion would replace every KOI8-R
 /// byte with U+FFFD before the parser could decode it.
 fn parse_thread(mbox: &[u8]) -> Vec<Mail> {
-    split_mbox(mbox)
+    let mails: Vec<Mail> = split_mbox(mbox)
         .iter()
         .map(|raw| parse_message(&unescape_mboxrd(raw)))
+        .collect();
+    in_thread_order(mails)
+}
+
+/// Reorder a thread into the overview's depth-first display order, so the OP
+/// heads the list and every reply follows the message it answers.
+///
+/// `thread_tree` is idempotent over this: the walk keeps each parent's
+/// children in their existing relative order, so re-running it on the result
+/// yields the same rows, now indexed in position order.
+fn in_thread_order(thread: Vec<Mail>) -> Vec<Mail> {
+    let order: Vec<usize> = thread_tree(&thread).iter().map(|row| row.index).collect();
+    // Every message is emitted exactly once, so this is a total permutation
+    // and no message can be dropped by the take().
+    let mut mails: Vec<Option<Mail>> = thread.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|index| mails[index].take())
         .collect()
 }
 
@@ -3470,6 +3493,61 @@ mod tests {
             .map(|row| (row.index, row.depth))
             .collect();
         assert_eq!(rows, [(1, 0), (0, 1), (2, 1)]);
+    }
+
+    /// The shape that exposed the bug: lore serves `t.mbox.gz` by date, and
+    /// this series (per-cpu work helpers v4) got its reviews in May and the
+    /// author's answers to every one of them two months later, in one sitting.
+    /// Chronologically those answers all pile up at the end of the file.
+    fn late_replies_thread() -> Vec<Mail> {
+        vec![
+            mail("cover@x", None, "[PATCH 0/2] series", "Leonardo"),
+            mail("p1@x", Some("cover@x"), "[PATCH 1/2] first", "Leonardo"),
+            mail("p2@x", Some("cover@x"), "[PATCH 2/2] second", "Leonardo"),
+            mail("r1@x", Some("p1@x"), "Re: [PATCH 1/2] first", "Frederic"),
+            mail("r2@x", Some("p2@x"), "Re: [PATCH 2/2] second", "Sebastian"),
+            // Two months on, answering both reviews above.
+            mail("late1@x", Some("r1@x"), "Re: [PATCH 1/2] first", "Leonardo"),
+            mail(
+                "late2@x",
+                Some("r2@x"),
+                "Re: [PATCH 2/2] second",
+                "Leonardo",
+            ),
+        ]
+    }
+
+    #[test]
+    fn thread_order_follows_the_reply_graph_not_the_clock() {
+        let ordered = in_thread_order(late_replies_thread());
+        let ids: Vec<&str> = ordered
+            .iter()
+            .filter_map(|mail| mail.message_id.as_deref())
+            .map(normalize_message_id)
+            .collect();
+        // Each patch is followed by its own discussion, the way lore's web
+        // view nests it — not both patches first and the late answers last.
+        assert_eq!(
+            ids,
+            [
+                "cover@x", "p1@x", "r1@x", "late1@x", "p2@x", "r2@x", "late2@x"
+            ]
+        );
+    }
+
+    #[test]
+    fn thread_order_is_stable_under_a_second_pass() {
+        // The overview rebuilds the tree from the already-reordered thread,
+        // so the walk must reproduce itself: same rows, now in index order.
+        let ordered = in_thread_order(late_replies_thread());
+        let rows: Vec<(usize, usize)> = thread_tree(&ordered)
+            .iter()
+            .map(|row| (row.index, row.depth))
+            .collect();
+        assert_eq!(
+            rows,
+            [(0, 0), (1, 1), (2, 2), (3, 3), (4, 1), (5, 2), (6, 3)]
+        );
     }
 
     #[test]

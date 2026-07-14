@@ -233,9 +233,14 @@ pub enum When {
 /// navigated to need this: their fetch, parse and row building would
 /// otherwise all land on the main thread while the new tab is still
 /// animating in, and for content nobody may ever look at.
+///
+/// It hangs off `shown`, not `showing`: `showing` fires as the navigation
+/// transition starts, so the load would land in the middle of it and stutter
+/// the very animation it is sliding in behind. `shown` fires once the
+/// transition has ended, leaving the animation a clear frame budget.
 pub fn load_on_first_show(page: &adw::NavigationPage, load: impl Fn() + 'static) {
     let loaded = std::cell::Cell::new(false);
-    page.connect_showing(move |_| {
+    page.connect_shown(move |_| {
         if !loaded.replace(true) {
             load();
         }

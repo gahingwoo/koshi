@@ -1,3 +1,4 @@
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -19,8 +20,10 @@ const ROW_MENU_LABELS: &[&str] = &["Open in New _Tab", "Open on _Web"];
 /// The main list's star buttons by slug, for updating a star in place when
 /// its inbox is unfavorited from the favorites section. Weak refs: the
 /// favorites section's handlers hold this map, and a strong ref here would
-/// cycle the buttons alive past the page's destruction.
-type StarButtons = Rc<HashMap<String, glib::WeakRef<gtk::Button>>>;
+/// cycle the buttons alive past the page's destruction. Mutable because the
+/// list is built a chunk at a time (see [`BUILD_CHUNK`]), so the map fills in
+/// behind handlers that already hold it.
+type StarButtons = Rc<RefCell<HashMap<String, glib::WeakRef<gtk::Button>>>>;
 
 pub fn build_inbox_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     build_page(nav, When::Now)
@@ -81,7 +84,7 @@ fn load(remote: RemoteContent, nav: adw::NavigationView, entry: gtk::SearchEntry
     let cancellable = remote.cancellable();
     glib::spawn_future_local(async move {
         match lore::fetch_inboxes(&cancellable).await {
-            Ok(inboxes) => remote.show_content(&build_content(&nav, inboxes, &entry)),
+            Ok(inboxes) => build_content(&remote, &nav, inboxes, &entry),
             Err(error) if error.is_cancelled() => {}
             Err(error) => {
                 let weak = remote.downgrade();
@@ -103,15 +106,27 @@ fn load(remote: RemoteContent, nav: adw::NavigationView, entry: gtk::SearchEntry
     });
 }
 
+/// Rows built per idle tick. All ~350 of them are some 220ms of widget
+/// construction: built in one pass they blow the frame budget wholesale, and
+/// the navigation that asked for the page visibly hitches. A chunk this size
+/// fits inside a frame, so the list assembles over a handful of them while
+/// the spinner still turns and the UI keeps answering.
+const BUILD_CHUNK: usize = 40;
+
 /// The page content: a favorites section stacked above the full inbox list.
 /// The full list is built exactly once — regenerating its hundreds of rows
 /// on every star click stalls noticeably — so a toggle only updates star
 /// icons in place and regenerates the small favorites section.
+///
+/// Rows arrive a chunk per idle, under RemoteContent's cover, so both their
+/// construction and their layout are spread over frames the UI can still
+/// answer in; the cover lifts on the last chunk.
 fn build_content(
+    remote: &RemoteContent,
     nav: &adw::NavigationView,
     inboxes: Vec<Inbox>,
     entry: &gtk::SearchEntry,
-) -> gtk::Box {
+) {
     let container = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -125,41 +140,7 @@ fn build_content(
     let list = new_boxed_list();
     // Hosted on the container, not the list: see RowMenu's docs.
     let menu = RowMenu::new(&container, ROW_MENU_LABELS);
-    let mut stars = HashMap::new();
-    for inbox in &inboxes {
-        let star = new_star_button(favorites::is_favorite_inbox(&inbox.slug));
-        stars.insert(inbox.slug.clone(), star.downgrade());
 
-        let row = build_row(&inbox.slug, &inbox.description);
-        row.add_suffix(&star);
-        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-        add_row_actions(&row, &menu, &inbox.slug, &inbox.description);
-        list.append(&row);
-    }
-    let stars: StarButtons = Rc::new(stars);
-
-    for inbox in &inboxes {
-        let fav = FavoriteInbox {
-            slug: inbox.slug.clone(),
-            description: inbox.description.clone(),
-        };
-        let Some(star) = stars.get(&inbox.slug).and_then(|weak| weak.upgrade()) else {
-            continue;
-        };
-        star.connect_clicked(glib::clone!(
-            #[weak]
-            section,
-            #[weak]
-            nav,
-            #[strong]
-            stars,
-            move |star| {
-                let starred = favorites::toggle_inbox(fav.clone());
-                apply_star_state(star, starred);
-                refresh_favorites(&section, &nav, &stars);
-            }
-        ));
-    }
     // Narrow the All Inboxes list to rows whose slug or description matches the
     // filter text. Favorites stay pinned and unfiltered: they're your short
     // curated set, and the filter exists to scan the long list below them.
@@ -182,6 +163,8 @@ fn build_content(
     list.connect_row_activated(glib::clone!(
         #[weak]
         nav,
+        #[strong]
+        inboxes,
         move |_, row| {
             let inbox = &inboxes[row.index() as usize];
             nav.push(&build_thread_list_page(
@@ -192,8 +175,73 @@ fn build_content(
         }
     ));
 
-    refresh_favorites(&section, nav, &stars);
-    container
+    // Mounted under RemoteContent's still-spinning cover, so each chunk's rows
+    // are measured and allocated in the frame that builds them. Attached only
+    // at the end instead, GTK would lay out and realize all ~350 at once — the
+    // frame that did it stalled for over 100ms, which is the hitch itself; the
+    // build was never the whole story.
+    remote.show_content_covered(&container);
+
+    // A star's handler refreshes every other view of the same inbox, so it
+    // needs the whole map — which only exists once the last chunk has run.
+    // Sharing it mutably lets a handler built in chunk 1 see chunk 9's rows.
+    let stars: StarButtons = Rc::new(RefCell::new(HashMap::new()));
+    let next = Cell::new(0);
+    let weak = remote.downgrade();
+    glib::idle_add_local(glib::clone!(
+        #[weak]
+        nav,
+        #[upgrade_or]
+        glib::ControlFlow::Break,
+        move || {
+            // The page was popped (or its tab closed) mid-build: drop the
+            // half-built list with it.
+            let Some(remote) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+
+            let start = next.get();
+            let end = (start + BUILD_CHUNK).min(inboxes.len());
+            for inbox in &inboxes[start..end] {
+                let star = new_star_button(favorites::is_favorite_inbox(&inbox.slug));
+                stars
+                    .borrow_mut()
+                    .insert(inbox.slug.clone(), star.downgrade());
+                star.connect_clicked(glib::clone!(
+                    #[weak]
+                    section,
+                    #[weak]
+                    nav,
+                    #[strong]
+                    stars,
+                    #[strong(rename_to = fav)]
+                    FavoriteInbox {
+                        slug: inbox.slug.clone(),
+                        description: inbox.description.clone(),
+                    },
+                    move |star| {
+                        let starred = favorites::toggle_inbox(fav.clone());
+                        apply_star_state(star, starred);
+                        refresh_favorites(&section, &nav, &stars);
+                    }
+                ));
+
+                let row = build_row(&inbox.slug, &inbox.description);
+                row.add_suffix(&star);
+                row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+                add_row_actions(&row, &menu, &inbox.slug, &inbox.description);
+                list.append(&row);
+            }
+            next.set(end);
+
+            if end < inboxes.len() {
+                return glib::ControlFlow::Continue;
+            }
+            refresh_favorites(&section, &nav, &stars);
+            remote.reveal();
+            glib::ControlFlow::Break
+        }
+    ));
 }
 
 /// Regenerate the favorites section (its heading, list and the trailing
@@ -229,7 +277,11 @@ fn refresh_favorites(section: &gtk::Box, nav: &adw::NavigationView, stars: &Star
             fav.clone(),
             move |_| {
                 favorites::toggle_inbox(fav.clone());
-                if let Some(main) = stars.get(&fav.slug).and_then(|weak| weak.upgrade()) {
+                let main = stars
+                    .borrow()
+                    .get(&fav.slug)
+                    .and_then(glib::WeakRef::upgrade);
+                if let Some(main) = main {
                     apply_star_state(&main, false);
                 }
                 // Refresh from an idle: it destroys the very button whose

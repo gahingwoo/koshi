@@ -98,6 +98,16 @@ impl RemoteContent {
     }
 
     pub fn show_loading(&self) {
+        // Drop what was on screen rather than just covering it. The cover is a
+        // plain opaque rectangle sized to whatever sits under it, so over a
+        // boxed list (a refresh) it paints across the card's rounded corners,
+        // and its centred spinner drifts off down the length of the list. An
+        // emptied stack also puts the spinner back where a first load has it.
+        for name in ["content", "error"] {
+            if let Some(child) = self.stack.child_by_name(name) {
+                self.stack.remove(&child);
+            }
+        }
         self.cover.set_visible(true);
     }
 
@@ -110,6 +120,11 @@ impl RemoteContent {
     /// Mount content underneath the still-visible loading cover, so it can
     /// lay out and prepare itself while the spinner keeps spinning. The
     /// caller lifts the cover with reveal() once the content is ready.
+    ///
+    /// Only sound where the content is viewport-sized — a page whose
+    /// RemoteContent *wraps* its ScrolledWindow. Cover content that grows
+    /// past the viewport (a RemoteContent *inside* a ScrolledWindow, like the
+    /// inbox list) and the cover grows with it, with the two artifacts above.
     pub fn show_content_covered(&self, child: &impl IsA<gtk::Widget>) {
         self.swap_child("content", child);
     }

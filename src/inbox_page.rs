@@ -118,9 +118,9 @@ const BUILD_CHUNK: usize = 40;
 /// on every star click stalls noticeably — so a toggle only updates star
 /// icons in place and regenerates the small favorites section.
 ///
-/// Rows arrive a chunk per idle, under RemoteContent's cover, so both their
-/// construction and their layout are spread over frames the UI can still
-/// answer in; the cover lifts on the last chunk.
+/// Rows arrive a chunk per idle — construction and layout both spread over
+/// frames the UI can still answer in — and the page goes on screen once the
+/// first chunk has filled the viewport.
 fn build_content(
     remote: &RemoteContent,
     nav: &adw::NavigationView,
@@ -175,13 +175,6 @@ fn build_content(
         }
     ));
 
-    // Mounted under RemoteContent's still-spinning cover, so each chunk's rows
-    // are measured and allocated in the frame that builds them. Attached only
-    // at the end instead, GTK would lay out and realize all ~350 at once — the
-    // frame that did it stalled for over 100ms, which is the hitch itself; the
-    // build was never the whole story.
-    remote.show_content_covered(&container);
-
     // A star's handler refreshes every other view of the same inbox, so it
     // needs the whole map — which only exists once the last chunk has run.
     // Sharing it mutably lets a handler built in chunk 1 see chunk 9's rows.
@@ -234,11 +227,20 @@ fn build_content(
             }
             next.set(end);
 
+            // Go on screen as soon as the first chunk exists: it is already
+            // more than a viewport of rows, so the list never appears partial,
+            // and every later chunk is measured and allocated in the frame that
+            // builds it. Attaching the finished list in one go instead, GTK
+            // laid out and realized all ~350 rows in a single frame — over
+            // 100ms of it, and the hitch this whole thing is about.
+            if start == 0 {
+                remote.show_content(&container);
+            }
+
             if end < inboxes.len() {
                 return glib::ControlFlow::Continue;
             }
             refresh_favorites(&section, &nav, &stars);
-            remote.reveal();
             glib::ControlFlow::Break
         }
     ));

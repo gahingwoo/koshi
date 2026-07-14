@@ -221,3 +221,23 @@ impl RemoteContent {
         self.stack.set_visible_child_name(name);
     }
 }
+
+/// When a page fetches its content: as it is built, or once it is first shown.
+pub enum When {
+    Now,
+    OnFirstShow,
+}
+
+/// Fetch a page's content the first time it is shown rather than the moment
+/// it is built. Only pages built straight into a back stack the user has not
+/// navigated to need this: their fetch, parse and row building would
+/// otherwise all land on the main thread while the new tab is still
+/// animating in, and for content nobody may ever look at.
+pub fn load_on_first_show(page: &adw::NavigationPage, load: impl Fn() + 'static) {
+    let loaded = std::cell::Cell::new(false);
+    page.connect_showing(move |_| {
+        if !loaded.replace(true) {
+            load();
+        }
+    });
+}

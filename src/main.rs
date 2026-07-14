@@ -20,9 +20,11 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 
 use favorites_page::{FAVORITES_PAGE_NAME, build_favorites_page};
-use inbox_page::{INBOX_LIST_TITLE, build_inbox_page};
+use inbox_page::{INBOX_LIST_TITLE, build_inbox_page, build_inbox_page_deferred};
 use profile_menu::build_profile_button;
-use thread_list_page::{build_search_page, build_thread_list_page};
+use thread_list_page::{
+    build_search_page, build_thread_list_page, build_thread_list_page_deferred,
+};
 use thread_page::{THREAD_PAGE_NAME, build_thread_page, start_thread_search, toggle_overview};
 
 const APP_ID: &str = "moe.nikableh.Koshi";
@@ -459,12 +461,16 @@ pub(crate) fn open_thread_in_new_tab(tab_view: &adw::TabView, list: &str, messag
     // Reconstruct the back stack a normal drill-in would build — inbox → the
     // thread's list → the thread — so a tab opened straight into a thread can
     // navigate back through its natural parents instead of stranding on a
-    // single page with no back button. The parent pages load their own content
-    // (as they would if navigated to), so back lands on a live list, not a
-    // blank. The list description isn't known here; the list page shows just
-    // its name until refreshed.
-    let inbox = build_inbox_page(&nav);
-    let thread_list = build_thread_list_page(&nav, list, "");
+    // single page with no back button.
+    //
+    // The parents fetch and build only once they are first shown: eagerly they
+    // would put a manifest fetch, a feed fetch and hundreds of rows on the main
+    // thread just as the new tab animates in (~110ms, enough to drop frames of
+    // the animation) — for pages the user often never goes back to. Deferred,
+    // back still lands on a live list, one loading spinner later. The list
+    // description isn't known here; the list page shows just its name.
+    let inbox = build_inbox_page_deferred(&nav);
+    let thread_list = build_thread_list_page_deferred(&nav, list);
     let thread = build_thread_page(&nav, list, message_id);
     nav.replace(&[inbox, thread_list, thread]);
     append_tab(tab_view, &nav, "Loading…");

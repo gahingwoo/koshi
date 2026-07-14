@@ -7,7 +7,7 @@ use gtk::{gdk, glib};
 use crate::favorites::{self, FavoriteInbox};
 use crate::list_page::{RowMenu, build_list_page_with_search};
 use crate::lore::{self, Inbox};
-use crate::remote_page::RemoteContent;
+use crate::remote_page::{RemoteContent, When, load_on_first_show};
 use crate::thread_list_page::build_thread_list_page;
 use crate::thread_page::launch_uri;
 
@@ -23,6 +23,17 @@ const ROW_MENU_LABELS: &[&str] = &["Open in New _Tab", "Open on _Web"];
 type StarButtons = Rc<HashMap<String, glib::WeakRef<gtk::Button>>>;
 
 pub fn build_inbox_page(nav: &adw::NavigationView) -> adw::NavigationPage {
+    build_page(nav, When::Now)
+}
+
+/// The inbox page for a back stack the user has not navigated to (a thread
+/// opened straight into its own tab). It fetches the manifest and builds its
+/// hundreds of rows only once the user actually goes back to it.
+pub fn build_inbox_page_deferred(nav: &adw::NavigationView) -> adw::NavigationPage {
+    build_page(nav, When::OnFirstShow)
+}
+
+fn build_page(nav: &adw::NavigationView, when: When) -> adw::NavigationPage {
     let remote = RemoteContent::new();
 
     // A reveal-on-demand filter over the (hundreds-long) inbox list, distinct
@@ -47,7 +58,21 @@ pub fn build_inbox_page(nav: &adw::NavigationView) -> adw::NavigationPage {
     // so background tabs and the header's global search are unaffected.
     search_bar.set_key_capture_widget(Some(&page));
 
-    load(remote, nav.clone(), entry);
+    match when {
+        When::Now => load(remote, nav.clone(), entry),
+        When::OnFirstShow => load_on_first_show(
+            &page,
+            glib::clone!(
+                #[strong]
+                remote,
+                #[strong]
+                nav,
+                #[strong]
+                entry,
+                move || load(remote.clone(), nav.clone(), entry.clone())
+            ),
+        ),
+    }
     page
 }
 

@@ -6,7 +6,7 @@ use gtk::{gdk, gio, glib};
 
 use crate::list_page::{RowMenu, build_list_page};
 use crate::lore::{self, Sort, ThreadSummary};
-use crate::remote_page::RemoteContent;
+use crate::remote_page::{RemoteContent, When, load_on_first_show};
 use crate::thread_page::{build_thread_page, launch_uri};
 
 /// Rows shown per Load More step. lore hands over 200 threads per fetch, but
@@ -69,6 +69,26 @@ pub fn build_thread_list_page(
         inbox_name,
         inbox_name,
         inbox_description,
+        When::Now,
+    )
+}
+
+/// The list page for a back stack the user has not navigated to (a thread
+/// opened straight into its own tab). It fetches the list's feed only once
+/// the user actually goes back to it.
+pub fn build_thread_list_page_deferred(
+    nav: &adw::NavigationView,
+    inbox_name: &str,
+) -> adw::NavigationPage {
+    build_page(
+        nav,
+        Mode::Recent {
+            list: inbox_name.to_string(),
+        },
+        inbox_name,
+        inbox_name,
+        "",
+        When::OnFirstShow,
     )
 }
 
@@ -82,6 +102,7 @@ pub fn build_search_page(nav: &adw::NavigationView, query: &str) -> adw::Navigat
         &format!("Search: {query}"),
         "Search results",
         &format!("Matches for “{query}” across all of lore.kernel.org"),
+        When::Now,
     )
 }
 
@@ -91,6 +112,7 @@ fn build_page(
     page_title: &str,
     heading: &str,
     description: &str,
+    when: When,
 ) -> adw::NavigationPage {
     let remote = RemoteContent::new();
     let sort = Rc::new(Cell::new(Sort::default()));
@@ -135,7 +157,23 @@ fn build_page(
 
     let page = build_list_page(page_title, heading, description, &actions, remote.widget());
 
-    load(remote, nav.clone(), mode, sort.get());
+    match when {
+        When::Now => load(remote, nav.clone(), mode, sort.get()),
+        When::OnFirstShow => load_on_first_show(
+            &page,
+            glib::clone!(
+                #[strong]
+                remote,
+                #[strong]
+                nav,
+                #[strong]
+                mode,
+                #[strong]
+                sort,
+                move || load(remote.clone(), nav.clone(), mode.clone(), sort.get())
+            ),
+        ),
+    }
     page
 }
 

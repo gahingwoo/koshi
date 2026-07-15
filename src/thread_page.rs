@@ -1112,6 +1112,34 @@ fn spawn_thread_load(
                     // was reached through; find it before the thread is moved
                     // into the content.
                     let opened = opened_message_index(&thread, &message_id);
+                    // The overview's Refresh button re-runs this very load to
+                    // pull in replies that have arrived since; it holds weak
+                    // handles so the closure never keeps a closed page alive.
+                    let refresh: Rc<dyn Fn()> = {
+                        let remote = remote.downgrade();
+                        let split = split.downgrade();
+                        let nav = nav.downgrade();
+                        let page = page.downgrade();
+                        let list = list.clone();
+                        let message_id = message_id.clone();
+                        Rc::new(move || {
+                            if let (Some(remote), Some(split), Some(nav), Some(page)) = (
+                                remote.upgrade(),
+                                split.upgrade(),
+                                nav.upgrade(),
+                                page.upgrade(),
+                            ) {
+                                spawn_thread_load(
+                                    remote,
+                                    split,
+                                    nav,
+                                    page,
+                                    list.clone(),
+                                    message_id.clone(),
+                                );
+                            }
+                        })
+                    };
                     // Mounted under RemoteContent's still-spinning cover; the
                     // content itself lifts it once the visible rows are
                     // filled and painted (see build_thread_content).
@@ -1121,6 +1149,7 @@ fn spawn_thread_load(
                         opened,
                         remote.downgrade(),
                         &split,
+                        refresh,
                     );
                     remote.show_content_covered(&content);
                 }
@@ -1184,6 +1213,7 @@ fn build_thread_content(
     opened: usize,
     remote: crate::remote_page::RemoteContentWeak,
     split: &adw::OverlaySplitView,
+    refresh: Rc<dyn Fn()>,
 ) -> gtk::Box {
     let op = &thread[0];
     // The single view opens on this message; the header star and Reply act on
@@ -1532,6 +1562,7 @@ fn build_thread_content(
         &scrolled,
         single_shown.clone(),
         show_single.clone(),
+        refresh,
     )));
 
     // Background warmup. GtkListView keeps every row of a <=205-item model
@@ -2450,6 +2481,7 @@ fn build_overview_sidebar(
     scrolled: &gtk::ScrolledWindow,
     single_shown: Rc<Cell<usize>>,
     show_single: Rc<dyn Fn(usize)>,
+    refresh: Rc<dyn Fn()>,
 ) -> gtk::Widget {
     // Single selection is the highlight: the row of the message on screen is
     // selected, so the "navigation-sidebar" style marks it. Selecting a row
@@ -2804,16 +2836,35 @@ fn build_overview_sidebar(
         .xalign(0.0)
         .css_classes(["caption", "dim-label"])
         .build();
-    let header = gtk::Box::builder()
+    let titles = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+    titles.append(&heading);
+    titles.append(&count);
+
+    // Threads keep growing after they are opened; Refresh re-downloads the
+    // mbox so replies that landed since show up without leaving the thread.
+    let refresh_button = gtk::Button::builder()
+        .icon_name("view-refresh-symbolic")
+        .tooltip_text("Refresh")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    refresh_button.connect_clicked(move |_| refresh());
+
+    let header = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
         .margin_top(12)
         .margin_bottom(12)
         .margin_start(12)
         .margin_end(12)
         .build();
-    header.append(&heading);
-    header.append(&count);
+    header.append(&titles);
+    header.append(&refresh_button);
 
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 0);
     sidebar.append(&header);

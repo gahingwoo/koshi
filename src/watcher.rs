@@ -18,9 +18,12 @@ use crate::settings;
 use crate::subscriptions::{self, Subscription};
 use crate::thread_page::thread_message_digests;
 
-/// Begin watching subscribed threads. Call once at startup; it reschedules
-/// itself for the life of the application.
+/// Begin watching subscribed threads. Call once at startup: it polls once right
+/// away — so replies that landed while Koshi was closed surface on launch
+/// instead of only after the first interval elapses — then reschedules itself
+/// for the life of the application.
 pub fn start(app: &adw::Application) {
+    poll_all(app);
     schedule_next_poll(app);
 }
 

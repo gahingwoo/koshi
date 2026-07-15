@@ -2557,43 +2557,45 @@ fn build_overview_sidebar(
         row_of_message[message] = row_pos as i32;
     }
 
-    // A generation counter so a new activation supersedes any correction
-    // loop still running from a previous click.
+    // The highlight marks the message the reader navigated to explicitly — the
+    // opened message on entry, or the message an overview row jumped to — and
+    // holds only until the reader scrolls the thread away from it. It is a fixed
+    // marker, not a scroll-position tracker: the moment the reader scrolls, the
+    // marked row no longer reflects what is on screen, so the marker is dropped
+    // and the overview re-opens with nothing highlighted.
+    let current: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(Some(opened)));
+    // Suppresses the clear-on-scroll while a jump (and the view switch it rides
+    // on) is still settling — both move the vadjustment on their own.
+    let settling = Rc::new(Cell::new(false));
+    // The vadjustment value the marker settled at; a later value more than a
+    // pixel off is the reader scrolling away from the marked message.
+    let anchor = Rc::new(Cell::new(0.0f64));
+    // A generation counter so a new activation supersedes any settling loop
+    // still running from a previous click.
     let scroll_generation = Rc::new(Cell::new(0u64));
+    let row_of_message = Rc::new(row_of_message);
 
-    // Keep the row of the message on screen selected. In single view that is
-    // always the opened message; in threaded view it follows the scroll, so
-    // the highlight tracks whichever message the reader has scrolled to.
-    let mails: Vec<Rc<Mail>> = thread.to_vec();
-    let refresh_highlight: Rc<dyn Fn()> = Rc::new({
-        let list = list.downgrade();
-        let list_view = list_view.downgrade();
-        let view_toggle = view_toggle.downgrade();
+    let apply_highlight: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        list,
+        #[strong]
+        current,
+        #[strong]
+        row_of_message,
         move || {
-            let (Some(list), Some(list_view), Some(view_toggle)) =
-                (list.upgrade(), list_view.upgrade(), view_toggle.upgrade())
-            else {
-                return;
-            };
-            let target = if view_toggle.active() == 0 {
-                opened
-            } else if let Some(index) = message_at_viewport_top(&list_view, &mails) {
-                index
-            } else {
-                // Nothing has settled at the top yet (mid-relayout after a
-                // model swap or jump); keep the current highlight.
-                return;
-            };
-            let Some(&row_pos) = row_of_message.get(target) else {
-                return;
-            };
-            if let Some(row) = list.row_at_index(row_pos)
-                && !row.is_selected()
-            {
-                list.select_row(Some(&row));
+            match current.get().and_then(|msg| row_of_message.get(msg).copied()) {
+                Some(row_pos) => {
+                    if let Some(row) = list.row_at_index(row_pos)
+                        && !row.is_selected()
+                    {
+                        list.select_row(Some(&row));
+                    }
+                }
+                None => list.unselect_all(),
             }
         }
-    });
+    ));
+    apply_highlight();
 
     list.connect_row_activated(glib::clone!(
         #[weak]
@@ -2603,11 +2605,22 @@ fn build_overview_sidebar(
         #[strong]
         scroll_generation,
         #[strong]
-        refresh_highlight,
+        current,
+        #[strong]
+        settling,
+        #[strong]
+        anchor,
+        #[strong]
+        apply_highlight,
         move |_, row| {
             let Some(&index) = message_of_row.get(row.index() as usize) else {
                 return;
             };
+            // Mark the picked message and raise the settling flag before moving
+            // the view, so the view switch and jump below — which both nudge the
+            // scroll — are not mistaken for the reader scrolling away.
+            current.set(Some(index));
+            settling.set(true);
             // The overview lists the whole thread, so a jump only lands
             // somewhere in the single view when it happens to be showing that
             // one message. Switch to the threaded view first (a no-op when
@@ -2615,28 +2628,42 @@ fn build_overview_sidebar(
             // so the message index is the row's list position.
             view_toggle.set_active(1);
             jump_to_message(&list_view, index as u32, &scroll_generation);
+            apply_highlight();
 
-            // The highlight tracks the message at the viewport top, but a
-            // widget's bounds lag the scroll by a frame, so the value-changed
-            // handlers fired during this programmatic jump read the pre-jump
-            // layout and latch the highlight onto the old message; once the
-            // jump settles no further scroll events arrive to correct it, so it
-            // stays stale until the row is activated again. Re-run the highlight
-            // across the jump's settling frames — the same generation gates it,
-            // so a newer jump takes over, and the budget matches
-            // jump_to_message's — so the final, settled frame lands it on the
-            // message we jumped to.
+            // Hold the marker on across the jump's settling frames, then anchor
+            // it at the scroll position the jump came to rest on and re-arm the
+            // clear-on-scroll. Gated by the jump generation so a newer click
+            // takes over; the frame budget matches jump_to_message's.
             let generation = scroll_generation.clone();
             let this_jump = generation.get();
-            let refresh_highlight = refresh_highlight.clone();
+            let apply_highlight = apply_highlight.clone();
+            let settling = settling.clone();
+            let anchor = anchor.clone();
+            let last = Cell::new(f64::NAN);
+            let steady = Cell::new(0u32);
             let frames = Cell::new(0u32);
-            list_view.add_tick_callback(move |_, _| {
+            list_view.add_tick_callback(move |list_view, _| {
                 if generation.get() != this_jump {
+                    // A newer jump owns the marker and runs its own settling.
                     return glib::ControlFlow::Break;
                 }
-                refresh_highlight();
+                apply_highlight();
+                let value = list_view
+                    .ancestor(gtk::ScrolledWindow::static_type())
+                    .and_downcast::<gtk::ScrolledWindow>()
+                    .map_or(0.0, |scrolled| scrolled.vadjustment().value());
                 frames.set(frames.get() + 1);
-                if frames.get() >= 60 {
+                if (value - last.get()).abs() < 0.5 {
+                    steady.set(steady.get() + 1);
+                } else {
+                    steady.set(0);
+                    last.set(value);
+                }
+                // Settle once the scroll holds steady, past an initial gate so
+                // the pre-jump frames aren't taken for a settled position.
+                if (frames.get() >= 4 && steady.get() >= 3) || frames.get() >= 60 {
+                    anchor.set(value);
+                    settling.set(false);
                     glib::ControlFlow::Break
                 } else {
                     glib::ControlFlow::Continue
@@ -2655,25 +2682,46 @@ fn build_overview_sidebar(
         }
     ));
 
+    // Scrolling the thread away from the marked message drops the marker; the
+    // settling flag lets a jump's own scrolling through untouched.
     let vadjustment = scrolled.vadjustment();
     vadjustment.connect_value_changed(glib::clone!(
         #[strong]
-        refresh_highlight,
-        move |_| refresh_highlight()
-    ));
-    // A view switch swaps the model and resizes the content; catch the
-    // relayout so the highlight settles onto the newly shown message.
-    vadjustment.connect_changed(glib::clone!(
+        current,
         #[strong]
-        refresh_highlight,
-        move |_| refresh_highlight()
+        settling,
+        #[strong]
+        anchor,
+        #[strong]
+        apply_highlight,
+        move |vadjustment| {
+            if settling.get() || current.get().is_none() {
+                return;
+            }
+            if (vadjustment.value() - anchor.get()).abs() <= 1.0 {
+                return;
+            }
+            current.set(None);
+            apply_highlight();
+        }
     ));
+    // A manual view switch changes what is on screen, so it too drops the
+    // marker; the settling flag exempts the switch the overview jump rides on.
     view_toggle.connect_active_notify(glib::clone!(
         #[strong]
-        refresh_highlight,
-        move |_| refresh_highlight()
+        current,
+        #[strong]
+        settling,
+        #[strong]
+        apply_highlight,
+        move |_| {
+            if settling.get() || current.get().is_none() {
+                return;
+            }
+            current.set(None);
+            apply_highlight();
+        }
     ));
-    refresh_highlight();
 
     let heading = gtk::Label::builder()
         .label("Thread Overview")

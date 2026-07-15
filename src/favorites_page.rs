@@ -3,9 +3,8 @@ use gtk::glib;
 
 use crate::favorites::{self, Favorite, FavoriteInbox};
 use crate::list_page::build_list_page;
-use crate::subscriptions::{self, Subscription};
 use crate::thread_list_page::build_thread_list_page;
-use crate::thread_page::{apply_bell_state, build_thread_page, new_bell_button};
+use crate::thread_page::{RowKind, add_star_and_bell, build_thread_page};
 
 pub const FAVORITES_TITLE: &str = "Favorites";
 
@@ -81,16 +80,8 @@ fn build_inbox_list(nav: &adw::NavigationView, inboxes: Vec<FavoriteInbox>) -> g
 fn build_mail_list(nav: &adw::NavigationView, mails: Vec<Favorite>) -> gtk::ListBox {
     let list = new_boxed_list();
     for fav in &mails {
-        list.append(&build_favorite_row(fav));
+        list.append(&build_favorite_row(nav, &list, fav));
     }
-    list.connect_row_activated(glib::clone!(
-        #[weak]
-        nav,
-        move |_, row| {
-            let fav = &mails[row.index() as usize];
-            nav.push(&build_thread_page(&nav, &fav.list, &fav.message_id));
-        }
-    ));
     list
 }
 
@@ -112,7 +103,11 @@ fn build_inbox_row(fav: &FavoriteInbox) -> adw::ActionRow {
     row
 }
 
-fn build_favorite_row(fav: &Favorite) -> adw::ActionRow {
+fn build_favorite_row(
+    nav: &adw::NavigationView,
+    list: &gtk::ListBox,
+    fav: &Favorite,
+) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title(format!(
             "<tt>{}</tt>",
@@ -128,38 +123,27 @@ fn build_favorite_row(fav: &Favorite) -> adw::ActionRow {
             .css_classes(["numeric", "caption", "dim-label"])
             .build(),
     );
-    // A bell to the right of the date subscribes this thread to new-mail
-    // notifications, toggling filled/outline like the header bell in the
-    // thread view.
-    row.add_suffix(&build_subscribe_button(fav));
-    row
-}
+    // A star and a subscribe bell to the right of the date. Un-starring drops
+    // the row (the mail leaves Favorites); the bell only toggles notifications.
+    add_star_and_bell(
+        list,
+        &row,
+        &fav.message_id,
+        &fav.subject,
+        &fav.date,
+        &fav.list,
+        RowKind::Favorites,
+    );
 
-/// A flat bell button toggling this mail's subscription state in the store,
-/// swapping its own icon between outline and filled on each click.
-fn build_subscribe_button(fav: &Favorite) -> gtk::Button {
-    let subscription = Subscription {
-        message_id: fav.message_id.clone(),
-        subject: fav.subject.clone(),
-        date: fav.date.clone(),
-        list: fav.list.clone(),
-        // Starts empty; seed_new_subscription fills the baseline the moment it
-        // is added (a scheduled poll re-seeds if that fetch fails).
-        seen: Vec::new(),
-    };
-    let button = new_bell_button(subscriptions::is_subscribed(&fav.message_id));
-    button.connect_clicked(glib::clone!(
-        #[strong]
-        subscription,
-        move |button| {
-            let subscribed = subscriptions::toggle(subscription.clone());
-            // On a fresh subscribe, seed the baseline now so an imminent reply
-            // isn't absorbed silently by the first scheduled poll.
-            if subscribed {
-                crate::watcher::seed_new_subscription(subscription.clone());
-            }
-            apply_bell_state(button, subscribed);
+    // Activating the row (a click anywhere but the buttons) opens the thread.
+    let list_slug = fav.list.clone();
+    let message_id = fav.message_id.clone();
+    row.connect_activated(glib::clone!(
+        #[weak]
+        nav,
+        move |_| {
+            nav.push(&build_thread_page(&nav, &list_slug, &message_id));
         }
     ));
-    button
+    row
 }

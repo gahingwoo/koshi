@@ -3413,6 +3413,85 @@ pub(crate) fn apply_bell_state(button: &gtk::Button, subscribed: bool) {
     }));
 }
 
+/// Which list a page row belongs to. Its membership button — the star on the
+/// Favorites page, the bell on the Subscriptions page — removes the row when
+/// switched off, because the mail has then left that list; the other button
+/// only flips state.
+#[derive(Clone, Copy)]
+pub(crate) enum RowKind {
+    Favorites,
+    Subscriptions,
+}
+
+/// Append a favorite star and a subscribe bell to `row`, each reflecting and
+/// toggling its store, so a mail on either page can be starred and subscribed
+/// from the one row. Toggling the membership button (per `kind`) off removes the
+/// row from `list`. Shared by the Favorites and Subscriptions pages.
+pub(crate) fn add_star_and_bell(
+    list: &gtk::ListBox,
+    row: &adw::ActionRow,
+    message_id: &str,
+    subject: &str,
+    date: &str,
+    list_slug: &str,
+    kind: RowKind,
+) {
+    let favorite = Favorite {
+        message_id: message_id.to_string(),
+        subject: subject.to_string(),
+        date: date.to_string(),
+        list: list_slug.to_string(),
+    };
+    let subscription = Subscription {
+        message_id: message_id.to_string(),
+        subject: subject.to_string(),
+        date: date.to_string(),
+        list: list_slug.to_string(),
+        // The watcher seeds the baseline the moment the subscription is added.
+        seen: Vec::new(),
+    };
+
+    let star = new_star_button(favorites::is_favorite(message_id));
+    star.connect_clicked(glib::clone!(
+        #[weak]
+        row,
+        #[weak]
+        list,
+        #[strong]
+        favorite,
+        move |star| {
+            let favorited = favorites::toggle(favorite.clone());
+            apply_star_state(star, favorited);
+            if !favorited && matches!(kind, RowKind::Favorites) {
+                list.remove(&row);
+            }
+        }
+    ));
+
+    let bell = new_bell_button(subscriptions::is_subscribed(message_id));
+    bell.connect_clicked(glib::clone!(
+        #[weak]
+        row,
+        #[weak]
+        list,
+        #[strong]
+        subscription,
+        move |bell| {
+            let subscribed = subscriptions::toggle(subscription.clone());
+            if subscribed {
+                crate::watcher::seed_new_subscription(subscription.clone());
+            }
+            apply_bell_state(bell, subscribed);
+            if !subscribed && matches!(kind, RowKind::Subscriptions) {
+                list.remove(&row);
+            }
+        }
+    ));
+
+    row.add_suffix(&star);
+    row.add_suffix(&bell);
+}
+
 /// A flat Reply icon button that retargets the composer to `mail`.
 fn build_reply_button(mail: &Mail, composer: &composer::Composer) -> gtk::Button {
     let button = gtk::Button::builder()

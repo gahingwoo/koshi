@@ -1,9 +1,9 @@
 use adw::prelude::*;
 use gtk::glib;
 
+use crate::list_page::build_list_page;
 use crate::subscriptions::{self, Subscription};
-use crate::thread_page::{apply_bell_state, build_thread_page, new_bell_button};
-use crate::{list_page::build_list_page, watcher};
+use crate::thread_page::{RowKind, add_star_and_bell, build_thread_page};
 
 pub const SUBSCRIPTIONS_TITLE: &str = "Subscriptions";
 
@@ -55,8 +55,9 @@ fn build_subscription_list(nav: &adw::NavigationView, subs: Vec<Subscription>) -
 }
 
 /// One subscribed thread: its subject and date, opening the thread when
-/// activated, with a filled bell to unsubscribe. Unsubscribing drops the row on
-/// the spot, so the page always reflects the store.
+/// activated, with a star to favorite it and a filled bell to unsubscribe.
+/// Unsubscribing drops the row on the spot, so the page always reflects the
+/// store.
 fn build_subscription_row(
     nav: &adw::NavigationView,
     list: &gtk::ListBox,
@@ -77,31 +78,17 @@ fn build_subscription_row(
             .css_classes(["numeric", "caption", "dim-label"])
             .build(),
     );
-
-    // A filled bell (every row here is subscribed); clicking it unsubscribes and
-    // removes the row. Re-subscribing from this page is possible if the click
-    // races the store, so keep the icon honest either way.
-    let bell = new_bell_button(true);
-    bell.connect_clicked(glib::clone!(
-        #[weak]
-        row,
-        #[weak]
+    add_star_and_bell(
         list,
-        #[strong]
-        sub,
-        move |bell| {
-            let subscribed = subscriptions::toggle(sub.clone());
-            if subscribed {
-                watcher::seed_new_subscription(sub.clone());
-                apply_bell_state(bell, true);
-            } else {
-                list.remove(&row);
-            }
-        }
-    ));
-    row.add_suffix(&bell);
+        &row,
+        &sub.message_id,
+        &sub.subject,
+        &sub.date,
+        &sub.list,
+        RowKind::Subscriptions,
+    );
 
-    // Activating the row (a click anywhere but the bell) opens the thread.
+    // Activating the row (a click anywhere but the buttons) opens the thread.
     let list_slug = sub.list.clone();
     let message_id = sub.message_id.clone();
     row.connect_activated(glib::clone!(

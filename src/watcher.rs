@@ -8,7 +8,7 @@
 //! a user preference ([`crate::settings::poll_interval_minutes`]); each cycle
 //! re-reads it, so changing it in Preferences takes effect on the next tick.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -172,11 +172,46 @@ async fn poll_one(app: &adw::Application, subscription: Subscription) {
 /// Raise a desktop notification for one new message: the sender's name as the
 /// title, the subject as the body — mirroring how a desktop mail client
 /// announces an arrival.
+///
+/// Sent straight to `org.freedesktop.Notifications` rather than through
+/// `GApplication::send_notification`. Under GNOME the latter routes via
+/// `org.gtk.Notifications`, which only displays a notification for an app GNOME
+/// Shell has indexed from an *installed* `.desktop` file — so an uninstalled
+/// build (`cargo run`), or one whose desktop file was added to an already
+/// running session, has every notification silently dropped with an `InvalidApp`
+/// error. The freedesktop service imposes no such requirement, so the banner
+/// shows however Koshi was launched.
 fn notify_new_message(app: &adw::Application, author: &str, subject: &str) {
-    let notification = gio::Notification::new(author);
-    notification.set_body(Some(subject));
-    // A category hint lets the shell file it as e-mail; harmless where ignored.
-    notification.set_category(Some("email.arrived"));
-    // No id: distinct arrivals should stack rather than replace one another.
-    app.send_notification(None, &notification);
+    let Some(connection) = app.dbus_connection() else {
+        eprintln!("koshi: no session bus; cannot notify about \"{subject}\"");
+        return;
+    };
+    // org.freedesktop.Notifications.Notify — signature `susssasa{sv}i`.
+    let params = (
+        "Koshi",                                 // app_name
+        0u32,                                    // replaces_id: never coalesce
+        "mail-unread",                           // app_icon: themed, always resolves
+        author,                                  // summary (notification title)
+        subject,                                 // body
+        &[] as &[&str],                          // actions: none
+        HashMap::<String, glib::Variant>::new(), // hints: none
+        -1i32,                                   // expire_timeout: server default
+    )
+        .to_variant();
+    connection.call(
+        Some("org.freedesktop.Notifications"),
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
+        "Notify",
+        Some(&params),
+        Some(glib::VariantTy::new("(u)").expect("valid reply signature")),
+        gio::DBusCallFlags::NONE,
+        -1,
+        gio::Cancellable::NONE,
+        |result| {
+            if let Err(err) = result {
+                eprintln!("koshi: notification failed: {err}");
+            }
+        },
+    );
 }

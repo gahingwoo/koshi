@@ -6,7 +6,9 @@
 //! account. Parsing is split from the `git` invocation so it can be tested
 //! against fixed input.
 
+use std::cell::RefCell;
 use std::process::Command;
+use std::rc::Rc;
 
 /// One `key = value` pair from a `[sendemail]` section, carrying the
 /// canonical camelCase spelling of the key for display.
@@ -89,6 +91,57 @@ impl Profile {
         get("smtpServer").or_else(|| get("sendmailCmd"))
     }
 
+    /// The `From:` header value Koshi writes into the message *and* passes to
+    /// `git send-email` as `--from`, so the two always agree — a mismatch makes
+    /// git rewrite the header and inject the original `From:` into the body.
+    /// Prefers the effective `sendemail.from`, then `Name <email>`, then the
+    /// bare email. `None` when git has no address to send as.
+    pub fn sender_header(&self) -> Option<String> {
+        if let Some(from) = self.effective_sendemail().iter().find(|s| s.key == "from") {
+            let from = from.value.trim();
+            if !from.is_empty() {
+                return Some(from.to_string());
+            }
+        }
+        let email = self.user_email.as_deref()?.trim();
+        if email.is_empty() {
+            return None;
+        }
+        match self
+            .user_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => Some(format!("{name} <{email}>")),
+            None => Some(email.to_string()),
+        }
+    }
+
+    /// The `(host, username)` a send-email SMTP password is stored under — when
+    /// the transport is SMTP with a username, so there is a credential to
+    /// forget. `None` for a sendmail transport or when no user is configured.
+    pub fn smtp_credential(&self) -> Option<(String, String)> {
+        let settings = self.effective_sendemail();
+        let get = |key: &str| {
+            settings
+                .iter()
+                .find(|s| s.key == key)
+                .map(|s| s.value.clone())
+        };
+        // A sendmail command bypasses SMTP auth entirely.
+        if get("sendmailCmd").is_some() {
+            return None;
+        }
+        let server = get("smtpServer")?;
+        let user = get("smtpUser")?;
+        let host = match get("smtpServerPort") {
+            Some(port) => format!("{server}:{port}"),
+            None => server,
+        };
+        Some((host, user))
+    }
+
     /// The out-of-the-box reply signature for someone who has never set one in
     /// Preferences: the standard `-- ` separator line followed by the git
     /// `user.name`, so a fresh install already signs replies. Empty when git
@@ -101,28 +154,100 @@ impl Profile {
     }
 }
 
-/// Read the merged git configuration (system + global + local) and build a
-/// [`Profile`]. Returns an empty profile when git is missing or has nothing
-/// configured, so callers never have to distinguish the two.
+thread_local! {
+    /// The profile is read from `git config` — a subprocess — so cache it and
+    /// hand out cheap clones. Replies build a fresh composer often; each one
+    /// would otherwise spawn git.
+    static CACHE: RefCell<Option<Rc<Profile>>> = const { RefCell::new(None) };
+}
+
+/// The git profile, loaded once and cached for the process lifetime. Call
+/// [`invalidate`] after changing git config so the next read reflects it.
+pub fn cached() -> Rc<Profile> {
+    CACHE.with(|cache| {
+        if let Some(profile) = cache.borrow().as_ref() {
+            return profile.clone();
+        }
+        let profile = Rc::new(load());
+        *cache.borrow_mut() = Some(profile.clone());
+        profile
+    })
+}
+
+/// Drop the cached profile so the next [`cached`] call re-reads git config.
+pub fn invalidate() {
+    CACHE.with(|cache| *cache.borrow_mut() = None);
+}
+
+/// Read the merged system + global git configuration and build a [`Profile`].
+/// Repository-scoped config (`local`/`worktree`) is deliberately dropped so a
+/// project Koshi happens to be launched inside cannot redirect the user's mail.
+/// Returns an empty profile when git is missing or has nothing configured, so
+/// callers never have to distinguish the two.
 pub fn load() -> Profile {
     let output = Command::new("git")
-        .args(["config", "--list", "-z"])
+        .args(["config", "--list", "-z", "--show-scope"])
         .output();
     match output {
-        Ok(out) if out.status.success() => parse(&String::from_utf8_lossy(&out.stdout)),
+        Ok(out) if out.status.success() => {
+            parse(&strip_local_scope(&String::from_utf8_lossy(&out.stdout)))
+        }
         _ => Profile::default(),
     }
+}
+
+/// Reduce `git config --list -z --show-scope` output — a NUL-separated stream
+/// alternating `scope`, `key\nvalue` — to the plain `-z` form [`parse`] expects,
+/// keeping only system- and global-scope entries.
+fn strip_local_scope(raw: &str) -> String {
+    let mut fields = raw.split('\0');
+    let mut out = String::new();
+    while let Some(scope) = fields.next() {
+        let Some(entry) = fields.next() else {
+            break;
+        };
+        if scope.is_empty() || scope == "local" || scope == "worktree" {
+            continue;
+        }
+        out.push_str(entry);
+        out.push('\0');
+    }
+    out
 }
 
 /// Point `sendemail.identity` at `name` in the user's global config, so
 /// `git send-email` (and Koshi's own view) uses that identity. Returns
 /// whether the write succeeded.
 pub fn set_active_identity(name: &str) -> bool {
-    Command::new("git")
+    let ok = Command::new("git")
         .args(["config", "--global", "sendemail.identity", name])
         .status()
         .map(|status| status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    invalidate();
+    ok
+}
+
+/// Evict a stored send-email SMTP password from git's credential helpers, so
+/// the next send prompts for it again. Best-effort: a send with no helper
+/// simply has nothing to evict.
+pub fn reject_smtp_credential(host: &str, username: &str) {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let Ok(mut child) = Command::new("git")
+        .args(["credential", "reject"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = write!(stdin, "protocol=smtp\nhost={host}\nusername={username}\n\n");
+    }
+    let _ = child.wait();
 }
 
 /// Parse the null-terminated output of `git config --list -z`. Each record is
@@ -206,14 +331,20 @@ fn displayable(var: &str, value: String) -> Option<Setting> {
 fn derive_email(settings: &[Setting]) -> Option<String> {
     let get = |key: &str| settings.iter().find(|s| s.key == key).map(|s| &s.value);
     if let Some(from) = get("from") {
-        if let (Some(start), Some(end)) = (from.find('<'), from.rfind('>'))
-            && start < end
-        {
-            return Some(from[start + 1..end].trim().to_string());
-        }
-        return Some(from.clone());
+        return Some(extract_address(from));
     }
     get("smtpUser").cloned()
+}
+
+/// The bare address from a `Name <addr>` header value, or the trimmed whole
+/// string when it carries no angle brackets.
+fn extract_address(from: &str) -> String {
+    if let (Some(start), Some(end)) = (from.find('<'), from.rfind('>'))
+        && start < end
+    {
+        return from[start + 1..end].trim().to_string();
+    }
+    from.trim().to_string()
 }
 
 /// Order settings by a curated display sequence (server details first, then
@@ -300,6 +431,15 @@ mod tests {
     /// `(key, value)` pairs.
     fn config_z(pairs: &[(&str, &str)]) -> String {
         pairs.iter().map(|(k, v)| format!("{k}\n{v}\0")).collect()
+    }
+
+    /// Build the `git config --list -z --show-scope` form: each entry is a
+    /// `scope` field then a `key\nvalue` field, both NUL-terminated.
+    fn scope_z(entries: &[(&str, &str, &str)]) -> String {
+        entries
+            .iter()
+            .map(|(scope, k, v)| format!("{scope}\0{k}\n{v}\0"))
+            .collect()
     }
 
     #[test]
@@ -415,6 +555,61 @@ mod tests {
                 .iter()
                 .all(|s| s.key != "smtpPass" && s.value != "hunter2"),
             "the SMTP password must not appear in the profile"
+        );
+    }
+
+    #[test]
+    fn sender_header_prefers_sendemail_from_then_name_and_email() {
+        // The effective `sendemail.from` wins, so `--from` and the message's
+        // `From:` will match what git sends as.
+        let from = parse(&config_z(&[
+            ("user.name", "Nika Krasnova"),
+            ("user.email", "nika@nikableh.moe"),
+            ("sendemail.from", "Nika K <nika@work.example>"),
+        ]));
+        assert_eq!(
+            from.sender_header().as_deref(),
+            Some("Nika K <nika@work.example>")
+        );
+
+        // No `sendemail.from`: fall back to the git identity.
+        let ident = parse(&config_z(&[
+            ("user.name", "Nika Krasnova"),
+            ("user.email", "nika@nikableh.moe"),
+        ]));
+        assert_eq!(
+            ident.sender_header().as_deref(),
+            Some("Nika Krasnova <nika@nikableh.moe>")
+        );
+
+        // No name: the bare email stands alone.
+        let bare = parse(&config_z(&[("user.email", "nika@nikableh.moe")]));
+        assert_eq!(bare.sender_header().as_deref(), Some("nika@nikableh.moe"));
+
+        // Nothing to send as.
+        assert_eq!(Profile::default().sender_header(), None);
+    }
+
+    #[test]
+    fn strip_local_scope_drops_repository_config() {
+        let raw = scope_z(&[
+            ("global", "user.email", "nika@nikableh.moe"),
+            ("local", "sendemail.to", "attacker@evil.example"),
+            ("worktree", "sendemail.cc", "attacker@evil.example"),
+            ("global", "sendemail.smtpserver", "smtp.purelymail.com"),
+        ]);
+        let profile = parse(&strip_local_scope(&raw));
+        assert_eq!(profile.user_email.as_deref(), Some("nika@nikableh.moe"));
+        // The local/worktree recipients git would have added are gone.
+        assert!(
+            profile
+                .sendemail
+                .iter()
+                .all(|s| s.key != "to" && s.key != "cc")
+        );
+        assert_eq!(
+            profile.effective_transport().as_deref(),
+            Some("smtp.purelymail.com")
         );
     }
 

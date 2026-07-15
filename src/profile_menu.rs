@@ -14,6 +14,7 @@
 use adw::prelude::*;
 use gtk::glib;
 
+use crate::askpass;
 use crate::profile::{self, Profile, Setting};
 
 /// `[sendemail]` keys shown under "Server" in the details dialog.
@@ -337,16 +338,60 @@ fn build_sending_dialog(profile: &Profile) -> adw::Dialog {
         page.add(&group);
     }
 
+    let overlay = adw::ToastOverlay::new();
+
+    // When a password could be cached (SMTP transport with a user), offer to
+    // forget it — the escape hatch for a password git approved but that did not
+    // actually authenticate.
+    if let Some((host, username)) = profile.smtp_credential() {
+        page.add(&build_forget_password_group(host, username, &overlay));
+    }
+
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
     toolbar.set_content(Some(&page));
+    overlay.set_child(Some(&toolbar));
 
     adw::Dialog::builder()
         .title("Send Email")
         .content_width(460)
         .content_height(620)
-        .child(&toolbar)
+        .child(&overlay)
         .build()
+}
+
+/// A group with one destructive action: forget the SMTP password kept for this
+/// session and evict it from git's credential helpers, so the next send prompts
+/// for it again.
+fn build_forget_password_group(
+    host: String,
+    username: String,
+    overlay: &adw::ToastOverlay,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Password")
+        .description(
+            "Koshi never stores your SMTP password — it is kept only for this session, and \
+             by git's own credential helper if you configured one.",
+        )
+        .build();
+
+    let row = adw::ButtonRow::builder()
+        .title("Forget SMTP Password")
+        .build();
+    row.add_css_class("destructive-action");
+    row.connect_activated(glib::clone!(
+        #[weak]
+        overlay,
+        move |_| {
+            askpass::forget_all();
+            profile::reject_smtp_credential(&host, &username);
+            overlay.add_toast(adw::Toast::new("SMTP password forgotten"));
+        }
+    ));
+    group.add(&row);
+
+    group
 }
 
 /// A read-only key/value row: the git key as a de-emphasized title, the value

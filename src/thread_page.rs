@@ -1210,14 +1210,20 @@ fn build_thread_content(
             list: list.to_string(),
         })
     };
-    let opened_fav = favorite_of(&thread[opened]);
+    // Precomputed for every message so single view can show any of them — an
+    // overview click swaps which — with the star, Reply and highlight following.
+    let favs: Rc<Vec<Option<Favorite>>> =
+        Rc::new(thread.iter().map(|mail| favorite_of(mail)).collect());
+    let replies: Rc<Vec<composer::ReplyContext>> =
+        Rc::new(thread.iter().map(|mail| build_reply_context(mail)).collect());
     let op_fav = favorite_of(op);
-    let opened_reply = build_reply_context(&thread[opened]);
     let op_reply = build_reply_context(op);
+    // The message single view currently shows; the star, Reply and overview
+    // highlight all track it. Single view is the default and opens on `opened`.
+    let single_shown = Rc::new(Cell::new(opened));
 
-    // Single view is the default, so both start on the opened message.
-    let star_target = Rc::new(RefCell::new(opened_fav.clone()));
-    let reply_target = Rc::new(RefCell::new(opened_reply.clone()));
+    let star_target = Rc::new(RefCell::new(favs[opened].clone()));
+    let reply_target = Rc::new(RefCell::new(replies[opened].clone()));
 
     let star_button = new_star_button(false);
     let refresh_star: Rc<dyn Fn()> = Rc::new(glib::clone!(
@@ -1298,27 +1304,28 @@ fn build_thread_content(
         #[strong]
         reply_target,
         #[strong]
-        opened_fav,
+        favs,
         #[strong]
         op_fav,
         #[strong]
-        opened_reply,
+        replies,
         #[strong]
         op_reply,
         #[strong]
+        single_shown,
+        #[strong]
         refresh_star,
         move |toggle| {
-            let single = toggle.active() == 0;
-            *star_target.borrow_mut() = if single {
-                opened_fav.clone()
+            // Threaded view focuses the thread's first message; single view
+            // focuses whichever message it is currently showing.
+            if toggle.active() == 0 {
+                let index = single_shown.get();
+                *star_target.borrow_mut() = favs[index].clone();
+                *reply_target.borrow_mut() = replies[index].clone();
             } else {
-                op_fav.clone()
-            };
-            *reply_target.borrow_mut() = if single {
-                opened_reply.clone()
-            } else {
-                op_reply.clone()
-            };
+                *star_target.borrow_mut() = op_fav.clone();
+                *reply_target.borrow_mut() = op_reply.clone();
+            }
             refresh_star();
         }
     ));
@@ -1415,6 +1422,38 @@ fn build_thread_content(
     }
     let single_model = gio::ListStore::new::<MessageObject>();
     single_model.append(&objects[opened]);
+    let objects = Rc::new(objects);
+
+    // Show one message in single view, moving the star, Reply and overview
+    // highlight onto it. The overview calls this when a row is picked while in
+    // single view, so picking a message there keeps the single view — it swaps
+    // which message is shown instead of jumping the threaded list.
+    let show_single: Rc<dyn Fn(usize)> = Rc::new(glib::clone!(
+        #[strong]
+        single_model,
+        #[strong]
+        objects,
+        #[strong]
+        single_shown,
+        #[strong]
+        star_target,
+        #[strong]
+        reply_target,
+        #[strong]
+        favs,
+        #[strong]
+        replies,
+        #[strong]
+        refresh_star,
+        move |index: usize| {
+            single_shown.set(index);
+            single_model.remove_all();
+            single_model.append(&objects[index]);
+            *star_target.borrow_mut() = favs[index].clone();
+            *reply_target.borrow_mut() = replies[index].clone();
+            refresh_star();
+        }
+    ));
 
     // Opening a message shows that message alone (single view); the toggle
     // switches to the whole thread. The model swap is all it takes — the
@@ -1491,7 +1530,8 @@ fn build_thread_content(
         &list_view,
         &view_toggle,
         &scrolled,
-        opened,
+        single_shown.clone(),
+        show_single.clone(),
     )));
 
     // Background warmup. GtkListView keeps every row of a <=205-item model
@@ -2399,14 +2439,17 @@ fn build_thread_search(
 
 /// The overview sidebar: a heading over one activatable row per message,
 /// laid out as a collapsible reply tree indented by depth. Activating a row
-/// jumps the message list to that message; the disclosure button on a row
-/// with replies hides or shows its subtree.
+/// navigates to that message without changing the view mode — in threaded view
+/// it jumps the list, in single view it swaps the shown message via
+/// `show_single`. The disclosure button on a row with replies hides or shows
+/// its subtree.
 fn build_overview_sidebar(
     thread: &[Rc<Mail>],
     list_view: &gtk::ListView,
     view_toggle: &adw::ToggleGroup,
     scrolled: &gtk::ScrolledWindow,
-    opened: usize,
+    single_shown: Rc<Cell<usize>>,
+    show_single: Rc<dyn Fn(usize)>,
 ) -> gtk::Widget {
     // Single selection is the highlight: the row of the message on screen is
     // selected, so the "navigation-sidebar" style marks it. Selecting a row
@@ -2557,14 +2600,14 @@ fn build_overview_sidebar(
         row_of_message[message] = row_pos as i32;
     }
 
-    // What the highlight marks depends on the view. Single view shows only the
-    // opened message, so that message is always what is on screen — its row
-    // stays highlighted there no matter how far the reader scrolls within it.
-    // Threaded view shows the whole thread, so the highlight is a navigation
-    // marker: it sits on the message an overview row jumped to and holds only
-    // until the reader scrolls the thread away from it (or switches view by
-    // hand), since past that the marked row no longer reflects what is on
-    // screen. `current` is that threaded-view marker; single view ignores it.
+    // What the highlight marks depends on the view. Single view shows one
+    // message at a time (`single_shown`), so that message is always what is on
+    // screen — its row stays highlighted no matter how far the reader scrolls
+    // within it. Threaded view shows the whole thread, so the highlight is a
+    // navigation marker: it sits on the message an overview row jumped to and
+    // holds only until the reader scrolls the thread away from it (or switches
+    // view by hand), since past that the marked row no longer reflects what is
+    // on screen. `current` is that threaded-view marker; single view ignores it.
     let current: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     // Suppresses the clear-on-scroll while a jump (and the view switch it rides
     // on) is still settling — both move the vadjustment on their own.
@@ -2585,12 +2628,14 @@ fn build_overview_sidebar(
         #[strong]
         current,
         #[strong]
+        single_shown,
+        #[strong]
         row_of_message,
         move || {
-            // Single view (toggle index 0) always highlights the opened
-            // message; threaded view follows the navigation marker.
+            // Single view (toggle index 0) always highlights the message it is
+            // showing; threaded view follows the navigation marker.
             let target = if view_toggle.active() == 0 {
-                Some(opened)
+                Some(single_shown.get())
             } else {
                 current.get()
             };
@@ -2623,67 +2668,74 @@ fn build_overview_sidebar(
         anchor,
         #[strong]
         apply_highlight,
+        #[strong]
+        show_single,
         move |_, row| {
             let Some(&index) = message_of_row.get(row.index() as usize) else {
                 return;
             };
-            // Mark the picked message and raise the settling flag before moving
-            // the view, so the view switch and jump below — which both nudge the
-            // scroll — are not mistaken for the reader scrolling away.
-            current.set(Some(index));
-            settling.set(true);
-            // The overview lists the whole thread, so a jump only lands
-            // somewhere in the single view when it happens to be showing that
-            // one message. Switch to the threaded view first (a no-op when
-            // already there); its model holds every message in thread order,
-            // so the message index is the row's list position.
-            view_toggle.set_active(1);
-            jump_to_message(&list_view, index as u32, &scroll_generation);
-            apply_highlight();
-
-            // Hold the marker on across the jump's settling frames, then anchor
-            // it at the scroll position the jump came to rest on and re-arm the
-            // clear-on-scroll. Gated by the jump generation so a newer click
-            // takes over; the frame budget matches jump_to_message's.
-            let generation = scroll_generation.clone();
-            let this_jump = generation.get();
-            let apply_highlight = apply_highlight.clone();
-            let settling = settling.clone();
-            let anchor = anchor.clone();
-            let last = Cell::new(f64::NAN);
-            let steady = Cell::new(0u32);
-            let frames = Cell::new(0u32);
-            list_view.add_tick_callback(move |list_view, _| {
-                if generation.get() != this_jump {
-                    // A newer jump owns the marker and runs its own settling.
-                    return glib::ControlFlow::Break;
-                }
+            // Picking a message never changes the view mode. Single view shows
+            // one message at a time, so swap which one it shows; threaded view
+            // shows the whole thread, so jump to the message's row.
+            if view_toggle.active() == 0 {
+                show_single(index);
+                // single_shown now names the picked message, and single view
+                // highlights whatever it shows.
                 apply_highlight();
-                let value = list_view
-                    .ancestor(gtk::ScrolledWindow::static_type())
-                    .and_downcast::<gtk::ScrolledWindow>()
-                    .map_or(0.0, |scrolled| scrolled.vadjustment().value());
-                frames.set(frames.get() + 1);
-                if (value - last.get()).abs() < 0.5 {
-                    steady.set(steady.get() + 1);
-                } else {
-                    steady.set(0);
-                    last.set(value);
-                }
-                // Settle once the scroll holds steady, past an initial gate so
-                // the pre-jump frames aren't taken for a settled position.
-                if (frames.get() >= 4 && steady.get() >= 3) || frames.get() >= 60 {
-                    anchor.set(value);
-                    settling.set(false);
-                    glib::ControlFlow::Break
-                } else {
-                    glib::ControlFlow::Continue
-                }
-            });
+            } else {
+                // Mark the picked message and raise the settling flag before the
+                // jump, so the jump's own scrolling is not mistaken for the
+                // reader scrolling away.
+                current.set(Some(index));
+                settling.set(true);
+                jump_to_message(&list_view, index as u32, &scroll_generation);
+                apply_highlight();
+
+                // Hold the marker on across the jump's settling frames, then
+                // anchor it at the scroll position the jump came to rest on and
+                // re-arm the clear-on-scroll. Gated by the jump generation so a
+                // newer click takes over; the frame budget matches
+                // jump_to_message's.
+                let generation = scroll_generation.clone();
+                let this_jump = generation.get();
+                let apply_highlight = apply_highlight.clone();
+                let settling = settling.clone();
+                let anchor = anchor.clone();
+                let last = Cell::new(f64::NAN);
+                let steady = Cell::new(0u32);
+                let frames = Cell::new(0u32);
+                list_view.add_tick_callback(move |list_view, _| {
+                    if generation.get() != this_jump {
+                        // A newer jump owns the marker and runs its own settling.
+                        return glib::ControlFlow::Break;
+                    }
+                    apply_highlight();
+                    let value = list_view
+                        .ancestor(gtk::ScrolledWindow::static_type())
+                        .and_downcast::<gtk::ScrolledWindow>()
+                        .map_or(0.0, |scrolled| scrolled.vadjustment().value());
+                    frames.set(frames.get() + 1);
+                    if (value - last.get()).abs() < 0.5 {
+                        steady.set(steady.get() + 1);
+                    } else {
+                        steady.set(0);
+                        last.set(value);
+                    }
+                    // Settle once the scroll holds steady, past an initial gate
+                    // so the pre-jump frames aren't taken for a settled position.
+                    if (frames.get() >= 4 && steady.get() >= 3) || frames.get() >= 60 {
+                        anchor.set(value);
+                        settling.set(false);
+                        glib::ControlFlow::Break
+                    } else {
+                        glib::ControlFlow::Continue
+                    }
+                });
+            }
 
             // The overview has done its job once a message is picked; dismiss
-            // it so the message it jumps to is actually visible — open, it
-            // overlays and dims most of the pane.
+            // it so the message is actually visible — open, it overlays and dims
+            // most of the pane.
             if let Some(split) = row
                 .ancestor(adw::OverlaySplitView::static_type())
                 .and_downcast::<adw::OverlaySplitView>()

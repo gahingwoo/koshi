@@ -13,6 +13,7 @@ use crate::highlight;
 use crate::inbox_page::{apply_star_state, new_star_button};
 use crate::lore;
 use crate::remote_page::RemoteContent;
+use crate::subscriptions::{self, Subscription};
 
 struct Mail {
     subject: String,
@@ -127,12 +128,14 @@ impl MessageRow {
         overlay: &adw::ToastOverlay,
         list: &str,
         fav_hub: &FavoriteHub,
+        sub_hub: &SubscriptionHub,
     ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
         imp.composer.set(composer.clone()).ok();
         imp.list.set(list.to_string()).ok();
         imp.fav_hub.set(fav_hub.clone()).ok();
+        imp.sub_hub.set(sub_hub.clone()).ok();
         // Weak: the overlay is this row's ancestor, and a strong handle here
         // would cycle the whole page tree alive after it is popped.
         imp.overlay.set(Some(overlay));
@@ -253,6 +256,10 @@ impl MessageRow {
             if let Some(overlay) = imp.overlay.upgrade() {
                 let hub = imp.fav_hub.get().expect("MessageRow fav_hub set");
                 for action in build_favorite_actions(&mail, list, &overlay, hub) {
+                    group.add_action(&action);
+                }
+                let sub_hub = imp.sub_hub.get().expect("MessageRow sub_hub set");
+                for action in build_subscribe_actions(&mail, list, &overlay, sub_hub) {
                     group.add_action(&action);
                 }
             }
@@ -388,6 +395,9 @@ mod imp {
         /// The page's favorite hub, so this row's Add/Remove context actions
         /// stay in step with the header star (see FavoriteHub).
         pub(super) fav_hub: OnceCell<super::FavoriteHub>,
+        /// The page's subscription hub, so this row's Subscribe/Unsubscribe
+        /// context actions stay in step with the header bell.
+        pub(super) sub_hub: OnceCell<super::SubscriptionHub>,
         /// The page's toast overlay, for the header card's address pills.
         /// Weak — it is an ancestor of this row.
         pub(super) overlay: glib::WeakRef<adw::ToastOverlay>,
@@ -573,10 +583,13 @@ fn build_body_menu() -> gio::Menu {
     mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
     mail_section.append(Some("View _Raw"), Some("mailview.raw"));
 
+    let mark_section = build_favorite_section();
+    append_subscribe_items(&mark_section);
+
     let menu = gio::Menu::new();
     menu.append_section(None, &quote_section);
     menu.append_section(None, &edit_section);
-    menu.append_section(None, &build_favorite_section());
+    menu.append_section(None, &mark_section);
     menu.append_section(None, &mail_section);
     menu
 }
@@ -1227,8 +1240,10 @@ fn build_thread_content(
 
     // Favorites toggled through the header star and through a message's
     // context menu must agree; the hub keeps every view of a Message-ID in
-    // step. It rides the page, so its listeners drop with it.
+    // step. It rides the page, so its listeners drop with it. The subscription
+    // bell has its own hub with the same job.
     let hub = FavoriteHub::default();
+    let sub_hub = SubscriptionHub::default();
 
     // The header star and Reply act on the message in focus: the opened
     // message in single view, the thread's first message in threaded view.
@@ -1241,18 +1256,31 @@ fn build_thread_content(
         })
     };
     // Precomputed for every message so single view can show any of them — an
-    // overview click swaps which — with the star, Reply and highlight following.
+    // overview click swaps which — with the star, bell, Reply and highlight
+    // following.
     let favs: Rc<Vec<Option<Favorite>>> =
         Rc::new(thread.iter().map(|mail| favorite_of(mail)).collect());
+    let subscription_of = |mail: &Mail| {
+        mail.message_id.as_ref().map(|id| Subscription {
+            message_id: id.clone(),
+            subject: mail.subject.clone(),
+            date: mail.date.clone(),
+            list: list.to_string(),
+        })
+    };
+    let subs: Rc<Vec<Option<Subscription>>> =
+        Rc::new(thread.iter().map(|mail| subscription_of(mail)).collect());
     let replies: Rc<Vec<composer::ReplyContext>> =
         Rc::new(thread.iter().map(|mail| build_reply_context(mail)).collect());
     let op_fav = favorite_of(op);
+    let op_sub = subscription_of(op);
     let op_reply = build_reply_context(op);
     // The message single view currently shows; the star, Reply and overview
     // highlight all track it. Single view is the default and opens on `opened`.
     let single_shown = Rc::new(Cell::new(opened));
 
     let star_target = Rc::new(RefCell::new(favs[opened].clone()));
+    let sub_target = Rc::new(RefCell::new(subs[opened].clone()));
     let reply_target = Rc::new(RefCell::new(replies[opened].clone()));
 
     let star_button = new_star_button(false);
@@ -1310,6 +1338,61 @@ fn build_thread_content(
         }
     )));
 
+    let bell_button = new_bell_button(false);
+    let refresh_bell: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        bell_button,
+        #[strong]
+        sub_target,
+        move || match sub_target.borrow().as_ref() {
+            Some(sub) => {
+                bell_button.set_sensitive(true);
+                apply_bell_state(&bell_button, subscriptions::is_subscribed(&sub.message_id));
+            }
+            // No Message-ID to key a subscription by.
+            None => {
+                bell_button.set_sensitive(false);
+                apply_bell_state(&bell_button, false);
+            }
+        }
+    ));
+    refresh_bell();
+    bell_button.connect_clicked(glib::clone!(
+        #[weak]
+        overlay,
+        #[strong]
+        sub_target,
+        #[strong]
+        sub_hub,
+        move |_| {
+            let Some(sub) = sub_target.borrow().clone() else {
+                return;
+            };
+            let added = !subscriptions::is_subscribed(&sub.message_id);
+            sub_hub.toggle(sub);
+            overlay.add_toast(adw::Toast::new(if added {
+                "Subscribed to thread"
+            } else {
+                "Unsubscribed from thread"
+            }));
+        }
+    ));
+    sub_hub.subscribe(Rc::new(glib::clone!(
+        #[strong]
+        sub_target,
+        #[strong]
+        refresh_bell,
+        move |changed: &str| {
+            if sub_target
+                .borrow()
+                .as_ref()
+                .is_some_and(|sub| sub.message_id == changed)
+            {
+                refresh_bell();
+            }
+        }
+    )));
+
     let reply_button = gtk::Button::builder()
         .icon_name("mail-reply-sender-symbolic")
         .tooltip_text("Reply")
@@ -1327,10 +1410,12 @@ fn build_thread_content(
     // Switches the message pane between the single opened message and the
     // whole thread; wired to swap the ListView's model once both are built.
     let view_toggle = build_view_toggle();
-    // Move the star and Reply onto the right message when the view flips.
+    // Move the star, bell and Reply onto the right message when the view flips.
     view_toggle.connect_active_notify(glib::clone!(
         #[strong]
         star_target,
+        #[strong]
+        sub_target,
         #[strong]
         reply_target,
         #[strong]
@@ -1340,23 +1425,32 @@ fn build_thread_content(
         #[strong]
         replies,
         #[strong]
+        subs,
+        #[strong]
+        op_sub,
+        #[strong]
         op_reply,
         #[strong]
         single_shown,
         #[strong]
         refresh_star,
+        #[strong]
+        refresh_bell,
         move |toggle| {
             // Threaded view focuses the thread's first message; single view
             // focuses whichever message it is currently showing.
             if toggle.active() == 0 {
                 let index = single_shown.get();
                 *star_target.borrow_mut() = favs[index].clone();
+                *sub_target.borrow_mut() = subs[index].clone();
                 *reply_target.borrow_mut() = replies[index].clone();
             } else {
                 *star_target.borrow_mut() = op_fav.clone();
+                *sub_target.borrow_mut() = op_sub.clone();
                 *reply_target.borrow_mut() = op_reply.clone();
             }
             refresh_star();
+            refresh_bell();
         }
     ));
 
@@ -1374,6 +1468,7 @@ fn build_thread_content(
     title_row.append(&gtk::Box::builder().hexpand(true).build());
     title_row.append(&reply_button);
     title_row.append(&star_button);
+    title_row.append(&bell_button);
     title_row.append(&view_toggle);
     // Match the bodies' reading width so the row lines up with them.
     let title_clamp = adw::Clamp::builder()
@@ -1399,6 +1494,8 @@ fn build_thread_content(
         list,
         #[strong]
         hub,
+        #[strong]
+        sub_hub,
         move |_, item| {
             let item = item
                 .downcast_ref::<gtk::ListItem>()
@@ -1412,7 +1509,7 @@ fn build_thread_content(
             item.set_activatable(false);
             item.set_selectable(false);
             item.set_focusable(false);
-            let row = MessageRow::new(&composer, &overlay, &list, &hub);
+            let row = MessageRow::new(&composer, &overlay, &list, &hub, &sub_hub);
             item.set_child(Some(&row));
         }
     ));
@@ -1468,20 +1565,28 @@ fn build_thread_content(
         #[strong]
         star_target,
         #[strong]
+        sub_target,
+        #[strong]
         reply_target,
         #[strong]
         favs,
         #[strong]
+        subs,
+        #[strong]
         replies,
         #[strong]
         refresh_star,
+        #[strong]
+        refresh_bell,
         move |index: usize| {
             single_shown.set(index);
             single_model.remove_all();
             single_model.append(&objects[index]);
             *star_target.borrow_mut() = favs[index].clone();
+            *sub_target.borrow_mut() = subs[index].clone();
             *reply_target.borrow_mut() = replies[index].clone();
             refresh_star();
+            refresh_bell();
         }
     ));
 
@@ -2882,8 +2987,11 @@ fn build_header_extra_menu() -> gio::Menu {
     mail_section.append(Some("Open on _Web"), Some("mailview.open-web"));
     mail_section.append(Some("View _Raw"), Some("mailview.raw"));
 
+    let mark_section = build_favorite_section();
+    append_subscribe_items(&mark_section);
+
     let menu = gio::Menu::new();
-    menu.append_section(None, &build_favorite_section());
+    menu.append_section(None, &mark_section);
     menu.append_section(None, &mail_section);
     menu
 }
@@ -3068,6 +3176,132 @@ fn build_favorite_section() -> gio::Menu {
     section
 }
 
+/// A page-scoped hub mirroring FavoriteHub for subscriptions: it keeps the
+/// header bell button and each message's context-menu Subscribe/Unsubscribe
+/// actions in agreement. Toggling through any of them mutates the store and
+/// then notifies the hub, so the others re-read the new state. It rides the
+/// page and drops with it.
+type SubscriptionListener = Rc<dyn Fn(&str)>;
+
+#[derive(Clone, Default)]
+struct SubscriptionHub {
+    listeners: Rc<RefCell<Vec<SubscriptionListener>>>,
+}
+
+impl SubscriptionHub {
+    fn subscribe(&self, listener: SubscriptionListener) {
+        self.listeners.borrow_mut().push(listener);
+    }
+
+    /// Flip `sub` in the store and tell every view of that Message-ID.
+    fn toggle(&self, sub: Subscription) {
+        let id = sub.message_id.clone();
+        subscriptions::toggle(sub);
+        self.notify(&id);
+    }
+
+    fn notify(&self, message_id: &str) {
+        let listeners = self.listeners.borrow().clone();
+        for listener in listeners {
+            listener(message_id);
+        }
+    }
+}
+
+/// The "mailview" subscription actions for one message: Subscribe and
+/// Unsubscribe as a pair, exactly one enabled at a time (their menu items hide
+/// via hidden-when, so together they read as a single toggling entry). Both
+/// stay disabled when the mail has no Message-ID to key the subscription by.
+fn build_subscribe_actions(
+    mail: &Mail,
+    list: &str,
+    overlay: &adw::ToastOverlay,
+    hub: &SubscriptionHub,
+) -> [gio::SimpleAction; 2] {
+    let sub = mail.message_id.as_ref().map(|id| Subscription {
+        message_id: id.clone(),
+        subject: mail.subject.clone(),
+        date: mail.date.clone(),
+        list: list.to_string(),
+    });
+
+    let add = gio::SimpleAction::new("subscribe-add", None);
+    let remove = gio::SimpleAction::new("subscribe-remove", None);
+
+    let refresh: Rc<dyn Fn()> = Rc::new(glib::clone!(
+        #[weak]
+        add,
+        #[weak]
+        remove,
+        #[strong]
+        sub,
+        move || {
+            let subscribed = sub
+                .as_ref()
+                .is_some_and(|sub| subscriptions::is_subscribed(&sub.message_id));
+            add.set_enabled(sub.is_some() && !subscribed);
+            remove.set_enabled(sub.is_some() && subscribed);
+        }
+    ));
+    refresh();
+    if let Some(sub) = &sub {
+        let id = sub.message_id.clone();
+        hub.subscribe(Rc::new(glib::clone!(
+            #[strong]
+            refresh,
+            move |changed: &str| {
+                if changed == id {
+                    refresh();
+                }
+            }
+        )));
+    }
+
+    let activate = |target: bool| {
+        glib::clone!(
+            #[weak]
+            overlay,
+            #[strong]
+            sub,
+            #[strong]
+            hub,
+            move |_: &gio::SimpleAction, _: Option<&glib::Variant>| {
+                let Some(sub) = &sub else { return };
+                if subscriptions::is_subscribed(&sub.message_id) != target {
+                    hub.toggle(sub.clone());
+                } else {
+                    hub.notify(&sub.message_id);
+                }
+                overlay.add_toast(adw::Toast::new(if target {
+                    "Subscribed to thread"
+                } else {
+                    "Unsubscribed from thread"
+                }));
+            }
+        )
+    };
+    add.connect_activate(activate(true));
+    remove.connect_activate(activate(false));
+
+    [add, remove]
+}
+
+/// Append the Subscribe/Unsubscribe pair to `section` — it shares the favorite
+/// section rather than a section of its own, so no separator sits between the
+/// two. hidden-when makes the pair mutually exclusive, so exactly one shows (or
+/// neither, for a mail with no Message-ID).
+fn append_subscribe_items(section: &gio::Menu) {
+    let add = gio::MenuItem::new(Some("_Subscribe to Thread"), Some("mailview.subscribe-add"));
+    add.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+    section.append_item(&add);
+    let remove = gio::MenuItem::new(
+        Some("_Unsubscribe from Thread"),
+        Some("mailview.subscribe-remove"),
+    );
+    remove.set_attribute_value("hidden-when", Some(&"action-disabled".to_variant()));
+    section.append_item(&remove);
+}
+
 /// A segmented switch between the single opened message and the whole thread.
 /// Index 0 is Single (the default), index 1 is Threaded; the caller wires the
 /// active-notify to swap the message model.
@@ -3088,6 +3322,31 @@ fn build_view_toggle() -> adw::ToggleGroup {
     group.add(threaded);
     group.set_active(0);
     group
+}
+
+/// A flat bell toggle button reflecting a message's subscription state,
+/// mirroring the favorites star: an outline bell when not subscribed, a filled
+/// one when subscribed. The caller wires the click and keeps it in step.
+pub(crate) fn new_bell_button(subscribed: bool) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+    apply_bell_state(&button, subscribed);
+    button
+}
+
+pub(crate) fn apply_bell_state(button: &gtk::Button, subscribed: bool) {
+    button.set_icon_name(if subscribed {
+        "bell-symbolic"
+    } else {
+        "bell-outline-symbolic"
+    });
+    button.set_tooltip_text(Some(if subscribed {
+        "Unsubscribe"
+    } else {
+        "Subscribe"
+    }));
 }
 
 /// A flat Reply icon button that retargets the composer to `mail`.

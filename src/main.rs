@@ -9,6 +9,7 @@ mod profile;
 mod profile_menu;
 mod remote_page;
 mod settings;
+mod subscriptions;
 mod thread_list_page;
 mod thread_page;
 mod window_state;
@@ -43,6 +44,7 @@ fn main() -> glib::ExitCode {
     app.connect_startup(|_| {
         let data_dir = glib::user_data_dir().join("koshi");
         favorites::init(data_dir.join("favorites.json"));
+        subscriptions::init(data_dir.join("subscriptions.json"));
         window_state::init(data_dir.join("window-state.json"));
         // Preferences are user configuration, so they live in the config dir
         // ($XDG_CONFIG_HOME), not the data dir used for window state above.

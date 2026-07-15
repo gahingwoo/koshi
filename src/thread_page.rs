@@ -123,7 +123,6 @@ const ROW_CHROME_HEIGHT: i32 = 48;
 
 impl MessageRow {
     fn new(
-        nav: &adw::NavigationView,
         composer: &composer::Composer,
         overlay: &adw::ToastOverlay,
         list: &str,
@@ -131,7 +130,6 @@ impl MessageRow {
     ) -> Self {
         let obj: Self = glib::Object::new();
         let imp = obj.imp();
-        imp.nav.set(nav.clone()).ok();
         imp.composer.set(composer.clone()).ok();
         imp.list.set(list.to_string()).ok();
         imp.fav_hub.set(fav_hub.clone()).ok();
@@ -245,10 +243,9 @@ impl MessageRow {
                 }
             }
 
-            let nav = imp.nav.get().expect("MessageRow nav set");
             let composer = imp.composer.get().expect("MessageRow composer set");
             let list = imp.list.get().expect("MessageRow list set");
-            let group = build_body_action_group(&mail, &view, nav, composer, list);
+            let group = build_body_action_group(&mail, &view, composer, list);
             // Added here rather than in build_body_action_group because they
             // need the toast overlay, which only the row holds (weakly — it
             // may already be gone during page teardown; the items then hide
@@ -384,7 +381,6 @@ mod imp {
         pub view: OnceCell<gtk::TextView>,
         pub popover: OnceCell<gtk::PopoverMenu>,
         pub group: RefCell<Option<gio::SimpleActionGroup>>,
-        pub nav: OnceCell<adw::NavigationView>,
         pub composer: OnceCell<composer::Composer>,
         /// The lore list slug the thread was opened from, keyed into
         /// favorites so they can be fetched again.
@@ -591,7 +587,6 @@ fn build_body_menu() -> gio::Menu {
 fn build_body_action_group(
     mail: &Mail,
     view: &gtk::TextView,
-    nav: &adw::NavigationView,
     composer: &composer::Composer,
     list: &str,
 ) -> gio::SimpleActionGroup {
@@ -653,7 +648,7 @@ fn build_body_action_group(
     group.add_action(&quote_with_date);
     group.add_action(&copy);
     group.add_action(&select_all);
-    for action in build_mail_actions(mail, view.upcast_ref(), nav, composer, list) {
+    for action in build_mail_actions(mail, view.upcast_ref(), composer, list) {
         group.add_action(&action);
     }
     group
@@ -1121,7 +1116,6 @@ fn spawn_thread_load(
                     // content itself lifts it once the visible rows are
                     // filled and painted (see build_thread_content).
                     let content = build_thread_content(
-                        &nav,
                         thread,
                         &list,
                         opened,
@@ -1185,7 +1179,6 @@ fn show_thread_error(
 }
 
 fn build_thread_content(
-    nav: &adw::NavigationView,
     thread: Vec<Mail>,
     list: &str,
     opened: usize,
@@ -1362,8 +1355,6 @@ fn build_thread_content(
     let list = list.to_string();
     factory.connect_setup(glib::clone!(
         #[strong]
-        nav,
-        #[strong]
         composer,
         #[strong]
         overlay,
@@ -1384,7 +1375,7 @@ fn build_thread_content(
             item.set_activatable(false);
             item.set_selectable(false);
             item.set_focusable(false);
-            let row = MessageRow::new(&nav, &composer, &overlay, &list, &hub);
+            let row = MessageRow::new(&composer, &overlay, &list, &hub);
             item.set_child(Some(&row));
         }
     ));
@@ -3145,7 +3136,6 @@ fn build_address_pill(addr: &str, overlay: &adw::ToastOverlay) -> gtk::Button {
 fn build_mail_actions(
     mail: &Mail,
     widget: &gtk::Widget,
-    nav: &adw::NavigationView,
     composer: &composer::Composer,
     list: &str,
 ) -> [gio::SimpleAction; 4] {
@@ -3200,19 +3190,28 @@ fn build_mail_actions(
         }
     ));
 
+    // View Raw opens in a new tab (selected, since it's an explicit "show me
+    // this now"), so the message it was invoked from stays put in its own tab.
     let raw = gio::SimpleAction::new("raw", None);
     let raw_text = mail.raw.clone();
     let subject = mail.subject.clone();
     raw.connect_activate(glib::clone!(
         #[weak]
-        nav,
-        move |_, _| nav.push(&build_raw_page(&raw_text, &subject))
+        widget,
+        move |_, _| {
+            if let Some(tab_view) = widget
+                .ancestor(adw::TabView::static_type())
+                .and_downcast::<adw::TabView>()
+            {
+                crate::open_raw_in_new_tab(&tab_view, &raw_text, &subject);
+            }
+        }
     ));
 
     [reply, open_web, open_new_tab, raw]
 }
 
-fn build_raw_page(raw: &str, subject: &str) -> adw::NavigationPage {
+pub(crate) fn build_raw_page(raw: &str, subject: &str) -> adw::NavigationPage {
     let view = gtk::TextView::builder()
         .editable(false)
         .cursor_visible(false)

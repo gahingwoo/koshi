@@ -484,6 +484,18 @@ pub(crate) fn open_list_in_new_tab(tab_view: &adw::TabView, list: &str, descript
     append_tab(tab_view, &nav, list);
 }
 
+/// Open a message's raw RFC 5322 text in its own new tab — used by a message's
+/// "View Raw" menu item. Unlike the background "Open in New Tab" opens, this is
+/// selected: the user explicitly asked to see the raw text now.
+pub(crate) fn open_raw_in_new_tab(tab_view: &adw::TabView, raw: &str, subject: &str) {
+    let page = thread_page::build_raw_page(raw, subject);
+    let title = page.title();
+    let nav = adw::NavigationView::new();
+    nav.push(&page);
+    let tab_page = append_tab(tab_view, &nav, &title);
+    tab_view.set_selected_page(&tab_page);
+}
+
 /// Append `nav` as a new tab, keeping the tab title bound to the visible page's
 /// title. Does not select it, and leaves the window's go-back/overview state to
 /// the selection handler — a background tab must not clobber it.

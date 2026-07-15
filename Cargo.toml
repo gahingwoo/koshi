@@ -2,6 +2,7 @@
 name = "koshi"
 version = "0.1.0"
 edition = "2024"
+default-run = "koshi"
 description = "Read and reply to kernel mailing lists"
 authors = ["Nika Krasnova <nika@nikableh.moe>"]
 license = "GPL-3.0-or-later"

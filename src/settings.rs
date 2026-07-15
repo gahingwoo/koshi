@@ -25,17 +25,7 @@ pub fn init(path: PathBuf) {
 /// deliberate "no signature" and is returned as `Some("")`, overriding the
 /// default.
 pub fn signature() -> Option<String> {
-    let path = STORE_PATH.with_borrow(|path| path.clone())?;
-    let json = fs::read_to_string(&path).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&json)
-        .inspect_err(|err| {
-            eprintln!("koshi: ignoring malformed {}: {err}", path.display());
-        })
-        .ok()?;
-    value
-        .get("signature")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
+    read_key("signature")?.as_str().map(str::to_owned)
 }
 
 /// The signature to actually insert into a reply: the user's configured one,
@@ -43,48 +33,57 @@ pub fn signature() -> Option<String> {
 /// so a fresh install signs replies with a default the user can then edit or
 /// clear in Preferences.
 pub fn reply_signature() -> String {
-    signature().unwrap_or_else(|| profile::load().default_signature())
+    signature().unwrap_or_else(|| profile::cached().default_signature())
 }
 
 /// Persist `signature` as the reply signature, preserving any other settings
 /// already in the file. An empty string records a deliberate "no signature".
 pub fn set_signature(signature: &str) {
-    let Some(path) = STORE_PATH.with_borrow(|path| path.clone()) else {
-        return;
-    };
-    let mut value = fs::read_to_string(&path)
-        .ok()
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-        .filter(serde_json::Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
-    value["signature"] = serde_json::Value::String(signature.to_owned());
-    if let Err(err) = write_atomically(&path, &value.to_string()) {
-        eprintln!(
-            "koshi: failed to save settings to {}: {err}",
-            path.display()
-        );
-    }
+    write_key("signature", serde_json::Value::String(signature.to_owned()));
 }
 
-/// Whether outgoing replies carry a `User-Agent` header identifying Koshi as
-/// the mail client. Defaults to `true`: Koshi announces itself unless the user
-/// opts out in Preferences.
-pub fn send_user_agent() -> bool {
-    let Some(path) = STORE_PATH.with_borrow(|path| path.clone()) else {
-        return true;
-    };
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-        .as_ref()
-        .and_then(|value| value.get("sendUserAgent"))
-        .and_then(serde_json::Value::as_bool)
+/// Whether to Cc the sender on their own replies, so a copy lands in their own
+/// mailbox. On by default.
+pub fn cc_self() -> bool {
+    read_key("cc_self")
+        .and_then(|value| value.as_bool())
         .unwrap_or(true)
 }
 
-/// Persist whether replies carry a `User-Agent` header, preserving any other
-/// settings already in the file.
+/// Persist the "Cc myself on replies" preference.
+pub fn set_cc_self(enabled: bool) {
+    write_key("cc_self", serde_json::Value::Bool(enabled));
+}
+
+/// Whether outgoing replies carry a `User-Agent` header identifying Koshi as
+/// the mail client. On by default: Koshi announces itself unless the user opts
+/// out in Preferences (and can still delete the prefilled header per message).
+pub fn send_user_agent() -> bool {
+    read_key("send_user_agent")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true)
+}
+
+/// Persist the "identify Koshi in sent mail" preference.
 pub fn set_send_user_agent(enabled: bool) {
+    write_key("send_user_agent", serde_json::Value::Bool(enabled));
+}
+
+/// Read a single settings key, or `None` when the store is unset, absent, or
+/// malformed.
+fn read_key(key: &str) -> Option<serde_json::Value> {
+    let path = STORE_PATH.with_borrow(|path| path.clone())?;
+    let json = fs::read_to_string(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json)
+        .inspect_err(|err| {
+            eprintln!("koshi: ignoring malformed {}: {err}", path.display());
+        })
+        .ok()?;
+    value.get(key).cloned()
+}
+
+/// Merge `key = value` into the store, preserving every other setting.
+fn write_key(key: &str, new: serde_json::Value) {
     let Some(path) = STORE_PATH.with_borrow(|path| path.clone()) else {
         return;
     };
@@ -93,7 +92,7 @@ pub fn set_send_user_agent(enabled: bool) {
         .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
-    value["sendUserAgent"] = serde_json::Value::Bool(enabled);
+    value[key] = new;
     if let Err(err) = write_atomically(&path, &value.to_string()) {
         eprintln!(
             "koshi: failed to save settings to {}: {err}",
@@ -168,30 +167,40 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_defaults_on_without_a_store() {
-        // A fresh install (or a store that never recorded the choice) announces
-        // Koshi.
-        assert!(send_user_agent());
+    fn cc_self_defaults_on_and_survives_a_reload() {
+        // Never set: on by default.
+        assert!(cc_self());
+
+        let store = ScratchStore::new("settings-cc-self");
+        init(store.path());
+        set_cc_self(false);
+        assert!(!cc_self());
+        set_cc_self(true);
+        assert!(cc_self());
     }
 
     #[test]
-    fn user_agent_choice_survives_a_reload() {
-        let store = ScratchStore::new("settings-ua");
+    fn cc_self_and_signature_share_the_store() {
+        // The two preferences must not clobber each other.
+        let store = ScratchStore::new("settings-two-keys");
+        init(store.path());
+        set_signature("-- \nNika");
+        set_cc_self(false);
+        assert_eq!(signature().as_deref(), Some("-- \nNika"));
+        assert!(!cc_self());
+    }
+
+    #[test]
+    fn user_agent_defaults_on_and_survives_a_reload() {
+        // Never set: Koshi announces itself by default.
+        assert!(send_user_agent());
+
+        let store = ScratchStore::new("settings-user-agent");
         init(store.path());
         set_send_user_agent(false);
         assert!(!send_user_agent());
         set_send_user_agent(true);
         assert!(send_user_agent());
-    }
-
-    #[test]
-    fn set_user_agent_preserves_the_signature() {
-        let store = ScratchStore::new("settings-ua-preserve");
-        init(store.path());
-        set_signature("sig");
-        set_send_user_agent(false);
-        assert_eq!(signature().as_deref(), Some("sig"));
-        assert!(!send_user_agent());
     }
 
     #[test]

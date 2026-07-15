@@ -8,6 +8,7 @@
 //! a user preference ([`crate::settings::poll_interval_minutes`]); each cycle
 //! re-reads it, so changing it in Preferences takes effect on the next tick.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use adw::prelude::*;
@@ -187,10 +188,11 @@ fn notify_new_message(app: &adw::Application, author: &str, subject: &str) {
         return;
     };
     // org.freedesktop.Notifications.Notify — signature `susssasa{sv}i`.
+    let icon = notification_icon();
     let params = (
         "Koshi",                                 // app_name
         0u32,                                    // replaces_id: never coalesce
-        "mail-unread",                           // app_icon: themed, always resolves
+        icon.as_str(),                           // app_icon: Koshi's symbolic icon
         author,                                  // summary (notification title)
         subject,                                 // body
         &[] as &[&str],                          // actions: none
@@ -214,4 +216,46 @@ fn notify_new_message(app: &adw::Application, author: &str, subject: &str) {
             }
         },
     );
+}
+
+/// The bundled symbolic app icon, as a gresource path.
+const ICON_RESOURCE: &str =
+    "/moe/nikableh/Koshi/icons/symbolic/apps/moe.nikableh.Koshi-symbolic.svg";
+
+thread_local! {
+    /// Filesystem path to Koshi's notification icon, or `None` before the first
+    /// notification materialises it. See [`notification_icon`].
+    static NOTIFICATION_ICON: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The `app_icon` to hand `org.freedesktop.Notifications`: an absolute path to
+/// Koshi's symbolic icon, written out from the bundled gresource on first use.
+///
+/// The notification daemon is a separate process and can't read Koshi's
+/// in-process resources, so the icon has to exist as a real file; extracting it
+/// works whether or not Koshi is installed with its icon in a system theme. The
+/// `-symbolic.svg` filename is preserved so the shell recolours it for the
+/// current theme (light icon on a dark banner). Extraction is done once per run
+/// and cached; if it fails, the themed `mail-unread` stands in.
+fn notification_icon() -> String {
+    NOTIFICATION_ICON.with_borrow_mut(|cached| {
+        if let Some(path) = cached {
+            return path.clone();
+        }
+        let path = extract_notification_icon().unwrap_or_else(|| "mail-unread".to_string());
+        *cached = Some(path.clone());
+        path
+    })
+}
+
+/// Write the bundled icon to `$XDG_CACHE_HOME/koshi/` and return its path, or
+/// `None` if the resource is missing or the file can't be written.
+fn extract_notification_icon() -> Option<String> {
+    let bytes = gio::resources_lookup_data(ICON_RESOURCE, gio::ResourceLookupFlags::NONE).ok()?;
+    let dir = glib::user_cache_dir().join("koshi");
+    std::fs::create_dir_all(&dir).ok()?;
+    // Keep the -symbolic.svg name so the shell recolours it.
+    let path = dir.join("moe.nikableh.Koshi-symbolic.svg");
+    std::fs::write(&path, bytes.as_ref()).ok()?;
+    path.into_os_string().into_string().ok()
 }

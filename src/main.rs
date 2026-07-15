@@ -514,6 +514,21 @@ pub(crate) fn open_raw_in_new_tab(tab_view: &adw::TabView, raw: &str, subject: &
     tab_view.set_selected_page(&tab_page);
 }
 
+/// Open a standalone composer in a new, selected tab — a blank new message from
+/// the header's compose button, or (with `seed`) a reply lifted out of the
+/// inline composer, carrying its draft. Always a fresh tab, wherever the user
+/// is.
+pub(crate) fn open_composer_in_new_tab(
+    tab_view: &adw::TabView,
+    reply: composer::ReplyContext,
+    seed: Option<String>,
+) {
+    let nav = adw::NavigationView::new();
+    nav.push(&composer::build_composer_page(reply, seed));
+    let tab_page = append_tab(tab_view, &nav, "New Message");
+    tab_view.set_selected_page(&tab_page);
+}
+
 /// Append `nav` as a new tab, keeping the tab title bound to the visible page's
 /// title. Does not select it, and leaves the window's go-back/overview state to
 /// the selection handler — a background tab must not clobber it.
@@ -638,6 +653,18 @@ fn build_header_bar(
         move |_| open_new_tab(&tab_view)
     ));
     header.pack_start(&new_tab_button);
+
+    // Compose a new message in its own tab, from anywhere — always a fresh tab.
+    let compose_button = gtk::Button::builder()
+        .icon_name("koshi-compose-symbolic")
+        .tooltip_text("New Message")
+        .build();
+    compose_button.connect_clicked(glib::clone!(
+        #[weak]
+        tab_view,
+        move |_| open_composer_in_new_tab(&tab_view, composer::ReplyContext::blank(), None)
+    ));
+    header.pack_start(&compose_button);
 
     let favorites_button = gtk::Button::builder()
         .icon_name("starred-symbolic")

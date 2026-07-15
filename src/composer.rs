@@ -31,6 +31,21 @@ pub struct ReplyContext {
     pub references: String,
 }
 
+impl ReplyContext {
+    /// An empty context for composing a brand-new message: no recipients,
+    /// subject or threading headers. The prefill is then just the sender's
+    /// identity and signature.
+    pub fn blank() -> Self {
+        ReplyContext {
+            to: String::new(),
+            cc: String::new(),
+            subject: String::new(),
+            in_reply_to: String::new(),
+            references: String::new(),
+        }
+    }
+}
+
 /// The editing state. The composer is the raw message: a single buffer holds
 /// the prefilled headers, a blank line, and the body, and the user edits all of
 /// it in place. The compact composer and the fullscreen dialog share this one
@@ -278,10 +293,55 @@ fn sender_identity() -> String {
     profile::cached().sender_header().unwrap_or_default()
 }
 
+/// Where a composer lives, and so how it returns to rest after sending or
+/// discarding. The two surfaces share one editor build; only the dismissal
+/// differs.
+#[derive(Clone)]
+enum Surface {
+    /// The sticky bottom-bar composer: reset the draft and collapse the editor.
+    Inline(gtk::ToggleButton),
+    /// A standalone full-page composer: close the tab it lives in.
+    Tab,
+}
+
+impl Surface {
+    /// Return the composer to rest after a completed send or an explicit
+    /// discard. `from` is any widget inside the composer, used by the tab
+    /// surface to find and close its own tab.
+    fn dismiss(&self, state: &ComposerState, from: &impl IsA<gtk::Widget>) {
+        match self {
+            Surface::Inline(toggle) => {
+                state.reset();
+                toggle.set_active(false);
+            }
+            Surface::Tab => close_composer_tab(from),
+        }
+    }
+}
+
+/// Close the tab `widget` sits in: its `NavigationView` is the tab's child, so
+/// the enclosing `TabView` can find and close the page. A no-op if the composer
+/// is not in a tab (it always is here, but the walk-up stays defensive).
+fn close_composer_tab(widget: &impl IsA<gtk::Widget>) {
+    let Some(nav) = widget
+        .ancestor(adw::NavigationView::static_type())
+        .and_downcast::<adw::NavigationView>()
+    else {
+        return;
+    };
+    let Some(tab_view) = widget
+        .ancestor(adw::TabView::static_type())
+        .and_downcast::<adw::TabView>()
+    else {
+        return;
+    };
+    tab_view.close_page(&tab_view.page(&nav));
+}
+
 /// The Send button — the composer's primary action. Validates the message,
 /// confirms the recipients, then hands the raw document to `git send-email`; on
-/// success it toasts and collapses the composer back to its resting state.
-fn build_send_button(state: &ComposerState, expand_toggle: &gtk::ToggleButton) -> gtk::Button {
+/// success it toasts and returns the composer to rest.
+fn build_send_button(state: &ComposerState, surface: &Surface) -> gtk::Button {
     let button = gtk::Button::builder()
         .label("Send")
         .css_classes(["suggested-action"])
@@ -290,8 +350,8 @@ fn build_send_button(state: &ComposerState, expand_toggle: &gtk::ToggleButton) -
     button.connect_clicked(glib::clone!(
         #[strong]
         state,
-        #[weak]
-        expand_toggle,
+        #[strong]
+        surface,
         move |button| {
             let doc = normalize_document(&state.document_text());
             let (headers, _) = message::parse_headers(&doc);
@@ -343,10 +403,10 @@ fn build_send_button(state: &ComposerState, expand_toggle: &gtk::ToggleButton) -
                     state,
                     #[weak]
                     button,
-                    #[weak]
-                    expand_toggle,
+                    #[strong]
+                    surface,
                     move |_, _| {
-                        send_now(&state, &button, &expand_toggle);
+                        send_now(&state, &button, &surface);
                     }
                 ),
             );
@@ -358,9 +418,9 @@ fn build_send_button(state: &ComposerState, expand_toggle: &gtk::ToggleButton) -
 }
 
 /// Spawn the send on the main loop, disabling the button while it runs. On
-/// success: toast, reset the draft, and collapse the composer. On failure:
-/// surface git's diagnostic in a dialog.
-fn send_now(state: &ComposerState, button: &gtk::Button, expand_toggle: &gtk::ToggleButton) {
+/// success: toast, then return the composer to rest (collapse the inline bar,
+/// or close the tab). On failure: surface git's diagnostic in a dialog.
+fn send_now(state: &ComposerState, button: &gtk::Button, surface: &Surface) {
     let doc = normalize_document(&state.document_text());
     let (headers, _) = message::parse_headers(&doc);
     let request = send::Request {
@@ -380,8 +440,8 @@ fn send_now(state: &ComposerState, button: &gtk::Button, expand_toggle: &gtk::To
         state,
         #[weak]
         button,
-        #[weak]
-        expand_toggle,
+        #[strong]
+        surface,
         async move {
             let outcome = send::send(request, &button).await;
             button.set_sensitive(true);
@@ -390,8 +450,7 @@ fn send_now(state: &ComposerState, button: &gtk::Button, expand_toggle: &gtk::To
                     if let Some(overlay) = &overlay {
                         overlay.add_toast(adw::Toast::new("Reply sent"));
                     }
-                    state.reset();
-                    expand_toggle.set_active(false);
+                    surface.dismiss(&state, &button);
                 }
                 Ok(send::Outcome::Failed { code, stderr }) => {
                     present_message(
@@ -582,6 +641,7 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
     // Expansion state lives on a headless toggle so start_reply/insert_quote/
     // Discard can flip it directly; the header bar below binds to it.
     let expand_toggle = gtk::ToggleButton::new();
+    let surface = Surface::Inline(expand_toggle.clone());
 
     let toolbar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -589,11 +649,11 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         .build();
     toolbar.append(&build_insert_button(&state, &root));
     toolbar.append(&build_rewrap_button(&state));
-    toolbar.append(&build_fullscreen_toggle(&state));
+    toolbar.append(&build_open_as_tab_button(&state, &expand_toggle));
     let spacer = gtk::Box::builder().hexpand(true).build();
     toolbar.append(&spacer);
-    toolbar.append(&build_discard_button(&state, &expand_toggle));
-    toolbar.append(&build_send_button(&state, &expand_toggle));
+    toolbar.append(&build_discard_button(&state, &surface));
+    toolbar.append(&build_send_button(&state, &surface));
 
     root.append(&toolbar);
     root.append(&body_editor);
@@ -774,7 +834,10 @@ fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> (gtk::Overlay, 
     (overlay, view)
 }
 
-fn build_insert_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::MenuButton {
+fn build_insert_button(
+    state: &ComposerState,
+    action_scope: &impl IsA<gtk::Widget>,
+) -> gtk::MenuButton {
     let menu = gio::Menu::new();
 
     let trailers = gio::Menu::new();
@@ -850,84 +913,17 @@ fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
     button
 }
 
-fn build_fullscreen_toggle(state: &ComposerState) -> gtk::ToggleButton {
-    let toggle = gtk::ToggleButton::builder()
-        .icon_name("view-fullscreen-symbolic")
-        .tooltip_text("Fullscreen")
-        .css_classes(["flat"])
-        .build();
-
-    let open_dialog: Rc<RefCell<Option<adw::Dialog>>> = Rc::new(RefCell::new(None));
-    toggle.connect_toggled(glib::clone!(
-        #[strong]
-        state,
-        #[strong]
-        open_dialog,
-        move |toggle| {
-            if toggle.is_active() {
-                if open_dialog.borrow().is_some() {
-                    return;
-                }
-                let dialog = build_fullscreen_dialog(&state);
-                dialog.connect_closed(glib::clone!(
-                    #[weak]
-                    toggle,
-                    #[strong]
-                    open_dialog,
-                    move |_| {
-                        open_dialog.replace(None);
-                        toggle.set_active(false);
-                    }
-                ));
-                // Store the dialog before presenting: connect_closed clears the
-                // slot, so storing after present() would re-fill it with an
-                // already-closed dialog if close ever fired synchronously.
-                open_dialog.replace(Some(dialog.clone()));
-                dialog.present(Some(toggle));
-            } else if let Some(dialog) = open_dialog.take() {
-                dialog.close();
-            }
-        }
-    ));
-
-    toggle
-}
-
-/// The focused-editing view: the same document buffer, roomier layout. Closing
-/// it lands back on the sticky bar with every edit intact.
-fn build_fullscreen_dialog(state: &ComposerState) -> adw::Dialog {
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(12)
-        .margin_end(12)
-        .build();
-    content.append(&build_body_editor(&state.document, false).0);
-
-    let clamp = adw::Clamp::builder()
-        .maximum_size(1100)
-        .tightening_threshold(800)
-        .child(&content)
-        .build();
-
-    let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&adw::HeaderBar::new());
-    toolbar_view.set_content(Some(&clamp));
-
-    adw::Dialog::builder()
-        .title("Reply")
-        .content_width(900)
-        .content_height(700)
-        .child(&toolbar_view)
-        .build()
-}
-
-fn build_discard_button(state: &ComposerState, expand_toggle: &gtk::ToggleButton) -> gtk::Button {
+/// The "Open as a Tab" button: lifts the current draft into a full-page
+/// composer in its own tab, then returns the inline composer to rest so the same
+/// reply is not open in two places. The window opens the tab (via the enclosing
+/// `TabView`, found by walking up from the button); the draft continues there.
+fn build_open_as_tab_button(
+    state: &ComposerState,
+    expand_toggle: &gtk::ToggleButton,
+) -> gtk::Button {
     let button = gtk::Button::builder()
-        .icon_name("user-trash-symbolic")
-        .tooltip_text("Discard")
+        .icon_name("view-fullscreen-symbolic")
+        .tooltip_text("Open as a Tab")
         .css_classes(["flat"])
         .build();
 
@@ -937,10 +933,150 @@ fn build_discard_button(state: &ComposerState, expand_toggle: &gtk::ToggleButton
         #[weak]
         expand_toggle,
         move |button| {
-            let dialog = adw::AlertDialog::new(
-                Some("Discard Draft?"),
-                Some("The draft will be reset to the original reply"),
-            );
+            let Some(tab_view) = button
+                .ancestor(adw::TabView::static_type())
+                .and_downcast::<adw::TabView>()
+            else {
+                return;
+            };
+            // Carry the draft exactly as typed into the new tab, keyed to the
+            // same reply so its Discard resets to the same baseline.
+            let reply = state.initial.borrow().clone();
+            let draft = state.document_text();
+            crate::open_composer_in_new_tab(&tab_view, reply, Some(draft));
+            // The draft now lives in the tab; collapse and reset the inline bar.
+            state.reset();
+            expand_toggle.set_active(false);
+        }
+    ));
+
+    button
+}
+
+/// Build the standalone composer as a full-page tab: the composer's tools in a
+/// header bar at the top of the page, the raw-message editor filling the rest.
+/// `seed` carries a draft over from the inline composer (its current text);
+/// without it the page starts from `reply`'s fresh prefill. Sending or
+/// discarding closes the tab.
+pub fn build_composer_page(reply: ReplyContext, seed: Option<String>) -> adw::NavigationPage {
+    let state = ComposerState::new(reply);
+    if let Some(doc) = seed {
+        state.set_document(&doc);
+    }
+
+    let (body_editor, body_view) = build_body_editor(&state.document, false);
+    highlight::attach(&state.document);
+    highlight::refresh(&state.document);
+    state.document.connect_changed(highlight::refresh);
+
+    let surface = Surface::Tab;
+
+    // The composer's tools sit in a flat toolbar, not a second header bar:
+    // koshi's pages carry no header bar of their own, so the window's is the
+    // only one. It mirrors the inline composer's row — composing aids on the
+    // left, the destructive/primary actions on the right (Send at the edge).
+    let toolbar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let insert = build_insert_button(&state, &toolbar);
+    toolbar.append(&insert);
+    toolbar.append(&build_rewrap_button(&state));
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    toolbar.append(&spacer);
+    toolbar.append(&build_discard_button(&state, &surface));
+    toolbar.append(&build_send_button(&state, &surface));
+
+    // Clamp the toolbar to the editor's reading width so its buttons line up
+    // with the message column, like everything else on the page.
+    let toolbar_clamp = adw::Clamp::builder()
+        .maximum_size(1100)
+        .tightening_threshold(800)
+        .child(&toolbar)
+        .build();
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    content.append(&body_editor);
+    let editor_clamp = adw::Clamp::builder()
+        .maximum_size(1100)
+        .tightening_threshold(800)
+        .vexpand(true)
+        .child(&content)
+        .build();
+
+    // The page carries no header bar (nor a ToolbarView top bar): the toolbar
+    // and editor rest on the page background, clamped to the reading width and
+    // with no divider between them, so the window keeps a single top bar and the
+    // debug stripes don't reach here.
+    let root = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    root.append(&toolbar_clamp);
+    root.append(&editor_clamp);
+
+    let page = adw::NavigationPage::builder()
+        .title(page_title(&state))
+        .child(&root)
+        .build();
+
+    // Land the cursor in the editor whenever the tab is shown.
+    body_view.connect_map(|view| {
+        view.grab_focus();
+    });
+
+    page
+}
+
+/// The page/tab title for a standalone composer: the message's Subject, or
+/// "New Message" when it has none (a blank compose).
+fn page_title(state: &ComposerState) -> String {
+    let (headers, _) = message::parse_headers(&state.document_text());
+    let subject = message::header_value(&headers, "Subject")
+        .unwrap_or("")
+        .trim();
+    if subject.is_empty() {
+        "New Message".to_string()
+    } else {
+        subject.to_string()
+    }
+}
+
+fn build_discard_button(state: &ComposerState, surface: &Surface) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .tooltip_text("Discard")
+        .css_classes(["flat"])
+        .build();
+
+    button.connect_clicked(glib::clone!(
+        #[strong]
+        state,
+        #[strong]
+        surface,
+        move |button| {
+            // Discarding resets the inline bar to its baseline; on a tab there is
+            // nothing to reset to, so it closes the tab.
+            let (heading, body) = match surface {
+                Surface::Inline(_) => (
+                    "Discard Draft?",
+                    "The draft will be reset to the original reply",
+                ),
+                Surface::Tab => (
+                    "Discard Message?",
+                    "This message will be discarded and its tab closed.",
+                ),
+            };
+            let dialog = adw::AlertDialog::new(Some(heading), Some(body));
             dialog.add_responses(&[("cancel", "Cancel"), ("discard", "Discard")]);
             dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
             dialog.set_default_response(Some("cancel"));
@@ -950,12 +1086,11 @@ fn build_discard_button(state: &ComposerState, expand_toggle: &gtk::ToggleButton
                 glib::clone!(
                     #[strong]
                     state,
+                    #[strong]
+                    surface,
                     #[weak]
-                    expand_toggle,
-                    move |_, _| {
-                        state.reset();
-                        expand_toggle.set_active(false);
-                    }
+                    button,
+                    move |_, _| surface.dismiss(&state, &button)
                 ),
             );
             dialog.present(Some(button));

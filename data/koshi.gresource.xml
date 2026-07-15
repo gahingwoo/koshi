@@ -3,6 +3,7 @@
   <gresource prefix="/moe/nikableh/Koshi">
     <file preprocess="xml-stripblanks">icons/scalable/actions/bell-outline-symbolic.svg</file>
     <file preprocess="xml-stripblanks">icons/scalable/actions/bell-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">icons/scalable/actions/koshi-compose-symbolic.svg</file>
     <file preprocess="xml-stripblanks">icons/scalable/actions/koshi-rewrap-symbolic.svg</file>
     <file preprocess="xml-stripblanks">icons/scalable/apps/moe.nikableh.Koshi.svg</file>
     <file preprocess="xml-stripblanks">icons/scalable/apps/moe.nikableh.Koshi.Devel.svg</file>

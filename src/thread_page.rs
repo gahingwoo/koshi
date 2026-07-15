@@ -1301,7 +1301,8 @@ fn build_thread_content(
             subject: mail.subject.clone(),
             date: mail.date.clone(),
             list: list.to_string(),
-            // The watcher seeds the baseline on its first poll.
+            // Starts empty; seed_new_subscription fills the baseline the moment
+            // it is added (a scheduled poll re-seeds if that fetch fails).
             seen: Vec::new(),
         })
     };
@@ -3249,10 +3250,14 @@ impl SubscriptionHub {
         self.listeners.borrow_mut().push(listener);
     }
 
-    /// Flip `sub` in the store and tell every view of that Message-ID.
+    /// Flip `sub` in the store and tell every view of that Message-ID. On a
+    /// fresh subscribe, seed its baseline immediately so a reply arriving right
+    /// after doesn't slip in before the first scheduled poll.
     fn toggle(&self, sub: Subscription) {
         let id = sub.message_id.clone();
-        subscriptions::toggle(sub);
+        if subscriptions::toggle(sub.clone()) {
+            crate::watcher::seed_new_subscription(sub);
+        }
         self.notify(&id);
     }
 
@@ -3279,7 +3284,8 @@ fn build_subscribe_actions(
         subject: mail.subject.clone(),
         date: mail.date.clone(),
         list: list.to_string(),
-        // The watcher seeds the baseline on its first poll.
+        // Starts empty; seed_new_subscription fills the baseline the moment it
+        // is added (a scheduled poll re-seeds if that fetch fails).
         seen: Vec::new(),
     });
 

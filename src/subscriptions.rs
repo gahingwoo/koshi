@@ -13,10 +13,11 @@ pub struct Subscription {
     pub date: String,
     /// The lore list the mail was opened from, used to fetch it again.
     pub list: String,
-    /// Message-IDs the watcher has already accounted for on this thread. Empty
-    /// on a fresh subscription: the watcher's first poll seeds it with whatever
-    /// the thread holds *now* and stays silent, so subscribing never dumps the
-    /// existing backlog as notifications — only genuinely new arrivals do.
+    /// Message-IDs the watcher has already accounted for on this thread. A
+    /// fresh subscription starts empty and is seeded — with whatever the thread
+    /// holds *now* — the moment it is added (or, failing that, on the next
+    /// poll), silently, so subscribing never dumps the existing backlog as
+    /// notifications. Only genuinely new arrivals do.
     pub seen: Vec<String>,
 }
 

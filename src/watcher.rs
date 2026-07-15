@@ -24,6 +24,52 @@ pub fn start(app: &adw::Application) {
     schedule_next_poll(app);
 }
 
+/// Seed a just-created subscription's baseline right away, rather than leaving
+/// it for the next scheduled poll up to a whole interval later. It fetches the
+/// thread once and records everything in it as already seen — silently, since
+/// this is the pre-existing backlog, not new mail — so a reply that lands
+/// moments after you subscribe is still caught by the following poll instead of
+/// being folded into a late baseline and missed.
+///
+/// Call it from every place a subscription is added; it reuses the watcher's
+/// own digest logic, so the seeded IDs can never drift from the format later
+/// polls diff against. A failed fetch leaves the baseline empty, which just
+/// hands the seeding back to the next scheduled poll — the same behaviour as
+/// before, so a subscribe is never worse off for this shortcut.
+pub fn seed_new_subscription(subscription: Subscription) {
+    glib::spawn_future_local(async move {
+        let cancellable = gio::Cancellable::new();
+        let Ok(mbox) =
+            lore::fetch_thread_mbox(&subscription.list, &subscription.message_id, &cancellable)
+                .await
+        else {
+            return;
+        };
+        let seen: Vec<String> = thread_message_digests(&mbox)
+            .into_iter()
+            .map(|digest| digest.message_id)
+            .collect();
+        // An empty result (unfetchable or unparsable) is left for the next poll
+        // to seed.
+        if seen.is_empty() {
+            return;
+        }
+        // Defer to a baseline that already exists: a scheduled poll may have
+        // fired and seeded (via its own union-extending set_seen) while this
+        // fetch was in flight, and its view could be newer than ours — a blind
+        // overwrite here could drop a message it saw and we didn't, resurfacing
+        // it as a spurious notification. A non-empty seen also means the store
+        // still holds this subscription, so this doubles as the unsubscribe
+        // check. Only seed when the baseline is genuinely still empty.
+        let unseeded = subscriptions::all()
+            .iter()
+            .any(|sub| sub.message_id == subscription.message_id && sub.seen.is_empty());
+        if unseeded {
+            subscriptions::set_seen(&subscription.message_id, seen);
+        }
+    });
+}
+
 /// Arm a one-shot timer for the next poll, re-reading the configured interval
 /// each time so a change in Preferences is honoured from the following cycle.
 /// The poll runs, then re-arms — a fixed recurring source would instead pin the

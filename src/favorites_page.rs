@@ -143,7 +143,8 @@ fn build_subscribe_button(fav: &Favorite) -> gtk::Button {
         subject: fav.subject.clone(),
         date: fav.date.clone(),
         list: fav.list.clone(),
-        // The watcher seeds the baseline on its first poll.
+        // Starts empty; seed_new_subscription fills the baseline the moment it
+        // is added (a scheduled poll re-seeds if that fetch fails).
         seen: Vec::new(),
     };
     let button = new_bell_button(subscriptions::is_subscribed(&fav.message_id));
@@ -152,6 +153,11 @@ fn build_subscribe_button(fav: &Favorite) -> gtk::Button {
         subscription,
         move |button| {
             let subscribed = subscriptions::toggle(subscription.clone());
+            // On a fresh subscribe, seed the baseline now so an imminent reply
+            // isn't absorbed silently by the first scheduled poll.
+            if subscribed {
+                crate::watcher::seed_new_subscription(subscription.clone());
+            }
             apply_bell_state(button, subscribed);
         }
     ));

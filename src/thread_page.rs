@@ -2560,36 +2560,6 @@ fn build_overview_sidebar(
     // A generation counter so a new activation supersedes any correction
     // loop still running from a previous click.
     let scroll_generation = Rc::new(Cell::new(0u64));
-    list.connect_row_activated(glib::clone!(
-        #[weak]
-        list_view,
-        #[weak]
-        view_toggle,
-        #[strong]
-        scroll_generation,
-        move |_, row| {
-            let Some(&index) = message_of_row.get(row.index() as usize) else {
-                return;
-            };
-            // The overview lists the whole thread, so a jump only lands
-            // somewhere in the single view when it happens to be showing that
-            // one message. Switch to the threaded view first (a no-op when
-            // already there); its model holds every message in thread order,
-            // so the message index is the row's list position.
-            view_toggle.set_active(1);
-            jump_to_message(&list_view, index as u32, &scroll_generation);
-
-            // The overview has done its job once a message is picked; dismiss
-            // it so the message it jumps to is actually visible — open, it
-            // overlays and dims most of the pane.
-            if let Some(split) = row
-                .ancestor(adw::OverlaySplitView::static_type())
-                .and_downcast::<adw::OverlaySplitView>()
-            {
-                split.set_show_sidebar(false);
-            }
-        }
-    ));
 
     // Keep the row of the message on screen selected. In single view that is
     // always the opened message; in threaded view it follows the scroll, so
@@ -2624,6 +2594,66 @@ fn build_overview_sidebar(
             }
         }
     });
+
+    list.connect_row_activated(glib::clone!(
+        #[weak]
+        list_view,
+        #[weak]
+        view_toggle,
+        #[strong]
+        scroll_generation,
+        #[strong]
+        refresh_highlight,
+        move |_, row| {
+            let Some(&index) = message_of_row.get(row.index() as usize) else {
+                return;
+            };
+            // The overview lists the whole thread, so a jump only lands
+            // somewhere in the single view when it happens to be showing that
+            // one message. Switch to the threaded view first (a no-op when
+            // already there); its model holds every message in thread order,
+            // so the message index is the row's list position.
+            view_toggle.set_active(1);
+            jump_to_message(&list_view, index as u32, &scroll_generation);
+
+            // The highlight tracks the message at the viewport top, but a
+            // widget's bounds lag the scroll by a frame, so the value-changed
+            // handlers fired during this programmatic jump read the pre-jump
+            // layout and latch the highlight onto the old message; once the
+            // jump settles no further scroll events arrive to correct it, so it
+            // stays stale until the row is activated again. Re-run the highlight
+            // across the jump's settling frames — the same generation gates it,
+            // so a newer jump takes over, and the budget matches
+            // jump_to_message's — so the final, settled frame lands it on the
+            // message we jumped to.
+            let generation = scroll_generation.clone();
+            let this_jump = generation.get();
+            let refresh_highlight = refresh_highlight.clone();
+            let frames = Cell::new(0u32);
+            list_view.add_tick_callback(move |_, _| {
+                if generation.get() != this_jump {
+                    return glib::ControlFlow::Break;
+                }
+                refresh_highlight();
+                frames.set(frames.get() + 1);
+                if frames.get() >= 60 {
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+
+            // The overview has done its job once a message is picked; dismiss
+            // it so the message it jumps to is actually visible — open, it
+            // overlays and dims most of the pane.
+            if let Some(split) = row
+                .ancestor(adw::OverlaySplitView::static_type())
+                .and_downcast::<adw::OverlaySplitView>()
+            {
+                split.set_show_sidebar(false);
+            }
+        }
+    ));
 
     let vadjustment = scrolled.vadjustment();
     vadjustment.connect_value_changed(glib::clone!(

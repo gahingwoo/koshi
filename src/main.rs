@@ -13,6 +13,7 @@ mod remote_page;
 mod send;
 mod settings;
 mod subscriptions;
+mod subscriptions_page;
 mod thread_list_page;
 mod thread_page;
 mod watcher;
@@ -27,6 +28,7 @@ use gtk::{gio, glib};
 use favorites_page::{FAVORITES_PAGE_NAME, build_favorites_page};
 use inbox_page::{INBOX_LIST_TITLE, build_inbox_page, build_inbox_page_deferred};
 use profile_menu::build_profile_button;
+use subscriptions_page::{SUBSCRIPTIONS_PAGE_NAME, build_subscriptions_page};
 use thread_list_page::{
     build_search_page, build_thread_list_page, build_thread_list_page_deferred,
 };
@@ -657,6 +659,26 @@ fn build_header_bar(
         }
     ));
 
+    let subscriptions_button = gtk::Button::builder()
+        .icon_name("bell-symbolic")
+        .tooltip_text("Subscriptions")
+        .build();
+    subscriptions_button.connect_clicked(glib::clone!(
+        #[weak]
+        tab_view,
+        move |_| {
+            let Some(nav) = selected_nav(&tab_view) else {
+                return;
+            };
+            let already_there = nav
+                .visible_page()
+                .is_some_and(|page| page.widget_name() == SUBSCRIPTIONS_PAGE_NAME);
+            if !already_there {
+                nav.push(&build_subscriptions_page(&nav));
+            }
+        }
+    ));
+
     let clamp = adw::Clamp::builder()
         .maximum_size(600)
         .tightening_threshold(400)
@@ -680,6 +702,7 @@ fn build_header_bar(
     header.pack_end(&build_primary_menu_button());
     header.pack_end(&build_profile_button());
     header.pack_end(&favorites_button);
+    header.pack_end(&subscriptions_button);
     header.pack_end(&overview_button);
 
     header

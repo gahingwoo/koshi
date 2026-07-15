@@ -12,7 +12,10 @@ use crate::favorites::{self, Favorite};
 use crate::highlight;
 use crate::inbox_page::{apply_star_state, new_star_button};
 use crate::lore;
+use crate::message;
+use crate::profile;
 use crate::remote_page::RemoteContent;
+use crate::settings;
 use crate::subscriptions::{self, Subscription};
 
 struct Mail {
@@ -25,6 +28,8 @@ struct Mail {
     date: String,
     message_id: Option<String>,
     in_reply_to: Option<String>,
+    /// The `References` header, carried into a reply's own chain.
+    references: Option<String>,
     body: String,
     /// The message's raw RFC 5322 text (without the mbox "From " line),
     /// shown by the per-mail Raw view.
@@ -873,6 +878,7 @@ fn parse_message(raw: &[u8]) -> Mail {
             date: unknown(),
             message_id: None,
             in_reply_to: None,
+            references: None,
             body: String::new(),
             raw: raw_text(),
         };
@@ -898,6 +904,7 @@ fn parse_message(raw: &[u8]) -> Mail {
         date: header("Date").unwrap_or_else(unknown),
         message_id: header("Message-ID"),
         in_reply_to: header("In-Reply-To"),
+        references: header("References"),
         body: format!("{}\n", body.trim_end()),
         raw: raw_text(),
     }
@@ -3016,6 +3023,18 @@ fn add_label_extra_menus(widget: &gtk::Widget, menu: &gio::Menu) {
 /// Re:-prefixed subject and the mail's Message-ID for threading. Parsed
 /// address lists are preferred; raw header values are the fallback.
 fn build_reply_context(mail: &Mail) -> composer::ReplyContext {
+    // Cc the sender to themselves unless they have turned it off, so a copy of
+    // the reply lands in their own mailbox.
+    let cc_self = settings::cc_self()
+        .then(|| profile::cached().sender_header())
+        .flatten();
+    reply_context(mail, cc_self.as_deref())
+}
+
+/// The pure core of [`build_reply_context`]: given the optional address to Cc
+/// the sender at, build the reply prefill. Split out so recipient handling is
+/// unit-testable without touching git config or the settings store.
+fn reply_context(mail: &Mail, cc_self: Option<&str>) -> composer::ReplyContext {
     let mut cc: Vec<String> = Vec::new();
     if mail.to_addrs.is_empty() {
         cc.push(mail.to.clone());
@@ -3027,12 +3046,19 @@ fn build_reply_context(mail: &Mail) -> composer::ReplyContext {
     } else {
         cc.extend(mail.cc_addrs.iter().cloned());
     }
+    cc.extend(cc_self.map(str::to_string));
+
+    // Drop blanks, duplicates, and the address we're replying to, so the Cc
+    // field is exactly who will be copied. A self-Cc that is already a
+    // recipient (or is the reply target) collapses away here.
+    let cc = message::dedup_cc(&mail.from, &cc);
 
     composer::ReplyContext {
         to: mail.from.clone(),
         cc: cc.join(", "),
         subject: composer::reply_subject(&mail.subject),
         in_reply_to: mail.message_id.clone().unwrap_or_default(),
+        references: mail.references.clone().unwrap_or_default(),
     }
 }
 
@@ -3763,7 +3789,7 @@ mod tests {
     #[test]
     fn reply_context_targets_the_clicked_message() {
         let thread = parse_thread(RAW_THREAD);
-        let reply = build_reply_context(&thread[1]);
+        let reply = reply_context(&thread[1], None);
         assert_eq!(reply.to, "sashiko-bot@kernel.org");
         assert!(reply.cc.contains("Linus Walleij <linusw@kernel.org>"));
         assert!(reply.cc.contains("linux-watchdog@vger.kernel.org"));
@@ -3775,6 +3801,27 @@ mod tests {
             reply.in_reply_to,
             "<20260619204041.040D71F000E9@smtp.kernel.org>"
         );
+    }
+
+    #[test]
+    fn reply_context_adds_self_to_cc_once() {
+        let to = mail("t@x", None, "Subj", "Author <author@x>");
+        // A brand-new address is appended to Cc.
+        let with_self = reply_context(&to, Some("Me <me@x>"));
+        assert!(with_self.cc.contains("Me <me@x>"));
+        // Turning it off leaves Cc without it.
+        let without = reply_context(&to, None);
+        assert!(!without.cc.contains("me@x"));
+    }
+
+    #[test]
+    fn reply_context_self_cc_does_not_duplicate_or_shadow_the_target() {
+        // Replying to yourself: self is the reply target, so it must not also
+        // appear in Cc.
+        let own = mail("t@x", None, "Subj", "Me <me@x>");
+        let reply = reply_context(&own, Some("Me <me@x>"));
+        assert_eq!(reply.to, "Me <me@x>");
+        assert!(!reply.cc.contains("me@x"));
     }
 
     #[test]
@@ -3872,6 +3919,7 @@ mod tests {
             date: "Mon, 29 Jun 2026 03:51:00 +0000".to_string(),
             message_id: Some(format!("<{id}>")),
             in_reply_to: in_reply_to.map(|id| format!("<{id}>")),
+            references: None,
             body: String::new(),
             raw: String::new(),
         }

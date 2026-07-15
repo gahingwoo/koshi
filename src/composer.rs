@@ -5,13 +5,14 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 
 use crate::highlight;
+use crate::message;
+use crate::profile;
+use crate::send;
 use crate::settings;
 
-/// Placeholder identity until account support exists.
-const IDENTITY: &str = "nika <nika@nikableh.moe>";
-
 /// The `User-Agent` header value announcing Koshi as the mail client, e.g.
-/// `koshi/0.1.0`. Sending it is opt-out via [`crate::settings::send_user_agent`].
+/// `koshi/0.1.0`. Prefilled into a reply only when [`settings::send_user_agent`]
+/// is on; the user can still delete the header from the message before sending.
 const USER_AGENT: &str = concat!("koshi/", env!("CARGO_PKG_VERSION"));
 
 const WRAP_WIDTH: usize = 72;
@@ -25,147 +26,161 @@ pub struct ReplyContext {
     pub cc: String,
     pub subject: String,
     pub in_reply_to: String,
+    /// The parent message's `References` header, carried (not edited) so the
+    /// reply can extend the chain.
+    pub references: String,
 }
 
-/// The shared editing state: the compact composer and the fullscreen dialog
-/// both render these same buffers, so edits stay in sync with no copying.
+/// The editing state. The composer is the raw message: a single buffer holds
+/// the prefilled headers, a blank line, and the body, and the user edits all of
+/// it in place. The compact composer and the fullscreen dialog share this one
+/// buffer, so edits stay in sync with no copying.
 #[derive(Clone)]
 struct ComposerState {
-    subject: gtk::EntryBuffer,
-    to: gtk::EntryBuffer,
-    cc: gtk::EntryBuffer,
-    in_reply_to: gtk::EntryBuffer,
-    body: gtk::TextBuffer,
-    // The context the composer resets against; a cell because a per-mail
-    // Reply button can retarget the whole composer at another message.
+    document: gtk::TextBuffer,
+    // The context the document resets against; a cell because a per-mail Reply
+    // button can retarget the whole composer at another message.
     initial: Rc<RefCell<ReplyContext>>,
 }
 
 impl ComposerState {
     fn new(reply: ReplyContext) -> Self {
-        let body = gtk::TextBuffer::new(None);
-        // Prefill the signature before enabling undo so it is part of the
-        // baseline document rather than an undoable edit.
-        prefill_signature(&body);
-        body.set_enable_undo(true);
-        Self {
-            subject: gtk::EntryBuffer::new(Some(&reply.subject)),
-            to: gtk::EntryBuffer::new(Some(&reply.to)),
-            cc: gtk::EntryBuffer::new(Some(&reply.cc)),
-            in_reply_to: gtk::EntryBuffer::new(Some(&reply.in_reply_to)),
-            body,
+        let document = gtk::TextBuffer::new(None);
+        let doc = document_for(&reply);
+        // Set the prefill before enabling undo so the baseline document is not
+        // itself an undoable edit.
+        document.set_text(&doc);
+        document.set_enable_undo(true);
+        let state = Self {
+            document,
             initial: Rc::new(RefCell::new(reply)),
-        }
+        };
+        state.place_cursor_at_body(&doc);
+        state
     }
 
+    fn document_text(&self) -> String {
+        let (start, end) = self.document.bounds();
+        self.document.text(&start, &end, false).into()
+    }
+
+    /// Replace the whole document (headers and body) and drop the cursor onto
+    /// the first body line. Clears the undo stack — used for reset/retarget,
+    /// where taking the previous draft back is not wanted.
+    fn set_document(&self, doc: &str) {
+        self.document.set_text(doc);
+        self.place_cursor_at_body(doc);
+    }
+
+    fn place_cursor_at_body(&self, doc: &str) {
+        let offset = body_start_offset(doc);
+        self.document
+            .place_cursor(&self.document.iter_at_offset(offset));
+    }
+
+    /// The body region — everything after the header block's blank-line
+    /// separator — as the user currently has it.
     fn body_text(&self) -> String {
-        let (start, end) = self.body.bounds();
-        self.body.text(&start, &end, false).into()
+        let (_, body) = message::parse_headers(&self.document_text());
+        body
     }
 
-    /// Replace the body in one undoable step. `TextBuffer::set_text` wraps its
-    /// delete+insert in an *irreversible* action, which drops the undo stack
-    /// entirely, so edits the user should be able to take back (rewrap,
-    /// trailers) run the two halves inside a user action instead.
-    fn replace_body_text(&self, text: &str) {
+    /// Replace just the body region in one undoable step, leaving the headers
+    /// untouched. `TextBuffer::set_text` would wrap delete+insert in an
+    /// *irreversible* action that drops the undo stack, so edits the user should
+    /// be able to take back (rewrap, trailers) run inside a user action instead.
+    fn replace_body(&self, body: &str) {
+        let start_offset = body_start_offset(&self.document_text());
         let caret = self
-            .body
-            .iter_at_mark(&self.body.get_insert())
-            .offset()
-            .clamp(0, text.chars().count() as i32);
+            .document
+            .iter_at_mark(&self.document.get_insert())
+            .offset();
 
-        self.body.begin_user_action();
-        let (mut start, mut end) = self.body.bounds();
-        self.body.delete(&mut start, &mut end);
-        self.body.insert(&mut start, text);
-        self.body.end_user_action();
+        self.document.begin_user_action();
+        let mut start = self.document.iter_at_offset(start_offset);
+        let mut end = self.document.end_iter();
+        self.document.delete(&mut start, &mut end);
+        self.document.insert(&mut start, body);
+        self.document.end_user_action();
 
-        self.body.place_cursor(&self.body.iter_at_offset(caret));
+        let caret = caret.clamp(start_offset, self.document.end_iter().offset());
+        self.document
+            .place_cursor(&self.document.iter_at_offset(caret));
     }
 
-    fn raw_message(&self) -> String {
-        assemble_raw(
-            &self.to.text(),
-            &self.cc.text(),
-            &self.subject.text(),
-            &self.in_reply_to.text(),
-            &self.body_text(),
-            settings::send_user_agent().then_some(USER_AGENT),
-        )
+    /// Whether the body is still the untouched prefill (empty or just the
+    /// signature) — used to decide whether retargeting at another message can
+    /// happen silently or should first confirm discarding a typed draft.
+    fn body_is_pristine(&self) -> bool {
+        self.body_text().trim() == reply_body_seed().trim()
     }
 
     fn reset(&self) {
-        let initial = self.initial.borrow();
-        self.subject.set_text(&initial.subject);
-        self.to.set_text(&initial.to);
-        self.cc.set_text(&initial.cc);
-        self.in_reply_to.set_text(&initial.in_reply_to);
-        // Re-read the signature so a change made in Preferences takes effect on
-        // the next fresh reply, without waiting for a restart.
-        prefill_signature(&self.body);
+        let doc = document_for(&self.initial.borrow());
+        self.set_document(&doc);
     }
 
-    /// Swap in a new reply target: the header fields follow the new context
-    /// (and the subject revert icon and Discard now reset against it), but
-    /// any body text already typed is deliberately kept.
+    /// Point the composer at a new reply target: the whole document is rebuilt
+    /// against the new context (and Discard now resets against it).
     fn retarget(&self, reply: ReplyContext) {
-        // The context goes in first so the entry change handlers (the
-        // subject revert icon) compare against the new target, and the
-        // subject is cleared before being set so a change always fires
-        // even when the old draft already carried the new subject.
+        let doc = document_for(&reply);
         self.initial.replace(reply);
-        let initial = self.initial.borrow();
-        self.subject.set_text("");
-        self.subject.set_text(&initial.subject);
-        self.to.set_text(&initial.to);
-        self.cc.set_text(&initial.cc);
-        self.in_reply_to.set_text(&initial.in_reply_to);
+        self.set_document(&doc);
     }
 }
 
-/// Hide the stock "Insert Emoji" and "Change Direction" items from the
-/// context menu of a composer input. For entries the actions live on the
-/// internal GtkText delegate; the emoji item must be suppressed via
-/// InputHints::NO_EMOJI because GTK re-enables the action whenever the
-/// hints or editability change.
-fn strip_extra_context_items(widget: &impl IsA<gtk::Widget>) {
-    let widget = widget.upcast_ref::<gtk::Widget>();
-    if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
-        entry.set_input_hints(entry.input_hints() | gtk::InputHints::NO_EMOJI);
-        if let Some(text) = entry.first_child().and_downcast::<gtk::Text>() {
-            text.action_set_enabled("misc.toggle-direction", false);
-        }
-    } else if let Some(view) = widget.downcast_ref::<gtk::TextView>() {
-        // GtkTextView has no "Change Direction" item, only the emoji one.
-        view.set_input_hints(view.input_hints() | gtk::InputHints::NO_EMOJI);
+/// The raw message to prefill a reply with: the headers from `reply` plus the
+/// sender's identity and (unless opted out) a `User-Agent`, then the body seed.
+fn document_for(reply: &ReplyContext) -> String {
+    message::render(&message::Outgoing {
+        from: sender_identity(),
+        to: reply.to.clone(),
+        cc: reply.cc.clone(),
+        subject: reply.subject.clone(),
+        in_reply_to: reply.in_reply_to.clone(),
+        references: reply.references.clone(),
+        user_agent: settings::send_user_agent().then(|| USER_AGENT.to_string()),
+        body: reply_body_seed(),
+    })
+}
+
+/// The initial body of a reply: the configured signature set off by a blank
+/// line for the reply to be typed above, read live from settings so a
+/// Preferences edit reaches the next fresh reply. Empty when no signature is
+/// configured — just a blank line to type on.
+fn reply_body_seed() -> String {
+    let signature = settings::reply_signature();
+    if signature.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{signature}\n")
     }
 }
 
-/// Show a revert icon in a subject entry whenever its text differs from the
-/// prefilled reply subject; clicking the icon restores it.
-fn setup_subject_revert(entry: &gtk::Entry, initial: &Rc<RefCell<ReplyContext>>) {
-    let initial = initial.clone();
+/// The char offset of the first body character: just past the blank line that
+/// separates the header block from the body. The whole length when there is no
+/// blank line (an all-headers document).
+fn body_start_offset(doc: &str) -> i32 {
+    match doc.find("\n\n") {
+        Some(byte) => doc[..byte + 2].chars().count() as i32,
+        None => doc.chars().count() as i32,
+    }
+}
 
-    entry.set_secondary_icon_activatable(true);
-    entry.set_secondary_icon_tooltip_text(Some("Revert Subject"));
+/// Ensure the document ends with exactly one trailing newline, as git wants the
+/// message file to. The buffer already uses LF line endings.
+fn normalize_document(doc: &str) -> String {
+    let mut out = doc.trim_end_matches('\n').to_string();
+    out.push('\n');
+    out
+}
 
-    let apply = glib::clone!(
-        #[strong]
-        initial,
-        move |entry: &gtk::Entry| {
-            let modified = entry.text() != initial.borrow().subject;
-            entry.set_secondary_icon_name(modified.then_some("edit-undo-symbolic"));
-        }
-    );
-    apply(entry);
-    entry.connect_changed(move |entry| apply(entry));
-
-    entry.connect_icon_release(move |entry, position| {
-        if position == gtk::EntryIconPosition::Secondary {
-            let subject = initial.borrow().subject.clone();
-            entry.set_text(&subject);
-        }
-    });
+/// Hide the stock "Insert Emoji" and "Change Direction" items from the context
+/// menu of a composer input. GtkTextView has only the emoji item, suppressed
+/// via InputHints::NO_EMOJI because GTK re-enables the action whenever the hints
+/// or editability change.
+fn strip_extra_context_items(view: &gtk::TextView) {
+    view.set_input_hints(view.input_hints() | gtk::InputHints::NO_EMOJI);
 }
 
 /// Prefix `subject` with "Re: " unless it already carries one.
@@ -177,9 +192,9 @@ pub fn reply_subject(subject: &str) -> String {
     }
 }
 
-/// Append `trailer` on its own line at the end of `body`: exactly one
-/// newline separates it from a nonempty body, and it always ends the text
-/// with a trailing newline.
+/// Append `trailer` on its own line at the end of `body`: exactly one newline
+/// separates it from a nonempty body, and it always ends the text with a
+/// trailing newline.
 fn append_trailer(body: &str, trailer: &str) -> String {
     let mut out = body.to_string();
     if !out.is_empty() && !out.ends_with('\n') {
@@ -190,23 +205,9 @@ fn append_trailer(body: &str, trailer: &str) -> String {
     out
 }
 
-/// Fill `body` with the current reply signature, read live from settings so a
-/// Preferences edit reaches the next fresh reply without a restart. The cursor
-/// is left on the empty line above it; when no signature is configured the body
-/// is simply cleared.
-fn prefill_signature(body: &gtk::TextBuffer) {
-    let signature = settings::reply_signature();
-    if signature.is_empty() {
-        body.set_text("");
-    } else {
-        body.set_text(&format!("\n\n{signature}\n"));
-        body.place_cursor(&body.start_iter());
-    }
-}
-
 /// Append `signature` (which carries its own `-- ` separator) at the end of
-/// `body`, set off from any typed text by one blank line, the way a signature
-/// conventionally sits below a mail, and ending with a trailing newline.
+/// `body`, set off from any typed text by one blank line, and ending with a
+/// trailing newline.
 fn append_signature(body: &str, signature: &str) -> String {
     let mut out = body.trim_end_matches('\n').to_string();
     if !out.is_empty() {
@@ -219,9 +220,9 @@ fn append_signature(body: &str, signature: &str) -> String {
 
 /// Greedy-wrap `text` at `width` columns on word boundaries. Blank lines are
 /// kept as paragraph breaks, quoted lines (starting with ">") pass through
-/// untouched, and words longer than `width` (long URLs) stay on their own
-/// line unbroken. Width is counted in chars, not display cells, so wide CJK
-/// glyphs count as one column.
+/// untouched, and words longer than `width` (long URLs) stay on their own line
+/// unbroken. Width is counted in chars, not display cells, so wide CJK glyphs
+/// count as one column.
 fn rewrap(text: &str, width: usize) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut para: Vec<&str> = Vec::new();
@@ -270,51 +271,214 @@ fn rewrap(text: &str, width: usize) -> String {
     result
 }
 
-/// Assemble the raw RFC 5322-style reply shown by the Raw Preview toggle.
-/// `user_agent` is the `User-Agent` value to advertise, or `None` when the user
-/// has turned client identification off in Preferences.
-fn assemble_raw(
-    to: &str,
-    cc: &str,
-    subject: &str,
-    in_reply_to: &str,
-    body: &str,
-    user_agent: Option<&str>,
-) -> String {
-    let mut raw = format!("From: {IDENTITY}\nTo: {to}\n");
-    if !cc.is_empty() {
-        raw.push_str("Cc: ");
-        raw.push_str(cc);
-        raw.push('\n');
-    }
-    raw.push_str("Subject: ");
-    raw.push_str(subject);
-    raw.push('\n');
-    if !in_reply_to.is_empty() {
-        raw.push_str("In-Reply-To: ");
-        raw.push_str(in_reply_to);
-        raw.push('\n');
-    }
-    if let Some(user_agent) = user_agent {
-        raw.push_str("User-Agent: ");
-        raw.push_str(user_agent);
-        raw.push('\n');
-    }
-    raw.push('\n');
-    raw.push_str(body);
-    raw
+/// The `From:` identity for a reply — the sender git will actually send as,
+/// read from git config. Empty when git has no address configured (the send
+/// path surfaces that; the prefill just shows a blank `From:`).
+fn sender_identity() -> String {
+    profile::cached().sender_header().unwrap_or_default()
 }
 
-/// A handle to a built composer: the bottom-bar widget to insert into the
-/// page, plus the hooks a per-mail Reply button needs to retarget the
-/// draft at another message in the thread.
+/// The Send button — the composer's primary action. Validates the message,
+/// confirms the recipients, then hands the raw document to `git send-email`; on
+/// success it toasts and collapses the composer back to its resting state.
+fn build_send_button(state: &ComposerState, expand_toggle: &gtk::ToggleButton) -> gtk::Button {
+    let button = gtk::Button::builder()
+        .label("Send")
+        .css_classes(["suggested-action"])
+        .build();
+
+    button.connect_clicked(glib::clone!(
+        #[strong]
+        state,
+        #[weak]
+        expand_toggle,
+        move |button| {
+            let doc = normalize_document(&state.document_text());
+            let (headers, _) = message::parse_headers(&doc);
+
+            // Guard the catastrophic edits the raw editor makes possible before
+            // handing anything to git.
+            if !doc.contains("\n\n") {
+                present_message(
+                    button,
+                    "No Message Body",
+                    "Add a blank line after the headers, then your reply below it.",
+                );
+                return;
+            }
+            if message::header_value(&headers, "From")
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                present_message(
+                    button,
+                    "No Sender Configured",
+                    "Set your name and email in git (user.name and user.email), \
+                     or a sendemail.from, before sending.",
+                );
+                return;
+            }
+            if message::header_value(&headers, "To")
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                present_message(button, "No Recipient", "Add a To: header first.");
+                return;
+            }
+
+            let dialog = adw::AlertDialog::new(Some("Send Reply?"), None);
+            dialog.set_body(&confirm_body(&headers));
+            dialog.add_responses(&[("cancel", "Cancel"), ("send", "Send")]);
+            dialog.set_response_appearance("send", adw::ResponseAppearance::Suggested);
+            // Sending is irreversible, so it must be an explicit click: Enter
+            // and Escape both cancel rather than fire the default action.
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            dialog.connect_response(
+                Some("send"),
+                glib::clone!(
+                    #[strong]
+                    state,
+                    #[weak]
+                    button,
+                    #[weak]
+                    expand_toggle,
+                    move |_, _| {
+                        send_now(&state, &button, &expand_toggle);
+                    }
+                ),
+            );
+            dialog.present(Some(button));
+        }
+    ));
+
+    button
+}
+
+/// Spawn the send on the main loop, disabling the button while it runs. On
+/// success: toast, reset the draft, and collapse the composer. On failure:
+/// surface git's diagnostic in a dialog.
+fn send_now(state: &ComposerState, button: &gtk::Button, expand_toggle: &gtk::ToggleButton) {
+    let doc = normalize_document(&state.document_text());
+    let (headers, _) = message::parse_headers(&doc);
+    let request = send::Request {
+        from: header_owned(&headers, "From"),
+        to: header_owned(&headers, "To"),
+        cc: header_owned(&headers, "Cc"),
+        eml: doc,
+    };
+    // Resolve the toast surface now, while the button is still in the tree.
+    let overlay = button
+        .ancestor(adw::ToastOverlay::static_type())
+        .and_downcast::<adw::ToastOverlay>();
+    button.set_sensitive(false);
+
+    glib::spawn_future_local(glib::clone!(
+        #[strong]
+        state,
+        #[weak]
+        button,
+        #[weak]
+        expand_toggle,
+        async move {
+            let outcome = send::send(request, &button).await;
+            button.set_sensitive(true);
+            match outcome {
+                Ok(send::Outcome::Sent) => {
+                    if let Some(overlay) = &overlay {
+                        overlay.add_toast(adw::Toast::new("Reply sent"));
+                    }
+                    state.reset();
+                    expand_toggle.set_active(false);
+                }
+                Ok(send::Outcome::Failed { code, stderr }) => {
+                    present_message(
+                        &button,
+                        "Couldn't Send Reply",
+                        &send_error_body(code, &stderr),
+                    );
+                }
+                Err(error) => {
+                    present_message(&button, "Couldn't Send Reply", &error.to_string());
+                }
+            }
+        }
+    ));
+}
+
+/// A header value as an owned, single-line string ("" when absent): any folding
+/// is collapsed so a multi-line `Cc`/`To` becomes the clean comma list git wants.
+fn header_owned(headers: &[(String, String)], name: &str) -> String {
+    message::unfold(message::header_value(headers, name).unwrap_or(""))
+}
+
+/// The recipient summary shown in the send confirmation, plus a caution when
+/// the reply has lost its threading header.
+fn confirm_body(headers: &[(String, String)]) -> String {
+    let mut body = format!("To: {}", header_owned(headers, "To"));
+    let cc = header_owned(headers, "Cc");
+    if !cc.is_empty() {
+        body.push_str(&format!("\nCc: {cc}"));
+    }
+    body.push_str(&format!("\nSubject: {}", header_owned(headers, "Subject")));
+    if header_owned(headers, "In-Reply-To").is_empty() {
+        body.push_str("\n\nThis reply is not threaded (no In-Reply-To header).");
+    }
+    body
+}
+
+/// A human-facing failure message: git's own stderr when it said anything,
+/// otherwise a summary of how it exited.
+fn send_error_body(code: Option<i32>, stderr: &str) -> String {
+    let stderr = stderr.trim();
+    // A missing password — the prompt was cancelled, or none could be obtained —
+    // is git's most common failure here; say so plainly instead of showing its
+    // raw "terminal prompts disabled" diagnostic.
+    if stderr.contains("could not read Password")
+        || stderr.contains("terminal prompts disabled")
+        || stderr.contains("askpass")
+    {
+        return "The reply was not sent because no SMTP password was provided. \
+                If you cancelled the password prompt, that is expected — nothing was sent, \
+                and your draft is untouched."
+            .to_string();
+    }
+    if !stderr.is_empty() {
+        // Show the tail, capped, so a verbose failure (the useful part of which
+        // is last) cannot produce an unbounded dialog.
+        const MAX: usize = 800;
+        let count = stderr.chars().count();
+        if count > MAX {
+            return format!("…{}", stderr.chars().skip(count - MAX).collect::<String>());
+        }
+        return stderr.to_string();
+    }
+    match code {
+        Some(code) => format!("git send-email exited with status {code}."),
+        None => "git send-email was terminated before it finished.".to_string(),
+    }
+}
+
+/// Show a simple informational dialog with a single Close response.
+fn present_message(parent: &impl IsA<gtk::Widget>, heading: &str, body: &str) {
+    let dialog = adw::AlertDialog::new(Some(heading), Some(body));
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
+    dialog.present(Some(parent));
+}
+
+/// A handle to a built composer: the bottom-bar widget to insert into the page,
+/// plus the hooks a per-mail Reply button needs to retarget the draft at another
+/// message in the thread.
 #[derive(Clone)]
 pub struct Composer {
     widget: gtk::Box,
     state: ComposerState,
     expand_toggle: gtk::ToggleButton,
     body_view: gtk::TextView,
-    preview_toggle: gtk::ToggleButton,
 }
 
 impl Composer {
@@ -322,26 +486,53 @@ impl Composer {
         &self.widget
     }
 
-    /// Point the composer at `reply`: headers and the reset baseline follow
-    /// the new context, typed body text is kept, and the expanded editor is
-    /// shown and focused.
+    /// Point the composer at `reply`: the document is rebuilt against the new
+    /// context and the editor is shown and focused. If the user has already
+    /// started typing a reply, confirm discarding it first.
     pub fn start_reply(&self, reply: ReplyContext) {
+        if self.state.body_is_pristine() {
+            self.apply_reply(reply);
+            return;
+        }
+
+        let dialog = adw::AlertDialog::new(
+            Some("Discard Draft?"),
+            Some("You have started a reply. Replying to a different message will discard it."),
+        );
+        dialog.add_responses(&[("cancel", "Cancel"), ("discard", "Discard")]);
+        dialog.set_response_appearance("discard", adw::ResponseAppearance::Destructive);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.connect_response(
+            Some("discard"),
+            glib::clone!(
+                #[strong(rename_to = this)]
+                self,
+                move |_, _| this.apply_reply(reply.clone())
+            ),
+        );
+        dialog.present(Some(&self.body_view));
+    }
+
+    fn apply_reply(&self, reply: ReplyContext) {
         self.state.retarget(reply);
         self.expand_toggle.set_active(true);
-        // Leave an active Raw Preview: replying means editing, and the
-        // focus grab below only lands once the editor page is mapped.
-        self.preview_toggle.set_active(false);
         self.body_view.grab_focus();
     }
 
-    /// Insert `quoted` into the body at the last known cursor position and
-    /// reveal the editor with the cursor on the line after the quote.
+    /// Insert `quoted` into the body at the cursor (clamped into the body region
+    /// so it can never land among the headers) and reveal the editor with the
+    /// cursor on the line after the quote.
     pub fn insert_quote(&self, quoted: &str) {
-        let buffer = &self.state.body;
+        let buffer = &self.state.document;
+        let body_start = body_start_offset(&self.state.document_text());
         let mut iter = buffer.iter_at_mark(&buffer.get_insert());
-        // Keep the quote on lines of its own: break out of a partially
-        // typed line first, and end with a newline so the cursor lands on
-        // the line after the quote.
+        if iter.offset() < body_start {
+            iter = buffer.iter_at_offset(body_start);
+        }
+        // Keep the quote on lines of its own: break out of a partially typed
+        // line first, and end with a newline so the cursor lands on the line
+        // after the quote.
         let mut text = String::new();
         if !iter.starts_line() {
             text.push('\n');
@@ -352,11 +543,10 @@ impl Composer {
         buffer.place_cursor(&iter);
 
         self.expand_toggle.set_active(true);
-        self.preview_toggle.set_active(false);
         self.body_view.grab_focus();
-        // Bring the cursor into view once the editor has a real allocation:
-        // the expander may only be expanding now, and scrolling a view that
-        // isn't laid out yet is a no-op.
+        // Bring the cursor into view once the editor has a real allocation: the
+        // expander may only be expanding now, and scrolling a view that isn't
+        // laid out yet is a no-op.
         glib::idle_add_local_once(glib::clone!(
             #[weak(rename_to = view)]
             self.body_view,
@@ -368,125 +558,17 @@ impl Composer {
     }
 }
 
-/// Build the reply composer: one click-anywhere bar that is the bottom bar
-/// when collapsed and the editor's header when open, toggling the editor
-/// either way with a chevron that flips to match. The bar's label and the
-/// open editor are clamped to the mail page's reading width so they line up
-/// with the message column.
+/// Build the reply composer: one click-anywhere bar that is the bottom bar when
+/// collapsed and the editor's header when open, toggling the editor either way
+/// with a chevron that flips to match. The open editor is clamped to the mail
+/// page's reading width so it lines up with the message column.
 pub fn build_composer(reply: ReplyContext) -> Composer {
     let state = ComposerState::new(reply);
 
-    let subject_entry = gtk::Entry::builder()
-        .buffer(&state.subject)
-        .placeholder_text("Subject")
-        .hexpand(true)
-        .build();
-    strip_extra_context_items(&subject_entry);
-    setup_subject_revert(&subject_entry, &state.initial);
-
-    // One title column shared by the Subject label and the headers grid,
-    // so all four entries start at the same x when Details is open.
-    let titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
-
-    let revealer = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::SlideDown)
-        .child(&build_headers_grid(&state, &titles))
-        .build();
-
-    let details_toggle = gtk::ToggleButton::builder()
-        .icon_name("view-more-horizontal-symbolic")
-        .tooltip_text("Details")
-        .css_classes(["flat"])
-        .build();
-    details_toggle
-        .bind_property("active", &revealer, "reveal-child")
-        .sync_create()
-        .build();
-
-    // Editor <-> raw preview stack. The preview gets its own buffer because
-    // it shows the assembled message, not the editable body.
-    let preview_buffer = gtk::TextBuffer::new(None);
-    let preview_view = gtk::TextView::builder()
-        .buffer(&preview_buffer)
-        .editable(false)
-        .cursor_visible(false)
-        .monospace(true)
-        .wrap_mode(gtk::WrapMode::None)
-        .left_margin(8)
-        .right_margin(8)
-        .top_margin(8)
-        .bottom_margin(8)
-        .build();
-    let preview_scrolled = gtk::ScrolledWindow::builder()
-        .child(&preview_view)
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .min_content_height(300)
-        .max_content_height(560)
-        .propagate_natural_height(true)
-        .build();
-
-    let stack = gtk::Stack::builder()
-        .transition_type(gtk::StackTransitionType::Crossfade)
-        .build();
-    let (body_editor, body_view) = build_body_editor(&state.body, true);
-    stack.add_named(&body_editor, Some("edit"));
-    stack.add_named(&preview_scrolled, Some("preview"));
-
-    let preview_toggle = gtk::ToggleButton::builder()
-        .icon_name("text-x-generic-symbolic")
-        .tooltip_text("Raw Preview")
-        .css_classes(["flat"])
-        .build();
-    preview_toggle.connect_toggled(glib::clone!(
-        #[strong]
-        state,
-        #[weak]
-        preview_buffer,
-        #[weak]
-        stack,
-        move |toggle| {
-            if toggle.is_active() {
-                preview_buffer.set_text(&state.raw_message());
-                stack.set_visible_child_name("preview");
-            } else {
-                stack.set_visible_child_name("edit");
-            }
-        }
-    ));
-
-    // Keep an active preview live: the subject entry and toolbar stay usable
-    // while the preview is shown, so edits made then must show up in it.
-    let refresh_preview: Rc<dyn Fn()> = Rc::new(glib::clone!(
-        #[strong]
-        state,
-        #[weak]
-        preview_buffer,
-        #[weak]
-        preview_toggle,
-        move || {
-            if preview_toggle.is_active() {
-                preview_buffer.set_text(&state.raw_message());
-            }
-        }
-    ));
-    state.body.connect_changed(glib::clone!(
-        #[strong]
-        refresh_preview,
-        move |_| refresh_preview()
-    ));
-    // The fullscreen dialog shares this buffer, so highlighting attached
-    // here covers it too.
-    highlight::attach(&state.body);
-    highlight::refresh(&state.body);
-    state.body.connect_changed(highlight::refresh);
-
-    for buffer in [&state.subject, &state.to, &state.cc, &state.in_reply_to] {
-        buffer.connect_text_notify(glib::clone!(
-            #[strong]
-            refresh_preview,
-            move |_| refresh_preview()
-        ));
-    }
+    let (body_editor, body_view) = build_body_editor(&state.document, true);
+    highlight::attach(&state.document);
+    highlight::refresh(&state.document);
+    state.document.connect_changed(highlight::refresh);
 
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -501,39 +583,23 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
     // Discard can flip it directly; the header bar below binds to it.
     let expand_toggle = gtk::ToggleButton::new();
 
-    // The subject row is a one-row grid sharing the headers grid's column
-    // spacing, with its label in the same SizeGroup: the label column and
-    // the entry's left edge then match the To/Cc/In-Reply-To rows exactly.
-    let subject_label = build_field_label("Subject");
-    titles.add_widget(&subject_label);
-    let subject_grid = gtk::Grid::builder().column_spacing(12).build();
-    subject_grid.attach(&subject_label, 0, 0, 1, 1);
-    subject_grid.attach(&subject_entry, 1, 0, 1, 1);
-
     let toolbar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
-        .margin_start(6)
         .build();
-    toolbar.append(&details_toggle);
     toolbar.append(&build_insert_button(&state, &root));
     toolbar.append(&build_rewrap_button(&state));
-    toolbar.append(&preview_toggle);
     toolbar.append(&build_fullscreen_toggle(&state));
-    toolbar.append(&build_discard_button(
-        &state,
-        &details_toggle,
-        &preview_toggle,
-        &expand_toggle,
-    ));
-    subject_grid.attach(&toolbar, 2, 0, 1, 1);
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    toolbar.append(&spacer);
+    toolbar.append(&build_discard_button(&state, &expand_toggle));
+    toolbar.append(&build_send_button(&state, &expand_toggle));
 
-    root.append(&subject_grid);
-    root.append(&revealer);
-    root.append(&stack);
+    root.append(&toolbar);
+    root.append(&body_editor);
 
-    // The open editor keeps the mail column's reading width so its fields
-    // line up with the message bodies above it.
+    // The open editor keeps the mail column's reading width so its fields line
+    // up with the message bodies above it.
     let editor_clamp = adw::Clamp::builder()
         .maximum_size(1100)
         .tightening_threshold(800)
@@ -544,12 +610,10 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         .child(&editor_clamp)
         .build();
 
-    // One full-width flat button is the whole composer's face: the bottom
-    // bar when collapsed, the editor's header when open. A click anywhere on
-    // it toggles the editor, and the chevron flips to show which way it
-    // goes. Its icon and label sit in the same reading-width clamp as the
-    // thread, so they line up with the message column rather than hugging
-    // the window edge.
+    // One full-width flat button is the whole composer's face: the bottom bar
+    // when collapsed, the editor's header when open. A click anywhere on it
+    // toggles the editor, and the chevron flips to show which way it goes. Its
+    // icon and label sit in the same reading-width clamp as the thread.
     let chevron = gtk::Image::from_icon_name("pan-up-symbolic");
     let header_content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -586,9 +650,9 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         move |_| expand_toggle.set_active(!expand_toggle.is_active())
     ));
 
-    // The one switch reveals the editor, flips the chevron and retitles the
-    // bar; opening also focuses the body, mirroring what start_reply does
-    // for per-mail Reply buttons.
+    // The one switch reveals the editor, flips the chevron and retitles the bar;
+    // opening also focuses the body, mirroring what start_reply does for
+    // per-mail Reply buttons.
     expand_toggle
         .bind_property("active", &editor_revealer, "reveal-child")
         .sync_create()
@@ -614,10 +678,10 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         }
     ));
 
-    // The composer floats over the bottom of the mail pane (see thread_page),
-    // so it needs an opaque background and a top divider of its own: bottom-
-    // anchored, it is the collapsed bar while shut and grows up over the
-    // content when open.
+    // The composer floats over the bottom of the mail pane (see thread_page), so
+    // it needs an opaque background and a top divider of its own: bottom-
+    // anchored, it is the collapsed bar while shut and grows up over the content
+    // when open.
     let widget = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .valign(gtk::Align::End)
@@ -632,50 +696,12 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         state,
         expand_toggle,
         body_view,
-        preview_toggle,
     }
 }
 
-/// A caption-heading field-name label, shared by the headers grid and the
-/// subject rows so every field title looks the same.
-fn build_field_label(name: &str) -> gtk::Label {
-    gtk::Label::builder()
-        .label(name)
-        .halign(gtk::Align::Start)
-        .xalign(0.0)
-        .css_classes(["caption-heading"])
-        .build()
-}
-
-/// To / Cc / In-Reply-To rows, shared by the revealer and the fullscreen
-/// dialog through the state's EntryBuffers. The field labels join `titles`
-/// so the entry column lines up with the caller's subject row.
-fn build_headers_grid(state: &ComposerState, titles: &gtk::SizeGroup) -> gtk::Grid {
-    let grid = gtk::Grid::builder()
-        .column_spacing(12)
-        .row_spacing(6)
-        .build();
-
-    let fields = [
-        ("To", &state.to),
-        ("Cc", &state.cc),
-        ("In-Reply-To", &state.in_reply_to),
-    ];
-    for (row, (name, buffer)) in fields.into_iter().enumerate() {
-        let label = build_field_label(name);
-        titles.add_widget(&label);
-        let entry = gtk::Entry::builder().buffer(buffer).hexpand(true).build();
-        strip_extra_context_items(&entry);
-        grid.attach(&label, 0, row as i32, 1, 1);
-        grid.attach(&entry, 1, row as i32, 1, 1);
-    }
-
-    grid
-}
-
-/// A monospace body editor with a dim 72-column ruler overlaid at the wrap
-/// margin. `compact` limits the height so the sticky bar stays small; the
-/// fullscreen dialog passes false and lets the editor fill the dialog.
+/// A monospace editor over the raw message, with a dim 72-column ruler overlaid
+/// at the wrap margin. `compact` limits the height so the sticky bar stays
+/// small; the fullscreen dialog passes false and lets the editor fill it.
 fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> (gtk::Overlay, gtk::TextView) {
     let view = gtk::TextView::builder()
         .buffer(buffer)
@@ -714,8 +740,8 @@ fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> (gtk::Overlay, 
     overlay.set_clip_overlay(&ruler, true);
 
     // Position the ruler at the 72nd column. Measuring a full 72-char string
-    // avoids accumulating per-char rounding error, and the position must
-    // track the horizontal scroll offset: the overlay is fixed in viewport
+    // avoids accumulating per-char rounding error, and the position must track
+    // the horizontal scroll offset: the overlay is fixed in viewport
     // coordinates while the unwrapped text scrolls underneath it.
     let position_ruler: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
@@ -732,8 +758,8 @@ fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> (gtk::Overlay, 
             ruler.set_margin_start(offset.max(0));
         }
     ));
-    // On map the pango context carries the real font; the scroll handler
-    // keeps the ruler on column 72 as the text pans under the overlay.
+    // On map the pango context carries the real font; the scroll handler keeps
+    // the ruler on column 72 as the text pans under the overlay.
     view.connect_map(glib::clone!(
         #[strong]
         position_ruler,
@@ -767,8 +793,8 @@ fn build_insert_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::M
             let Some(kind) = param.and_then(|p| p.str()) else {
                 return;
             };
-            let trailer = format!("{kind}: {IDENTITY}");
-            state.replace_body_text(&append_trailer(&state.body_text(), &trailer));
+            let trailer = format!("{kind}: {}", sender_identity());
+            state.replace_body(&append_trailer(&state.body_text(), &trailer));
         }
     ));
     group.add_action(&trailer);
@@ -788,7 +814,7 @@ fn build_insert_button(state: &ComposerState, action_scope: &gtk::Box) -> gtk::M
             move |_, _| {
                 let signature = settings::reply_signature();
                 if !signature.is_empty() {
-                    state.replace_body_text(&append_signature(&state.body_text(), &signature));
+                    state.replace_body(&append_signature(&state.body_text(), &signature));
                 }
             }
         ));
@@ -817,7 +843,8 @@ fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
         #[strong]
         state,
         move |_| {
-            state.replace_body_text(&rewrap(&state.body_text(), WRAP_WIDTH));
+            // Rewrap only the body; the headers are never wrapped.
+            state.replace_body(&rewrap(&state.body_text(), WRAP_WIDTH));
         }
     ));
     button
@@ -852,9 +879,9 @@ fn build_fullscreen_toggle(state: &ComposerState) -> gtk::ToggleButton {
                         toggle.set_active(false);
                     }
                 ));
-                // Store the dialog before presenting: connect_closed clears
-                // the slot, so storing after present() would re-fill it with
-                // an already-closed dialog if close ever fired synchronously.
+                // Store the dialog before presenting: connect_closed clears the
+                // slot, so storing after present() would re-fill it with an
+                // already-closed dialog if close ever fired synchronously.
                 open_dialog.replace(Some(dialog.clone()));
                 dialog.present(Some(toggle));
             } else if let Some(dialog) = open_dialog.take() {
@@ -866,31 +893,9 @@ fn build_fullscreen_toggle(state: &ComposerState) -> gtk::ToggleButton {
     toggle
 }
 
-/// The focused-editing view: same buffers, roomier layout, headers always
-/// shown. Closing it lands back on the sticky bar with every edit intact.
+/// The focused-editing view: the same document buffer, roomier layout. Closing
+/// it lands back on the sticky bar with every edit intact.
 fn build_fullscreen_dialog(state: &ComposerState) -> adw::Dialog {
-    let subject_entry = gtk::Entry::builder()
-        .buffer(&state.subject)
-        .placeholder_text("Subject")
-        .hexpand(true)
-        .build();
-    strip_extra_context_items(&subject_entry);
-    setup_subject_revert(&subject_entry, &state.initial);
-
-    // Same title-column trick as the compact composer: the Subject label
-    // shares a SizeGroup with the grid labels so the entries align. The
-    // row spacing already matches the grid's column spacing (12).
-    let titles = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
-    let subject_label = build_field_label("Subject");
-    titles.add_widget(&subject_label);
-
-    let subject_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(12)
-        .build();
-    subject_row.append(&subject_label);
-    subject_row.append(&subject_entry);
-
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -899,9 +904,7 @@ fn build_fullscreen_dialog(state: &ComposerState) -> adw::Dialog {
         .margin_start(12)
         .margin_end(12)
         .build();
-    content.append(&subject_row);
-    content.append(&build_headers_grid(state, &titles));
-    content.append(&build_body_editor(&state.body, false).0);
+    content.append(&build_body_editor(&state.document, false).0);
 
     let clamp = adw::Clamp::builder()
         .maximum_size(1100)
@@ -921,12 +924,7 @@ fn build_fullscreen_dialog(state: &ComposerState) -> adw::Dialog {
         .build()
 }
 
-fn build_discard_button(
-    state: &ComposerState,
-    details_toggle: &gtk::ToggleButton,
-    preview_toggle: &gtk::ToggleButton,
-    expand_toggle: &gtk::ToggleButton,
-) -> gtk::Button {
+fn build_discard_button(state: &ComposerState, expand_toggle: &gtk::ToggleButton) -> gtk::Button {
     let button = gtk::Button::builder()
         .icon_name("user-trash-symbolic")
         .tooltip_text("Discard")
@@ -936,10 +934,6 @@ fn build_discard_button(
     button.connect_clicked(glib::clone!(
         #[strong]
         state,
-        #[weak]
-        details_toggle,
-        #[weak]
-        preview_toggle,
         #[weak]
         expand_toggle,
         move |button| {
@@ -957,15 +951,9 @@ fn build_discard_button(
                     #[strong]
                     state,
                     #[weak]
-                    details_toggle,
-                    #[weak]
-                    preview_toggle,
-                    #[weak]
                     expand_toggle,
                     move |_, _| {
                         state.reset();
-                        details_toggle.set_active(false);
-                        preview_toggle.set_active(false);
                         expand_toggle.set_active(false);
                     }
                 ),
@@ -980,6 +968,19 @@ fn build_discard_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn body_start_offset_lands_just_after_the_separator() {
+        // The body starts right after the blank line that ends the headers.
+        let doc = "From: a@b\nTo: c@d\n\nbody\n";
+        let offset = body_start_offset(doc);
+        assert_eq!(
+            doc.chars().skip(offset as usize).collect::<String>(),
+            "body\n"
+        );
+        // No blank line: the whole document is headers, so the offset is its end.
+        assert_eq!(body_start_offset("From: a@b\n"), 10);
+    }
 
     #[test]
     fn rewrap_wraps_long_lines_at_word_boundaries() {
@@ -1084,28 +1085,5 @@ mod tests {
         assert_eq!(reply_subject("[PATCH] fix"), "Re: [PATCH] fix");
         assert_eq!(reply_subject("Re: [PATCH] fix"), "Re: [PATCH] fix");
         assert_eq!(reply_subject("RE: shouting"), "RE: shouting");
-    }
-
-    #[test]
-    fn assemble_raw_skips_empty_optional_headers() {
-        let raw = assemble_raw("a@b", "", "Subj", "", "body", None);
-        assert_eq!(
-            raw,
-            format!("From: {IDENTITY}\nTo: a@b\nSubject: Subj\n\nbody")
-        );
-        let full = assemble_raw("a@b", "c@d", "Subj", "<id@x>", "body", None);
-        assert!(full.contains("\nCc: c@d\n"));
-        assert!(full.contains("\nIn-Reply-To: <id@x>\n\nbody"));
-    }
-
-    #[test]
-    fn assemble_raw_advertises_the_user_agent_when_asked() {
-        // The header rides in the block just before the body, and is omitted
-        // entirely when the user has opted out (`None`).
-        let with = assemble_raw("a@b", "", "Subj", "", "body", Some("koshi/1.2.3"));
-        assert!(with.contains("\nUser-Agent: koshi/1.2.3\n\nbody"));
-
-        let without = assemble_raw("a@b", "", "Subj", "", "body", None);
-        assert!(!without.contains("User-Agent"));
     }
 }

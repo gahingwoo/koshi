@@ -85,9 +85,6 @@ fn build_content(
             "Koshi reads your name, email, and SMTP settings from git. \
              Configure git send-email to see them here.",
         ));
-        let group = adw::PreferencesGroup::new();
-        group.add(&account_settings_row(popover));
-        root.append(&group);
         return root.upcast();
     }
 
@@ -98,7 +95,9 @@ fn build_content(
     if let Some(transport) = build_transport(profile) {
         root.append(&transport);
     }
-    root.append(&build_actions(popover, button, profile));
+    if let Some(actions) = build_actions(popover, button, profile) {
+        root.append(&actions);
+    }
 
     root.upcast()
 }
@@ -246,61 +245,46 @@ fn encryption_label(value: &str) -> String {
     }
 }
 
-/// The lead-in rows: "Sending details" (opens the config dialog, only when
-/// there is config to show) and "Account Settings".
+/// The "Sending details" row, which opens the config dialog. Shown only when
+/// there is git send-email config to show.
 fn build_actions(
     popover: &gtk::Popover,
     button: &gtk::MenuButton,
     profile: &Profile,
-) -> gtk::Widget {
-    let group = adw::PreferencesGroup::new();
-
-    if !profile.effective_sendemail().is_empty() {
-        let row = adw::ActionRow::builder()
-            .title("Sending details")
-            .subtitle("SMTP and git send-email options")
-            .activatable(true)
-            .build();
-        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-
-        let profile = profile.clone();
-        row.connect_activated(glib::clone!(
-            #[weak]
-            popover,
-            #[weak]
-            button,
-            move |_| {
-                let dialog = build_sending_dialog(&profile);
-                // Present on the top-level window (a stable widget) and only
-                // then dismiss the popover. Presenting relative to the row
-                // inside the closing popover serialises the dialog behind the
-                // popover's dismissal grab/animation, which is the source of
-                // the open lag; the window is always mapped, so it does not.
-                dialog.present(button.root().and_downcast::<gtk::Window>().as_ref());
-                popover.popdown();
-            }
-        ));
-        group.add(&row);
+) -> Option<gtk::Widget> {
+    if profile.effective_sendemail().is_empty() {
+        return None;
     }
 
-    group.add(&account_settings_row(popover));
-    group.upcast()
-}
+    let group = adw::PreferencesGroup::new();
 
-/// An "Account Settings" row wired to the existing `app.preferences` action.
-fn account_settings_row(popover: &gtk::Popover) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title("Account Settings")
+        .title("Sending details")
+        .subtitle("SMTP and git send-email options")
         .activatable(true)
-        .action_name("app.preferences")
         .build();
     row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+
+    let profile = profile.clone();
     row.connect_activated(glib::clone!(
         #[weak]
         popover,
-        move |_| popover.popdown()
+        #[weak]
+        button,
+        move |_| {
+            let dialog = build_sending_dialog(&profile);
+            // Present on the top-level window (a stable widget) and only
+            // then dismiss the popover. Presenting relative to the row
+            // inside the closing popover serialises the dialog behind the
+            // popover's dismissal grab/animation, which is the source of
+            // the open lag; the window is always mapped, so it does not.
+            dialog.present(button.root().and_downcast::<gtk::Window>().as_ref());
+            popover.popdown();
+        }
     ));
-    row
+    group.add(&row);
+
+    Some(group.upcast())
 }
 
 /// The full git-send-email configuration, split into Server / Addressing /

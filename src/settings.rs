@@ -101,6 +101,53 @@ fn write_key(key: &str, new: serde_json::Value) {
     }
 }
 
+/// Koshi's default gap between subscription polls, in minutes.
+pub const DEFAULT_POLL_INTERVAL_MINUTES: u32 = 5;
+
+/// The narrowest and widest poll interval the Preferences spinner offers:
+/// every minute at the eager end, once a day at the lazy end.
+pub const MIN_POLL_INTERVAL_MINUTES: u32 = 1;
+pub const MAX_POLL_INTERVAL_MINUTES: u32 = 1440;
+
+/// How often the watcher refetches each subscribed thread, in minutes. Defaults
+/// to [`DEFAULT_POLL_INTERVAL_MINUTES`] and is clamped to the spinner's range so
+/// a hand-edited store can't schedule a zero-second (busy-loop) poll.
+pub fn poll_interval_minutes() -> u32 {
+    let stored = STORE_PATH
+        .with_borrow(|path| path.clone())
+        .and_then(|path| fs::read_to_string(&path).ok())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .as_ref()
+        .and_then(|value| value.get("pollIntervalMinutes"))
+        .and_then(serde_json::Value::as_u64);
+    match stored {
+        Some(minutes) => {
+            (minutes as u32).clamp(MIN_POLL_INTERVAL_MINUTES, MAX_POLL_INTERVAL_MINUTES)
+        }
+        None => DEFAULT_POLL_INTERVAL_MINUTES,
+    }
+}
+
+/// Persist the subscription poll interval, preserving any other settings
+/// already in the file.
+pub fn set_poll_interval_minutes(minutes: u32) {
+    let Some(path) = STORE_PATH.with_borrow(|path| path.clone()) else {
+        return;
+    };
+    let mut value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    value["pollIntervalMinutes"] = serde_json::Value::from(minutes);
+    if let Err(err) = write_atomically(&path, &value.to_string()) {
+        eprintln!(
+            "koshi: failed to save settings to {}: {err}",
+            path.display()
+        );
+    }
+}
+
 /// Write via a temp file and rename so a crash mid-write can't truncate the
 /// store.
 fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -201,6 +248,30 @@ mod tests {
         assert!(!send_user_agent());
         set_send_user_agent(true);
         assert!(send_user_agent());
+    }
+
+    #[test]
+    fn poll_interval_defaults_without_a_store() {
+        assert_eq!(poll_interval_minutes(), DEFAULT_POLL_INTERVAL_MINUTES);
+    }
+
+    #[test]
+    fn poll_interval_survives_a_reload() {
+        let store = ScratchStore::new("settings-poll");
+        init(store.path());
+        set_poll_interval_minutes(15);
+        assert_eq!(poll_interval_minutes(), 15);
+    }
+
+    #[test]
+    fn poll_interval_is_clamped_to_the_spinner_range() {
+        let store = ScratchStore::new("settings-poll-clamp");
+        init(store.path());
+        // A hand-edited store must never schedule a zero-minute busy loop.
+        fs::write(store.path(), r#"{"pollIntervalMinutes": 0}"#).unwrap();
+        assert_eq!(poll_interval_minutes(), MIN_POLL_INTERVAL_MINUTES);
+        fs::write(store.path(), r#"{"pollIntervalMinutes": 99999}"#).unwrap();
+        assert_eq!(poll_interval_minutes(), MAX_POLL_INTERVAL_MINUTES);
     }
 
     #[test]

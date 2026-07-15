@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// A subscribed thread, keyed by the Message-ID of the message it was
-/// subscribed from. A subscription marks a thread to be watched so a later
-/// arrival on it can raise a notification (the watcher is future work; for now
-/// the store just records the choice).
+/// subscribed from. A subscription marks a thread to be watched: the
+/// background watcher ([`crate::watcher`]) refetches it on an interval and
+/// raises a notification for every message it has not seen before.
 #[derive(Clone)]
 pub struct Subscription {
     pub message_id: String,
@@ -13,6 +13,11 @@ pub struct Subscription {
     pub date: String,
     /// The lore list the mail was opened from, used to fetch it again.
     pub list: String,
+    /// Message-IDs the watcher has already accounted for on this thread. Empty
+    /// on a fresh subscription: the watcher's first poll seeds it with whatever
+    /// the thread holds *now* and stays silent, so subscribing never dumps the
+    /// existing backlog as notifications — only genuinely new arrivals do.
+    pub seen: Vec<String>,
 }
 
 thread_local! {
@@ -41,6 +46,18 @@ fn load(path: &Path) -> Option<Vec<Subscription>> {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     };
+    let strings = |item: &serde_json::Value, key: &str| {
+        item.get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let mails = value
         .get("mails")
         .and_then(serde_json::Value::as_array)
@@ -53,6 +70,9 @@ fn load(path: &Path) -> Option<Vec<Subscription>> {
                 subject: text(item, "subject")?,
                 date: text(item, "date")?,
                 list: text(item, "list")?,
+                // Absent on subscriptions written by an older Koshi; an empty
+                // seen list just means the next poll reseeds the baseline.
+                seen: strings(item, "seen"),
             })
         })
         .collect();
@@ -71,6 +91,7 @@ fn save() {
                     "subject": sub.subject,
                     "date": sub.date,
                     "list": sub.list,
+                    "seen": sub.seen,
                 })
             })
             .collect()
@@ -118,6 +139,29 @@ pub fn toggle(sub: Subscription) -> bool {
     subscribed
 }
 
+/// A snapshot of every current subscription, for the watcher to poll.
+pub fn all() -> Vec<Subscription> {
+    SUBSCRIPTIONS.with_borrow(|subs| subs.clone())
+}
+
+/// Replace the seen-Message-ID set of the subscription keyed by `message_id`
+/// and persist it, so the watcher only ever notifies once per arrival. A no-op
+/// if the subscription was removed while a poll was in flight.
+pub fn set_seen(message_id: &str, seen: Vec<String>) {
+    let changed = SUBSCRIPTIONS.with_borrow_mut(|subs| {
+        match subs.iter_mut().find(|sub| sub.message_id == message_id) {
+            Some(sub) => {
+                sub.seen = seen;
+                true
+            }
+            None => false,
+        }
+    });
+    if changed {
+        save();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,11 +172,8 @@ mod tests {
             subject: format!("subject for {id}"),
             date: "Thu, 3 Jul 2026 12:00:00 +0000".to_string(),
             list: "lkml".to_string(),
+            seen: Vec::new(),
         }
-    }
-
-    fn all() -> Vec<Subscription> {
-        SUBSCRIPTIONS.with_borrow(|subs| subs.clone())
     }
 
     // The store is thread-local and each #[test] runs on its own thread, so
@@ -212,6 +253,33 @@ mod tests {
         assert_eq!(reloaded.len(), 1);
         assert_eq!(reloaded[0].subject, "subject for <p@example>");
         assert_eq!(reloaded[0].list, "lkml");
+    }
+
+    #[test]
+    fn seen_ids_are_recorded_and_survive_a_reload() {
+        let store = ScratchStore::new("subscriptions-seen-survive");
+        init(store.path());
+        toggle(sub("<s@example>"));
+        set_seen(
+            "<s@example>",
+            vec!["<a@x>".to_string(), "<b@x>".to_string()],
+        );
+
+        SUBSCRIPTIONS.set(Vec::new());
+        init(store.path());
+
+        let reloaded = all();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].seen, vec!["<a@x>", "<b@x>"]);
+    }
+
+    #[test]
+    fn set_seen_on_a_missing_subscription_is_a_noop() {
+        let store = ScratchStore::new("subscriptions-seen-missing");
+        init(store.path());
+        // Nothing subscribed; must not panic or create a phantom entry.
+        set_seen("<gone@example>", vec!["<a@x>".to_string()]);
+        assert!(all().is_empty());
     }
 
     #[test]

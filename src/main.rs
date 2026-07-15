@@ -15,6 +15,7 @@ mod settings;
 mod subscriptions;
 mod thread_list_page;
 mod thread_page;
+mod watcher;
 mod window_state;
 
 use std::cell::RefCell;
@@ -51,7 +52,7 @@ fn main() -> glib::ExitCode {
     gio::resources_register_include!("koshi.gresource").expect("failed to register resources");
 
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_startup(|_| {
+    app.connect_startup(|app| {
         let data_dir = glib::user_data_dir().join("koshi");
         favorites::init(data_dir.join("favorites.json"));
         subscriptions::init(data_dir.join("subscriptions.json"));
@@ -65,6 +66,9 @@ fn main() -> glib::ExitCode {
         // is installed its desktop file points the shell at the same icon; this
         // covers the uninstalled `cargo run` case and titlebar fallbacks.
         gtk::Window::set_default_icon_name(APP_ICON);
+        // Start polling subscribed threads for new mail (stores are initialised
+        // above, so the first tick sees the persisted subscriptions).
+        watcher::start(app);
     });
     app.connect_activate(build_ui);
     app.run()
@@ -753,6 +757,7 @@ fn show_preferences(app: &adw::Application) {
         .build();
     page.add(&build_replies_group());
     page.add(&build_signature_group());
+    page.add(&build_notifications_group());
     page.add(&build_privacy_group());
 
     let dialog = adw::PreferencesDialog::new();
@@ -836,6 +841,37 @@ fn build_signature_group() -> adw::PreferencesGroup {
         let (start, end) = buffer.bounds();
         settings::set_signature(&buffer.text(&start, &end, false));
     });
+
+    group
+}
+
+/// The Preferences group for subscription notifications: how often Koshi
+/// refetches each subscribed thread to look for new replies. Lower is more
+/// responsive at the cost of more requests to lore; the value is in minutes and
+/// bounded by the settings module's clamp.
+fn build_notifications_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Notifications")
+        .description("Koshi notifies you of new replies on threads you subscribe to.")
+        .build();
+
+    let adjustment = gtk::Adjustment::new(
+        settings::poll_interval_minutes() as f64,
+        settings::MIN_POLL_INTERVAL_MINUTES as f64,
+        settings::MAX_POLL_INTERVAL_MINUTES as f64,
+        1.0,
+        5.0,
+        0.0,
+    );
+    let row = adw::SpinRow::builder()
+        .title("Check for new replies")
+        .subtitle("How often to poll subscribed threads, in minutes.")
+        .adjustment(&adjustment)
+        .build();
+    row.connect_value_notify(|row| {
+        settings::set_poll_interval_minutes(row.value() as u32);
+    });
+    group.add(&row);
 
     group
 }

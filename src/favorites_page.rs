@@ -143,6 +143,8 @@ fn build_subscribe_button(fav: &Favorite) -> gtk::Button {
         subject: fav.subject.clone(),
         date: fav.date.clone(),
         list: fav.list.clone(),
+        // The watcher seeds the baseline on its first poll.
+        seen: Vec::new(),
     };
     let button = new_bell_button(subscriptions::is_subscribed(&fav.message_id));
     button.connect_clicked(glib::clone!(

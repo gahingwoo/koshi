@@ -796,6 +796,34 @@ fn parse_thread(mbox: &[u8]) -> Vec<Mail> {
     in_thread_order(mails)
 }
 
+/// The minimum the subscription watcher needs from a fetched thread: each
+/// message's Message-ID (to spot arrivals it has not seen), plus the author
+/// and subject to title and body its notification. Messages without a
+/// Message-ID are skipped — the watcher keys everything by Message-ID and could
+/// neither dedupe nor remember them.
+pub(crate) struct MessageDigest {
+    pub message_id: String,
+    pub author: String,
+    pub subject: String,
+}
+
+/// Reduce a thread mbox to one [`MessageDigest`] per message it can key, in the
+/// thread's own display order, for [`crate::watcher`] to diff against a
+/// subscription's seen set.
+pub(crate) fn thread_message_digests(mbox: &[u8]) -> Vec<MessageDigest> {
+    parse_thread(mbox)
+        .into_iter()
+        .filter_map(|mail| {
+            let message_id = mail.message_id?.trim().trim_matches(['<', '>']).to_string();
+            (!message_id.is_empty()).then(|| MessageDigest {
+                author: author_name(&mail.from).to_string(),
+                subject: mail.subject,
+                message_id,
+            })
+        })
+        .collect()
+}
+
 /// Reorder a thread into the overview's depth-first display order, so the OP
 /// heads the list and every reply follows the message it answers.
 ///
@@ -1273,6 +1301,8 @@ fn build_thread_content(
             subject: mail.subject.clone(),
             date: mail.date.clone(),
             list: list.to_string(),
+            // The watcher seeds the baseline on its first poll.
+            seen: Vec::new(),
         })
     };
     let subs: Rc<Vec<Option<Subscription>>> =
@@ -3249,6 +3279,8 @@ fn build_subscribe_actions(
         subject: mail.subject.clone(),
         date: mail.date.clone(),
         list: list.to_string(),
+        // The watcher seeds the baseline on its first poll.
+        seen: Vec::new(),
     });
 
     let add = gio::SimpleAction::new("subscribe-add", None);
@@ -3837,6 +3869,40 @@ mod tests {
             thread[1].in_reply_to.as_deref(),
             Some("<20260619-mfd-prcmu-merge-headers-v1-1-8ea0ee23b4d6@kernel.org>")
         );
+    }
+
+    #[test]
+    fn digests_carry_author_subject_and_bracketless_message_id() {
+        let mbox = b"From a@b Thu Jan  1 00:00:00 1970\n\
+                     From: Nika Krasnova <nika@example.moe>\n\
+                     Subject: bleh\n\
+                     Message-ID: <root@example>\n\n\
+                     body\n\
+                     From c@d Thu Jan  1 00:00:00 1970\n\
+                     From: reply-guy@example.org\n\
+                     Subject: Re: bleh\n\
+                     Message-ID: <reply@example>\n\
+                     In-Reply-To: <root@example>\n\n\
+                     ok\n";
+        let digests = thread_message_digests(mbox);
+        assert_eq!(digests.len(), 2);
+        // Author is the From display name; the subject is verbatim; the
+        // Message-ID is stored without its angle brackets.
+        assert_eq!(digests[0].author, "Nika Krasnova");
+        assert_eq!(digests[0].subject, "bleh");
+        assert_eq!(digests[0].message_id, "root@example");
+        // No display name → the bare address stands in as the author.
+        assert_eq!(digests[1].author, "reply-guy@example.org");
+        assert_eq!(digests[1].message_id, "reply@example");
+    }
+
+    #[test]
+    fn digests_skip_messages_without_a_message_id() {
+        let mbox = b"From a@b Thu Jan  1 00:00:00 1970\n\
+                     From: nobody@example.org\n\
+                     Subject: no id here\n\n\
+                     body\n";
+        assert!(thread_message_digests(mbox).is_empty());
     }
 
     #[test]

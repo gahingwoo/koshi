@@ -2557,13 +2557,15 @@ fn build_overview_sidebar(
         row_of_message[message] = row_pos as i32;
     }
 
-    // The highlight marks the message the reader navigated to explicitly — the
-    // opened message on entry, or the message an overview row jumped to — and
-    // holds only until the reader scrolls the thread away from it. It is a fixed
-    // marker, not a scroll-position tracker: the moment the reader scrolls, the
-    // marked row no longer reflects what is on screen, so the marker is dropped
-    // and the overview re-opens with nothing highlighted.
-    let current: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(Some(opened)));
+    // What the highlight marks depends on the view. Single view shows only the
+    // opened message, so that message is always what is on screen — its row
+    // stays highlighted there no matter how far the reader scrolls within it.
+    // Threaded view shows the whole thread, so the highlight is a navigation
+    // marker: it sits on the message an overview row jumped to and holds only
+    // until the reader scrolls the thread away from it (or switches view by
+    // hand), since past that the marked row no longer reflects what is on
+    // screen. `current` is that threaded-view marker; single view ignores it.
+    let current: Rc<Cell<Option<usize>>> = Rc::new(Cell::new(None));
     // Suppresses the clear-on-scroll while a jump (and the view switch it rides
     // on) is still settling — both move the vadjustment on their own.
     let settling = Rc::new(Cell::new(false));
@@ -2578,12 +2580,21 @@ fn build_overview_sidebar(
     let apply_highlight: Rc<dyn Fn()> = Rc::new(glib::clone!(
         #[weak]
         list,
+        #[weak]
+        view_toggle,
         #[strong]
         current,
         #[strong]
         row_of_message,
         move || {
-            match current.get().and_then(|msg| row_of_message.get(msg).copied()) {
+            // Single view (toggle index 0) always highlights the opened
+            // message; threaded view follows the navigation marker.
+            let target = if view_toggle.active() == 0 {
+                Some(opened)
+            } else {
+                current.get()
+            };
+            match target.and_then(|msg| row_of_message.get(msg).copied()) {
                 Some(row_pos) => {
                     if let Some(row) = list.row_at_index(row_pos)
                         && !row.is_selected()
@@ -2683,9 +2694,12 @@ fn build_overview_sidebar(
     ));
 
     // Scrolling the thread away from the marked message drops the marker; the
-    // settling flag lets a jump's own scrolling through untouched.
+    // settling flag lets a jump's own scrolling through untouched. Single view
+    // never clears — its highlight is the one message on screen, not a marker.
     let vadjustment = scrolled.vadjustment();
     vadjustment.connect_value_changed(glib::clone!(
+        #[weak]
+        view_toggle,
         #[strong]
         current,
         #[strong]
@@ -2695,7 +2709,7 @@ fn build_overview_sidebar(
         #[strong]
         apply_highlight,
         move |vadjustment| {
-            if settling.get() || current.get().is_none() {
+            if view_toggle.active() == 0 || settling.get() || current.get().is_none() {
                 return;
             }
             if (vadjustment.value() - anchor.get()).abs() <= 1.0 {
@@ -2705,8 +2719,10 @@ fn build_overview_sidebar(
             apply_highlight();
         }
     ));
-    // A manual view switch changes what is on screen, so it too drops the
-    // marker; the settling flag exempts the switch the overview jump rides on.
+    // A manual view switch changes what is on screen: drop any threaded marker
+    // (the settling flag exempts the switch the overview jump rides on) and
+    // re-apply, so single view lands its highlight on the opened message and
+    // threaded view clears until the next jump.
     view_toggle.connect_active_notify(glib::clone!(
         #[strong]
         current,
@@ -2715,10 +2731,9 @@ fn build_overview_sidebar(
         #[strong]
         apply_highlight,
         move |_| {
-            if settling.get() || current.get().is_none() {
-                return;
+            if !settling.get() {
+                current.set(None);
             }
-            current.set(None);
             apply_highlight();
         }
     ));

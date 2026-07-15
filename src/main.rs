@@ -740,6 +740,7 @@ fn show_preferences(app: &adw::Application) {
         .icon_name("emblem-system-symbolic")
         .build();
     page.add(&build_signature_group());
+    page.add(&build_privacy_group());
 
     let dialog = adw::PreferencesDialog::new();
     dialog.add(&page);
@@ -790,6 +791,26 @@ fn build_signature_group() -> adw::PreferencesGroup {
         let (start, end) = buffer.bounds();
         settings::set_signature(&buffer.text(&start, &end, false));
     });
+
+    group
+}
+
+/// The Preferences group for what Koshi reveals about itself in outgoing mail.
+/// For now a single switch: whether replies carry a `User-Agent` header naming
+/// Koshi (and its version). On by default; turning it off keeps the header out
+/// of every message so the client stays anonymous.
+fn build_privacy_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Privacy").build();
+
+    let row = adw::SwitchRow::builder()
+        .title("Identify Koshi in sent mail")
+        .subtitle("Add a User-Agent header naming Koshi to your replies.")
+        .active(settings::send_user_agent())
+        .build();
+    row.connect_active_notify(|row| {
+        settings::set_send_user_agent(row.is_active());
+    });
+    group.add(&row);
 
     group
 }

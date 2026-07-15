@@ -10,6 +10,10 @@ use crate::settings;
 /// Placeholder identity until account support exists.
 const IDENTITY: &str = "nika <nika@nikableh.moe>";
 
+/// The `User-Agent` header value announcing Koshi as the mail client, e.g.
+/// `koshi/0.1.0`. Sending it is opt-out via [`crate::settings::send_user_agent`].
+const USER_AGENT: &str = concat!("koshi/", env!("CARGO_PKG_VERSION"));
+
 const WRAP_WIDTH: usize = 72;
 
 const TRAILERS: [&str; 4] = ["Reviewed-by", "Acked-by", "Tested-by", "Signed-off-by"];
@@ -86,6 +90,7 @@ impl ComposerState {
             &self.subject.text(),
             &self.in_reply_to.text(),
             &self.body_text(),
+            settings::send_user_agent().then_some(USER_AGENT),
         )
     }
 
@@ -266,7 +271,16 @@ fn rewrap(text: &str, width: usize) -> String {
 }
 
 /// Assemble the raw RFC 5322-style reply shown by the Raw Preview toggle.
-fn assemble_raw(to: &str, cc: &str, subject: &str, in_reply_to: &str, body: &str) -> String {
+/// `user_agent` is the `User-Agent` value to advertise, or `None` when the user
+/// has turned client identification off in Preferences.
+fn assemble_raw(
+    to: &str,
+    cc: &str,
+    subject: &str,
+    in_reply_to: &str,
+    body: &str,
+    user_agent: Option<&str>,
+) -> String {
     let mut raw = format!("From: {IDENTITY}\nTo: {to}\n");
     if !cc.is_empty() {
         raw.push_str("Cc: ");
@@ -279,6 +293,11 @@ fn assemble_raw(to: &str, cc: &str, subject: &str, in_reply_to: &str, body: &str
     if !in_reply_to.is_empty() {
         raw.push_str("In-Reply-To: ");
         raw.push_str(in_reply_to);
+        raw.push('\n');
+    }
+    if let Some(user_agent) = user_agent {
+        raw.push_str("User-Agent: ");
+        raw.push_str(user_agent);
         raw.push('\n');
     }
     raw.push('\n');
@@ -1069,13 +1088,24 @@ mod tests {
 
     #[test]
     fn assemble_raw_skips_empty_optional_headers() {
-        let raw = assemble_raw("a@b", "", "Subj", "", "body");
+        let raw = assemble_raw("a@b", "", "Subj", "", "body", None);
         assert_eq!(
             raw,
             format!("From: {IDENTITY}\nTo: a@b\nSubject: Subj\n\nbody")
         );
-        let full = assemble_raw("a@b", "c@d", "Subj", "<id@x>", "body");
+        let full = assemble_raw("a@b", "c@d", "Subj", "<id@x>", "body", None);
         assert!(full.contains("\nCc: c@d\n"));
         assert!(full.contains("\nIn-Reply-To: <id@x>\n\nbody"));
+    }
+
+    #[test]
+    fn assemble_raw_advertises_the_user_agent_when_asked() {
+        // The header rides in the block just before the body, and is omitted
+        // entirely when the user has opted out (`None`).
+        let with = assemble_raw("a@b", "", "Subj", "", "body", Some("koshi/1.2.3"));
+        assert!(with.contains("\nUser-Agent: koshi/1.2.3\n\nbody"));
+
+        let without = assemble_raw("a@b", "", "Subj", "", "body", None);
+        assert!(!without.contains("User-Agent"));
     }
 }

@@ -66,6 +66,42 @@ pub fn set_signature(signature: &str) {
     }
 }
 
+/// Whether outgoing replies carry a `User-Agent` header identifying Koshi as
+/// the mail client. Defaults to `true`: Koshi announces itself unless the user
+/// opts out in Preferences.
+pub fn send_user_agent() -> bool {
+    let Some(path) = STORE_PATH.with_borrow(|path| path.clone()) else {
+        return true;
+    };
+    fs::read_to_string(&path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .as_ref()
+        .and_then(|value| value.get("sendUserAgent"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+/// Persist whether replies carry a `User-Agent` header, preserving any other
+/// settings already in the file.
+pub fn set_send_user_agent(enabled: bool) {
+    let Some(path) = STORE_PATH.with_borrow(|path| path.clone()) else {
+        return;
+    };
+    let mut value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    value["sendUserAgent"] = serde_json::Value::Bool(enabled);
+    if let Err(err) = write_atomically(&path, &value.to_string()) {
+        eprintln!(
+            "koshi: failed to save settings to {}: {err}",
+            path.display()
+        );
+    }
+}
+
 /// Write via a temp file and rename so a crash mid-write can't truncate the
 /// store.
 fn write_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -129,6 +165,33 @@ mod tests {
         init(store.path());
         set_signature("");
         assert_eq!(signature().as_deref(), Some(""));
+    }
+
+    #[test]
+    fn user_agent_defaults_on_without_a_store() {
+        // A fresh install (or a store that never recorded the choice) announces
+        // Koshi.
+        assert!(send_user_agent());
+    }
+
+    #[test]
+    fn user_agent_choice_survives_a_reload() {
+        let store = ScratchStore::new("settings-ua");
+        init(store.path());
+        set_send_user_agent(false);
+        assert!(!send_user_agent());
+        set_send_user_agent(true);
+        assert!(send_user_agent());
+    }
+
+    #[test]
+    fn set_user_agent_preserves_the_signature() {
+        let store = ScratchStore::new("settings-ua-preserve");
+        init(store.path());
+        set_signature("sig");
+        set_send_user_agent(false);
+        assert_eq!(signature().as_deref(), Some("sig"));
+        assert!(!send_user_agent());
     }
 
     #[test]

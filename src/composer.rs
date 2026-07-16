@@ -670,6 +670,13 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
     let sheet = adw::BottomSheet::new();
     sheet.set_modal(false);
     sheet.set_full_width(false);
+    // The thread pane keeps a bottom margin the height of the sheet (see
+    // thread_page's sheet-height handler), and a non-full-width sheet no
+    // longer covers that strip edge to edge: the window background showed
+    // through as grey bands flanking the card. Painting the sheet widget
+    // itself view-colored fills the strip with the same background as the
+    // thread's list view above it.
+    sheet.add_css_class("view");
     let surface = Surface::Inline(sheet.clone());
 
     let root = gtk::Box::builder()

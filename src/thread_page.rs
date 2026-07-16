@@ -1783,10 +1783,34 @@ fn build_thread_content(
     let sheet = composer.widget();
     sheet.set_content(Some(&pane));
     sheet.set_vexpand(true);
+    // sheet-height is notified from inside the sheet's size_allocate, before
+    // it allocates its content — setting the margin right there invalidates
+    // the content's measure mid-allocation (a Gtk-WARNING per frame), so the
+    // update waits for an idle between layout passes. One pending update at a
+    // time: the idle reads the current height, so coalescing loses nothing.
+    let pending = Rc::new(Cell::new(false));
     sheet.connect_sheet_height_notify(glib::clone!(
+        #[strong]
+        pending,
         #[weak]
         scrolled,
-        move |sheet| scrolled.set_margin_bottom(sheet.sheet_height())
+        move |sheet| {
+            if pending.replace(true) {
+                return;
+            }
+            glib::idle_add_local_once(glib::clone!(
+                #[strong]
+                pending,
+                #[weak]
+                scrolled,
+                #[weak]
+                sheet,
+                move || {
+                    pending.set(false);
+                    scrolled.set_margin_bottom(sheet.sheet_height());
+                }
+            ));
+        }
     ));
 
     // The title stays pinned above the scrolling list rather than scrolling

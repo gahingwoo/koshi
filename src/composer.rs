@@ -665,8 +665,11 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
     state.document.connect_changed(highlight::refresh);
 
     // The sheet is built first so the toolbar's dismissing buttons can close it.
+    // Not full-width: the sheet card itself keeps the thread's reading width
+    // (see the width anchor below) instead of spanning the whole window.
     let sheet = adw::BottomSheet::new();
     sheet.set_modal(false);
+    sheet.set_full_width(false);
     let surface = Surface::Inline(sheet.clone());
 
     let root = gtk::Box::builder()
@@ -719,7 +722,26 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         move |_, _, _, _| sheet.set_open(false)
     ));
     handle_target.add_controller(handle_click);
-    let sheet_content = gtk::Overlay::builder().child(&editor_clamp).build();
+
+    // A non-full-width sheet card is allocated its content's *natural* width
+    // (clamped to the window), but the editor's natural width wanders with the
+    // scrolled text inside it. This invisible anchor — an empty paintable with
+    // an intrinsic width of the mail column's maximum, free to shrink — pins
+    // the card's natural width to the thread's reading width without raising
+    // its minimum, so narrow windows still get a full-width sheet: the card
+    // ends up min(window, 1100) wide and centered, same as the clamps above.
+    let width_anchor = gtk::Picture::builder()
+        .paintable(&gdk::Paintable::new_empty(1100, 0))
+        .can_shrink(true)
+        .can_target(false)
+        .build();
+    let sheet_body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    sheet_body.append(&editor_clamp);
+    sheet_body.append(&width_anchor);
+
+    let sheet_content = gtk::Overlay::builder().child(&sheet_body).build();
     sheet_content.add_overlay(&handle_target);
     sheet.set_sheet(Some(&sheet_content));
 

@@ -12,6 +12,10 @@ repository = "https://github.com/nikableh/koshi"
 [dependencies]
 gtk = { package = "gtk4", version = "0.11", features = ["v4_18"] }
 adw = { package = "libadwaita", version = "0.9", features = ["v1_8"] }
+# Already in the tree via gtk; listed directly only to enable its bridge that
+# routes `log` records into GLib logging (GlibLogger).
+glib = { version = "0.22", features = ["log"] }
+log = "0.4"
 mailparse = "0.16"
 soup = { package = "soup3", version = "0.9" }
 flate2 = "1"

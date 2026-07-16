@@ -39,7 +39,7 @@ fn load(path: &Path) -> Option<(Vec<Favorite>, Vec<FavoriteInbox>)> {
     let json = fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&json)
         .inspect_err(|err| {
-            eprintln!("koshi: ignoring malformed {}: {err}", path.display());
+            log::warn!("ignoring malformed {}: {err}", path.display());
         })
         .ok()?;
     let items = |key: &str| {
@@ -105,10 +105,7 @@ fn save() {
     });
     let value = serde_json::json!({ "mails": mails, "inboxes": inboxes });
     if let Err(err) = write_atomically(&path, &value.to_string()) {
-        eprintln!(
-            "koshi: failed to save favorites to {}: {err}",
-            path.display()
-        );
+        log::error!("failed to save favorites to {}: {err}", path.display());
     }
 }
 

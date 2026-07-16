@@ -43,7 +43,20 @@ const APP_ICON: &str = std::cfg_select! {
     _ => { APP_ID }
 };
 
+// Routes `log` records (log::warn! and friends) into GLib logging, so Koshi's
+// messages come out through the same machinery as GTK's own — stderr with a
+// log domain when run from a terminal, the journal under systemd, and debug
+// levels gated by G_MESSAGES_DEBUG.
+static GLIB_LOGGER: glib::GlibLogger = glib::GlibLogger::new(
+    glib::GlibLoggerFormat::Plain,
+    glib::GlibLoggerDomain::CrateTarget,
+);
+
 fn main() -> glib::ExitCode {
+    log::set_logger(&GLIB_LOGGER).expect("no other logger is ever installed");
+    // Pass everything through to GLib and let it decide what to show.
+    log::set_max_level(log::LevelFilter::Debug);
+
     // When Koshi has re-exec'd itself as the GIT_ASKPASS fallback (no standalone
     // helper binary installed), answer git's prompt and exit before any GTK
     // setup — this branch runs as a short-lived password helper.

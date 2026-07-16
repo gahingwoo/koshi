@@ -285,8 +285,8 @@ fn askpass_program() -> io::Result<PathBuf> {
     {
         return Ok(helper);
     }
-    eprintln!(
-        "koshi: {HELPER_BINARY} not installed beside koshi; using the slower \
+    log::warn!(
+        "{HELPER_BINARY} not installed beside koshi; using the slower \
          re-exec askpass fallback (run `cargo build` to build the fast helper)"
     );
     Ok(exe)

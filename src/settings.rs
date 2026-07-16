@@ -76,7 +76,7 @@ fn read_key(key: &str) -> Option<serde_json::Value> {
     let json = fs::read_to_string(&path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&json)
         .inspect_err(|err| {
-            eprintln!("koshi: ignoring malformed {}: {err}", path.display());
+            log::warn!("ignoring malformed {}: {err}", path.display());
         })
         .ok()?;
     value.get(key).cloned()
@@ -94,10 +94,7 @@ fn write_key(key: &str, new: serde_json::Value) {
         .unwrap_or_else(|| serde_json::json!({}));
     value[key] = new;
     if let Err(err) = write_atomically(&path, &value.to_string()) {
-        eprintln!(
-            "koshi: failed to save settings to {}: {err}",
-            path.display()
-        );
+        log::error!("failed to save settings to {}: {err}", path.display());
     }
 }
 
@@ -141,10 +138,7 @@ pub fn set_poll_interval_minutes(minutes: u32) {
         .unwrap_or_else(|| serde_json::json!({}));
     value["pollIntervalMinutes"] = serde_json::Value::from(minutes);
     if let Err(err) = write_atomically(&path, &value.to_string()) {
-        eprintln!(
-            "koshi: failed to save settings to {}: {err}",
-            path.display()
-        );
+        log::error!("failed to save settings to {}: {err}", path.display());
     }
 }
 

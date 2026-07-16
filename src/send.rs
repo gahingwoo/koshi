@@ -79,7 +79,7 @@ pub async fn send(req: Request, parent: &impl IsA<gtk::Widget>) -> io::Result<Ou
     let askpass = crate::askpass::AskpassServer::start(parent);
     match &askpass {
         Ok(server) => server.install(&launcher),
-        Err(error) => eprintln!("koshi: SMTP password prompt unavailable: {error}"),
+        Err(error) => log::warn!("SMTP password prompt unavailable: {error}"),
     }
 
     let osargv: Vec<&std::ffi::OsStr> = argv.iter().map(std::ffi::OsStr::new).collect();

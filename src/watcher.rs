@@ -127,8 +127,8 @@ async fn poll_one(app: &adw::Application, subscription: Subscription) {
         {
             Ok(mbox) => mbox,
             Err(err) => {
-                eprintln!(
-                    "koshi: could not poll subscription {}: {err}",
+                log::warn!(
+                    "could not poll subscription {}: {err}",
                     subscription.message_id
                 );
                 return;
@@ -184,7 +184,7 @@ async fn poll_one(app: &adw::Application, subscription: Subscription) {
 /// shows however Koshi was launched.
 fn notify_new_message(app: &adw::Application, author: &str, subject: &str) {
     let Some(connection) = app.dbus_connection() else {
-        eprintln!("koshi: no session bus; cannot notify about \"{subject}\"");
+        log::warn!("no session bus; cannot notify about \"{subject}\"");
         return;
     };
     // org.freedesktop.Notifications.Notify — signature `susssasa{sv}i`.
@@ -212,7 +212,7 @@ fn notify_new_message(app: &adw::Application, author: &str, subject: &str) {
         gio::Cancellable::NONE,
         |result| {
             if let Err(err) = result {
-                eprintln!("koshi: notification failed: {err}");
+                log::warn!("notification failed: {err}");
             }
         },
     );

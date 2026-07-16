@@ -3829,7 +3829,7 @@ pub(crate) fn launch_uri(widget: &impl IsA<gtk::Widget>, uri: &str) {
     let parent = widget.root().and_downcast::<gtk::Window>();
     gtk::UriLauncher::new(uri).launch(parent.as_ref(), gio::Cancellable::NONE, |result| {
         if let Err(error) = result {
-            eprintln!("Failed to launch URI: {error}");
+            log::warn!("failed to launch URI: {error}");
         }
     });
 }

@@ -28,7 +28,7 @@ pub fn load() -> Option<WindowState> {
     let json = fs::read_to_string(&path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&json)
         .inspect_err(|err| {
-            eprintln!("koshi: ignoring malformed {}: {err}", path.display());
+            log::warn!("ignoring malformed {}: {err}", path.display());
         })
         .ok()?;
     let int = |key: &str| value.get(key).and_then(serde_json::Value::as_i64);
@@ -58,10 +58,7 @@ pub fn save(state: WindowState) {
         "fullscreen": state.fullscreen,
     });
     if let Err(err) = write_atomically(&path, &value.to_string()) {
-        eprintln!(
-            "koshi: failed to save window state to {}: {err}",
-            path.display()
-        );
+        log::error!("failed to save window state to {}: {err}", path.display());
     }
 }
 

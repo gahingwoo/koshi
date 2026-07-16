@@ -342,6 +342,7 @@ dependencies = [
  "glib-sys 0.22.8",
  "gobject-sys 0.22.6",
  "libc",
+ "log",
  "memchr",
  "smallvec",
 ]
@@ -559,9 +560,11 @@ name = "koshi"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "glib 0.22.8",
  "glib-build-tools",
  "gtk4",
  "libadwaita",
+ "log",
  "mailparse",
  "quick-xml",
  "serde_json",
@@ -604,6 +607,12 @@ name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+
+[[package]]
+name = "log"
+version = "0.4.33"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "mailparse"

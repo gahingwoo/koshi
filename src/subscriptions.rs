@@ -39,7 +39,7 @@ fn load(path: &Path) -> Option<Vec<Subscription>> {
     let json = fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&json)
         .inspect_err(|err| {
-            eprintln!("koshi: ignoring malformed {}: {err}", path.display());
+            log::warn!("ignoring malformed {}: {err}", path.display());
         })
         .ok()?;
     let text = |item: &serde_json::Value, key: &str| {
@@ -99,10 +99,7 @@ fn save() {
     });
     let value = serde_json::json!({ "mails": mails });
     if let Err(err) = write_atomically(&path, &value.to_string()) {
-        eprintln!(
-            "koshi: failed to save subscriptions to {}: {err}",
-            path.display()
-        );
+        log::error!("failed to save subscriptions to {}: {err}", path.display());
     }
 }
 

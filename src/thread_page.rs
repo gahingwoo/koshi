@@ -3488,8 +3488,8 @@ pub(crate) fn add_star_and_bell(
         }
     ));
 
-    row.add_suffix(&star);
     row.add_suffix(&bell);
+    row.add_suffix(&star);
 }
 
 /// A flat Reply icon button that retargets the composer to `mail`.

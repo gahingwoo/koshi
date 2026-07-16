@@ -1,4 +1,5 @@
 mod askpass;
+mod cache;
 mod composer;
 mod favorites;
 mod favorites_page;
@@ -822,6 +823,7 @@ fn show_preferences(app: &adw::Application) {
     page.add(&build_signature_group());
     page.add(&build_notifications_group());
     page.add(&build_privacy_group());
+    page.add(&build_cache_group());
 
     let dialog = adw::PreferencesDialog::new();
     dialog.add(&page);
@@ -937,6 +939,128 @@ fn build_notifications_group() -> adw::PreferencesGroup {
     group.add(&row);
 
     group
+}
+
+/// The Preferences group for the downloaded-email cache: where cached threads
+/// live (with a chooser and a reset back to the default), and a destructive
+/// Clear button whose row doubles as the size readout.
+fn build_cache_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Downloaded Emails")
+        .description(
+            "Threads you open are kept on disk so they reopen instantly and stay \
+             readable offline.",
+        )
+        .build();
+
+    // Folder row: subtitle shows the effective folder; a folder button picks a
+    // new one, and an undo button (shown only while an override is active)
+    // reverts to the default. Cached threads are not moved — the cache in the
+    // old folder is simply left behind and everything re-downloads on demand.
+    let folder_row = adw::ActionRow::builder()
+        .title("Cache folder")
+        .subtitle(cache::dir().display().to_string())
+        .build();
+
+    let reset = gtk::Button::builder()
+        .icon_name("edit-undo-symbolic")
+        .tooltip_text("Reset to the default folder")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .visible(settings::cache_dir().is_some())
+        .build();
+
+    let choose = gtk::Button::builder()
+        .icon_name("folder-symbolic")
+        .tooltip_text("Choose a folder")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+
+    // Clear row: the subtitle is the size readout, refreshed by every action
+    // in the group that can change what is on disk.
+    let clear_row = adw::ActionRow::builder()
+        .title("Clear cache")
+        .subtitle(cache_size_label())
+        .build();
+
+    let clear = gtk::Button::builder()
+        .label("Clear")
+        .valign(gtk::Align::Center)
+        .css_classes(["destructive-action"])
+        .build();
+
+    reset.connect_clicked(glib::clone!(
+        #[weak]
+        folder_row,
+        #[weak]
+        clear_row,
+        move |reset| {
+            settings::set_cache_dir(None);
+            reset.set_visible(false);
+            folder_row.set_subtitle(&cache::dir().display().to_string());
+            clear_row.set_subtitle(&cache_size_label());
+        }
+    ));
+
+    choose.connect_clicked(glib::clone!(
+        #[weak]
+        folder_row,
+        #[weak]
+        reset,
+        #[weak]
+        clear_row,
+        move |choose| {
+            let dialog = gtk::FileDialog::builder()
+                .title("Choose Cache Folder")
+                .modal(true)
+                .build();
+            let parent = choose.root().and_downcast::<gtk::Window>();
+            dialog.select_folder(
+                parent.as_ref(),
+                gio::Cancellable::NONE,
+                move |result| {
+                    // A dismissed chooser is not an error worth reporting.
+                    if let Ok(file) = result
+                        && let Some(path) = file.path()
+                    {
+                        settings::set_cache_dir(Some(&path));
+                        reset.set_visible(true);
+                        folder_row.set_subtitle(&cache::dir().display().to_string());
+                        clear_row.set_subtitle(&cache_size_label());
+                    }
+                },
+            );
+        }
+    ));
+
+    clear.connect_clicked(glib::clone!(
+        #[weak]
+        clear_row,
+        move |_| {
+            cache::clear();
+            clear_row.set_subtitle(&cache_size_label());
+        }
+    ));
+
+    folder_row.add_suffix(&reset);
+    folder_row.add_suffix(&choose);
+    folder_row.set_activatable_widget(Some(&choose));
+    group.add(&folder_row);
+
+    clear_row.add_suffix(&clear);
+    clear_row.set_activatable_widget(Some(&clear));
+    group.add(&clear_row);
+
+    group
+}
+
+/// The clear-cache row's subtitle: how much disk the cached threads occupy.
+fn cache_size_label() -> String {
+    match cache::size_bytes() {
+        0 => "Nothing cached right now.".to_string(),
+        bytes => format!("Currently {}.", glib::format_size(bytes)),
+    }
 }
 
 fn show_shortcuts(app: &adw::Application) {

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 
 use crate::highlight;
 use crate::message;
@@ -620,12 +620,42 @@ impl Composer {
     }
 }
 
-/// Build the reply composer as a bottom sheet: a "Reply" bottom bar that opens
-/// (by click or swipe — the sheet wires that itself) into the raw-message
-/// editor sliding up over the thread. Non-modal, so the thread stays readable
-/// and interactive while composing: per-mail Reply buttons and Quote in Reply
-/// keep working with the editor open. The editor is clamped to the mail page's
-/// reading width so it lines up with the message column.
+/// Style widgets named `drag-handle` like the sheet's own overlaid handle.
+/// The declarations are copied verbatim from libadwaita 1.9's
+/// `_bottom-sheet.scss`, only without its sheet-internal scoping
+/// (`> stack > widget >`), so the collapsed bottom bar can carry the same
+/// pill. The sheet's internal handle matches this selector too; the identical
+/// values make that a no-op.
+fn install_handle_style() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(
+            "drag-handle {
+                background-color: color-mix(in srgb, currentColor 25%, transparent);
+                min-width: 54px;
+                min-height: 6px;
+                margin: 15px;
+                border-radius: 99px;
+            }",
+        );
+        let Some(display) = gdk::Display::default() else {
+            return;
+        };
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
+}
+
+/// Build the reply composer as a bottom sheet: a drag-handle bottom bar that
+/// opens (by click or swipe — the sheet wires that itself) into the
+/// raw-message editor sliding up over the thread. Non-modal, so the thread
+/// stays readable and interactive while composing: per-mail Reply buttons and
+/// Quote in Reply keep working with the editor open. The editor is clamped to
+/// the mail page's reading width so it lines up with the message column.
 pub fn build_composer(reply: ReplyContext) -> Composer {
     let state = ComposerState::new(reply);
 
@@ -670,35 +700,40 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         .tightening_threshold(800)
         .child(&root)
         .build();
-    sheet.set_sheet(Some(&editor_clamp));
 
-    // The collapsed face of the composer: an icon and "Reply" in the same
-    // reading-width clamp as the thread. The sheet itself renders the bar's
-    // background and makes it clickable, so this is just the content.
-    let bar_content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(12)
-        .margin_top(9)
-        .margin_bottom(9)
-        .margin_start(12)
-        .margin_end(12)
+    // The sheet's stock drag handle cannot be clicked — it is can-target:
+    // false, so clicks pass through it into the sheet. A transparent catcher
+    // matching the handle's footprint (54×6 pill plus its 15px margins) sits
+    // over the sheet's top center and closes the sheet on click, making the
+    // handle behave like the toggle it looks like.
+    let handle_target = gtk::Box::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Start)
+        .width_request(84)
+        .height_request(36)
         .build();
-    bar_content.append(&gtk::Image::from_icon_name("mail-reply-sender-symbolic"));
-    bar_content.append(
-        &gtk::Label::builder()
-            .label("Reply")
-            .halign(gtk::Align::Start)
-            .hexpand(true)
-            .xalign(0.0)
-            .build(),
-    );
-    let bar_clamp = adw::Clamp::builder()
-        .maximum_size(1100)
-        .tightening_threshold(800)
-        .hexpand(true)
-        .child(&bar_content)
+    let handle_click = gtk::GestureClick::new();
+    handle_click.connect_released(glib::clone!(
+        #[weak]
+        sheet,
+        move |_, _, _, _| sheet.set_open(false)
+    ));
+    handle_target.add_controller(handle_click);
+    let sheet_content = gtk::Overlay::builder().child(&editor_clamp).build();
+    sheet_content.add_overlay(&handle_target);
+    sheet.set_sheet(Some(&sheet_content));
+
+    // The collapsed face of the composer is nothing but a drag handle, the
+    // same pill the open sheet wears (see install_handle_style). The sheet
+    // itself renders the bar's background and makes the whole strip clickable
+    // and swipable.
+    install_handle_style();
+    let bar_handle = gtk::Box::builder()
+        .css_name("drag-handle")
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
         .build();
-    sheet.set_bottom_bar(Some(&bar_clamp));
+    sheet.set_bottom_bar(Some(&bar_handle));
 
     // Opening lands the cursor in the editor, mirroring what start_reply does
     // for per-mail Reply buttons.

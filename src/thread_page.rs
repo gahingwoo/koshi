@@ -1774,16 +1774,20 @@ fn build_thread_content(
     let search_bar = build_thread_search(&list_view, &view_toggle, Rc::new(mails.clone()), opened);
 
     // The composer is a bottom sheet wrapped around the mail pane rather than
-    // a row below it in the layout. If it shared the layout, expanding it
-    // would shrink the scroller's viewport, and GtkListView re-anchors on a
-    // resize — so a partially-scrolled message would jump. The sheet's
-    // collapsed bottom bar reserves its own constant strip below the content,
-    // and the open editor slides up over it: the viewport never changes size,
-    // so the scroll position — the top line the reader is looking at — stays
-    // put.
+    // a row below it in the layout, so the thread keeps its full height and
+    // the sheet slides over it. Both of the sheet's faces overlay the pane —
+    // the collapsed bar as much as the open editor — so the scroller's bottom
+    // margin tracks sheet-height, the strip the sheet currently covers (the
+    // bar height when shut, the editor height while open, animating between):
+    // the end of the thread stays scrollable into view behind either face.
     let sheet = composer.widget();
     sheet.set_content(Some(&pane));
     sheet.set_vexpand(true);
+    sheet.connect_sheet_height_notify(glib::clone!(
+        #[weak]
+        scrolled,
+        move |sheet| scrolled.set_margin_bottom(sheet.sheet_height())
+    ));
 
     // The title stays pinned above the scrolling list rather than scrolling
     // away with it, so the subject and view toggle stay reachable.

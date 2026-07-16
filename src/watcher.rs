@@ -7,6 +7,12 @@
 //! which is the whole promise of "poll every few minutes." The poll interval is
 //! a user preference ([`crate::settings::poll_interval_minutes`]); each cycle
 //! re-reads it, so changing it in Preferences takes effect on the next tick.
+//!
+//! Polling is deliberately gentle: one fetch at a time with a pause between
+//! them, and the first cycle waits out the launch page load. lore.kernel.org
+//! rate-limits bursts of requests with 503 Service Unavailable — and once the
+//! limiter trips, it answers *everything* with 503, including whatever page
+//! the user is trying to read.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -19,13 +25,44 @@ use crate::settings;
 use crate::subscriptions::{self, Subscription};
 use crate::thread_page::thread_message_digests;
 
-/// Begin watching subscribed threads. Call once at startup: it polls once right
-/// away — so replies that landed while Koshi was closed surface on launch
-/// instead of only after the first interval elapses — then reschedules itself
+/// How long the first poll waits after startup. Long enough for the launch
+/// page's own fetch to finish first — polling the moment the app opens is what
+/// used to trip lore's rate limiter and turn the landing page into a 503 —
+/// while still surfacing replies that landed while Koshi was closed "on
+/// launch" rather than a full interval later.
+const STARTUP_POLL_DELAY_SECONDS: u32 = 10;
+
+/// Pause between consecutive subscription fetches within one cycle, so a long
+/// subscription list reads as a trickle rather than a burst to lore's rate
+/// limiter.
+const POLL_SPACING_SECONDS: u32 = 2;
+
+/// Begin watching subscribed threads. Call once at startup: it polls shortly
+/// after launch — so replies that landed while Koshi was closed surface right
+/// away instead of only after the first interval elapses — then keeps polling
 /// for the life of the application.
+///
+/// Each cycle runs to completion before the next interval starts counting, so
+/// cycles never overlap: a slow cycle (many subscriptions, spaced fetches)
+/// under a short interval just stretches the cadence instead of piling
+/// concurrent cycles onto lore. The interval is re-read every cycle, so a
+/// change in Preferences is honoured from the following one.
 pub fn start(app: &adw::Application) {
-    poll_all(app);
-    schedule_next_poll(app);
+    let weak = app.downgrade();
+    glib::spawn_future_local(async move {
+        glib::timeout_future_seconds(STARTUP_POLL_DELAY_SECONDS).await;
+        loop {
+            {
+                // Upgrade per cycle, not for the loop's lifetime: a strong
+                // reference held across the interval sleep would keep the
+                // application alive after its last window closes.
+                let Some(app) = weak.upgrade() else { return };
+                poll_all(&app).await;
+            }
+            let seconds = settings::poll_interval_minutes().saturating_mul(60);
+            glib::timeout_future_seconds(seconds).await;
+        }
+    });
 }
 
 /// Seed a just-created subscription's baseline right away, rather than leaving
@@ -74,38 +111,39 @@ pub fn seed_new_subscription(subscription: Subscription) {
     });
 }
 
-/// Arm a one-shot timer for the next poll, re-reading the configured interval
-/// each time so a change in Preferences is honoured from the following cycle.
-/// The poll runs, then re-arms — a fixed recurring source would instead pin the
-/// cadence to whatever the interval was when the watcher started.
-fn schedule_next_poll(app: &adw::Application) {
-    let seconds = settings::poll_interval_minutes().saturating_mul(60);
-    glib::timeout_add_seconds_local_once(
-        seconds,
-        glib::clone!(
-            #[weak]
-            app,
-            move || {
-                poll_all(&app);
-                schedule_next_poll(&app);
+/// Poll every current subscription, one at a time with a courtesy pause
+/// between fetches. Sequential on purpose: the original shape — one concurrent
+/// future per subscription — hit lore with a burst of simultaneous `t.mbox.gz`
+/// requests, and its rate limiter answered every one of them (plus the page
+/// the user was opening) with 503 Service Unavailable.
+///
+/// If lore reports rate limiting anyway, the rest of the cycle is abandoned:
+/// pressing on would only prolong the penalty, and the untouched subscriptions
+/// simply retry next cycle.
+async fn poll_all(app: &adw::Application) {
+    for (index, subscription) in subscriptions::all().into_iter().enumerate() {
+        if index > 0 {
+            glib::timeout_future_seconds(POLL_SPACING_SECONDS).await;
+        }
+        let message_id = subscription.message_id.clone();
+        if let Err(err) = poll_one(app, subscription).await {
+            log::warn!("could not poll subscription {message_id}: {err}");
+            if rate_limited(&err) {
+                log::warn!(
+                    "lore.kernel.org is rate limiting; \
+                     leaving the remaining subscriptions for the next cycle"
+                );
+                return;
             }
-        ),
-    );
+        }
+    }
 }
 
-/// Kick off a concurrent fetch of every current subscription. Each subscription
-/// is handled by its own local future so one slow or failing thread never holds
-/// up the rest.
-fn poll_all(app: &adw::Application) {
-    for subscription in subscriptions::all() {
-        glib::spawn_future_local(glib::clone!(
-            #[weak]
-            app,
-            async move {
-                poll_one(&app, subscription).await;
-            }
-        ));
-    }
+/// Whether an error is lore's rate limiter talking — the signal to back off
+/// for the rest of the cycle rather than keep asking. lore answers overload
+/// with 503 Service Unavailable.
+fn rate_limited(err: &lore::Error) -> bool {
+    matches!(err, lore::Error::Status(soup::Status::ServiceUnavailable))
 }
 
 /// Refetch one thread and reconcile it with the subscription's seen set:
@@ -118,32 +156,25 @@ fn poll_all(app: &adw::Application) {
 ///
 /// The seen set only grows, so a transiently short fetch can't resurrect old
 /// messages as "new". A failed fetch leaves the subscription untouched to retry
-/// next cycle.
-async fn poll_one(app: &adw::Application, subscription: Subscription) {
+/// next cycle; the error is surfaced so [`poll_all`] can spot rate limiting.
+async fn poll_one(
+    app: &adw::Application,
+    subscription: Subscription,
+) -> Result<(), lore::Error> {
     let cancellable = gio::Cancellable::new();
     let mbox =
-        match lore::fetch_thread_mbox(&subscription.list, &subscription.message_id, &cancellable)
-            .await
-        {
-            Ok(mbox) => mbox,
-            Err(err) => {
-                log::warn!(
-                    "could not poll subscription {}: {err}",
-                    subscription.message_id
-                );
-                return;
-            }
-        };
+        lore::fetch_thread_mbox(&subscription.list, &subscription.message_id, &cancellable)
+            .await?;
 
     let digests = thread_message_digests(&mbox);
     if digests.is_empty() {
-        return;
+        return Ok(());
     }
 
     // The subscription may have been toggled off while the fetch was in flight;
     // if so, drop this result rather than notify or persist against it.
     if !subscriptions::is_subscribed(&subscription.message_id) {
-        return;
+        return Ok(());
     }
 
     let seen: HashSet<&str> = subscription.seen.iter().map(String::as_str).collect();
@@ -168,6 +199,7 @@ async fn poll_one(app: &adw::Application, subscription: Subscription) {
         .collect();
     updated.extend(fresh);
     subscriptions::set_seen(&subscription.message_id, updated);
+    Ok(())
 }
 
 /// Raise a desktop notification for one new message: the sender's name as the

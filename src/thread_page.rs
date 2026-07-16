@@ -1077,6 +1077,7 @@ pub fn build_thread_page(
         page.clone(),
         list.to_string(),
         message_id.to_string(),
+        false,
     );
     page
 }
@@ -1140,11 +1141,19 @@ fn spawn_thread_load(
     page: adw::NavigationPage,
     list: String,
     message_id: String,
+    bypass_cache: bool,
 ) {
     remote.show_loading();
     let cancellable = remote.cancellable();
     glib::spawn_future_local(async move {
-        match lore::fetch_thread_mbox(&list, &message_id, &cancellable).await {
+        // Opening a thread is happy with a recently cached copy; an explicit
+        // Refresh exists to pull in new replies, so it must go to the network.
+        let fetched = if bypass_cache {
+            lore::fetch_thread_mbox_live(&list, &message_id, &cancellable).await
+        } else {
+            lore::fetch_thread_mbox(&list, &message_id, &cancellable).await
+        };
+        match fetched {
             Ok(mbox) => {
                 // Parsing a big thread (hundreds of MIME messages) takes long
                 // enough to stall the loading spinner; do it off-thread.
@@ -1184,6 +1193,9 @@ fn spawn_thread_load(
                                     page,
                                     list.clone(),
                                     message_id.clone(),
+                                    // Refresh means "check for new replies":
+                                    // never satisfy it from the cache.
+                                    true,
                                 );
                             }
                         })
@@ -1249,7 +1261,15 @@ fn show_thread_error(
             ) else {
                 return;
             };
-            spawn_thread_load(remote, split, nav, page, list.clone(), message_id.clone());
+            spawn_thread_load(
+                remote,
+                split,
+                nav,
+                page,
+                list.clone(),
+                message_id.clone(),
+                false,
+            );
         },
         Some(("Open on Web", open_web)),
     );

@@ -69,6 +69,27 @@ pub fn set_send_user_agent(enabled: bool) {
     write_key("send_user_agent", serde_json::Value::Bool(enabled));
 }
 
+/// The folder the user chose for the downloaded-email cache, or `None` when
+/// they never picked one (so [`crate::cache::dir`] falls back to the default
+/// under the XDG cache dir). Stored as `"cacheDir"`.
+pub fn cache_dir() -> Option<PathBuf> {
+    let value = read_key("cacheDir")?;
+    let path = value.as_str()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
+/// Persist the cache-folder override; `None` reverts to the default folder.
+pub fn set_cache_dir(dir: Option<&Path>) {
+    let value = match dir {
+        Some(dir) => serde_json::Value::String(dir.to_string_lossy().into_owned()),
+        None => serde_json::Value::Null,
+    };
+    write_key("cacheDir", value);
+}
+
 /// Read a single settings key, or `None` when the store is unset, absent, or
 /// malformed.
 fn read_key(key: &str) -> Option<serde_json::Value> {
@@ -266,6 +287,20 @@ mod tests {
         assert_eq!(poll_interval_minutes(), MIN_POLL_INTERVAL_MINUTES);
         fs::write(store.path(), r#"{"pollIntervalMinutes": 99999}"#).unwrap();
         assert_eq!(poll_interval_minutes(), MAX_POLL_INTERVAL_MINUTES);
+    }
+
+    #[test]
+    fn cache_dir_defaults_to_none_and_survives_a_reload() {
+        // Never set: no override, callers use the default folder.
+        assert!(cache_dir().is_none());
+
+        let store = ScratchStore::new("settings-cache-dir");
+        init(store.path());
+        set_cache_dir(Some(Path::new("/tmp/koshi-mail")));
+        assert_eq!(cache_dir(), Some(PathBuf::from("/tmp/koshi-mail")));
+        // Resetting reverts to the default.
+        set_cache_dir(None);
+        assert!(cache_dir().is_none());
     }
 
     #[test]

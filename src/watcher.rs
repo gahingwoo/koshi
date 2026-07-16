@@ -80,9 +80,14 @@ pub fn start(app: &adw::Application) {
 pub fn seed_new_subscription(subscription: Subscription) {
     glib::spawn_future_local(async move {
         let cancellable = gio::Cancellable::new();
-        let Ok(mbox) =
-            lore::fetch_thread_mbox(&subscription.list, &subscription.message_id, &cancellable)
-                .await
+        // Live, never cached: the baseline must reflect the thread as it is
+        // right now, and each fetch also refreshes the cache entry.
+        let Ok(mbox) = lore::fetch_thread_mbox_live(
+            &subscription.list,
+            &subscription.message_id,
+            &cancellable,
+        )
+        .await
         else {
             return;
         };
@@ -162,9 +167,15 @@ async fn poll_one(
     subscription: Subscription,
 ) -> Result<(), lore::Error> {
     let cancellable = gio::Cancellable::new();
-    let mbox =
-        lore::fetch_thread_mbox(&subscription.list, &subscription.message_id, &cancellable)
-            .await?;
+    // Live, never cached: a poll exists to see messages the cache can't have
+    // yet. As a side effect each poll refreshes the cache entry, so a
+    // subscribed thread reopens with its newest replies already on disk.
+    let mbox = lore::fetch_thread_mbox_live(
+        &subscription.list,
+        &subscription.message_id,
+        &cancellable,
+    )
+    .await?;
 
     let digests = thread_message_digests(&mbox);
     if digests.is_empty() {

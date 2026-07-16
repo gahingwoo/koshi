@@ -158,6 +158,13 @@ pub fn gunzip_to_string(bytes: &[u8]) -> Result<String, Error> {
 /// The Message-ID is accepted with or without angle brackets. The pseudo-list
 /// `r` resolves a Message-ID across every list via lore's redirect.
 ///
+/// Consults the on-disk cache: a copy fetched within the last
+/// [`crate::cache::FRESH_FOR_SECS`] is served without touching the network,
+/// a successful download replaces the cached entry, and when the network
+/// fails a stale copy (any age) is served instead of the error — a thread you
+/// have read before stays readable offline. Callers that must see the live
+/// thread use [`fetch_thread_mbox_live`].
+///
 /// Both the compressed download and its inflated form are size-capped: a real
 /// thread — even a long patch series with full quoting — stays well under a
 /// few MB, whereas the degenerate `rtt-probe` "thread" is ~140 MB gzipped and
@@ -168,11 +175,63 @@ pub async fn fetch_thread_mbox(
     message_id: &str,
     cancellable: &gio::Cancellable,
 ) -> Result<Vec<u8>, Error> {
+    fetch_thread_mbox_inner(list, message_id, true, cancellable).await
+}
+
+/// Like [`fetch_thread_mbox`], but always downloads — for the subscription
+/// watcher, whose whole job is spotting messages the cache can't have yet,
+/// and the thread page's Refresh button, whose whole point is bypassing the
+/// fresh window. Still rewrites the cache entry on success (so watched
+/// threads keep their cache warm), but never *reads* the cache: a poll that
+/// can't reach lore reports its error rather than dressing up stale bytes as
+/// a result.
+pub async fn fetch_thread_mbox_live(
+    list: &str,
+    message_id: &str,
+    cancellable: &gio::Cancellable,
+) -> Result<Vec<u8>, Error> {
+    fetch_thread_mbox_inner(list, message_id, false, cancellable).await
+}
+
+async fn fetch_thread_mbox_inner(
+    list: &str,
+    message_id: &str,
+    use_cache: bool,
+    cancellable: &gio::Cancellable,
+) -> Result<Vec<u8>, Error> {
     let trimmed = message_id.trim().trim_matches(['<', '>']);
+    // A fresh cached copy stands in for the network entirely. A cached entry
+    // that fails to inflate (torn write, disk rot) is treated as absent.
+    if use_cache
+        && let Some(gz) = crate::cache::load_fresh(list, trimmed)
+        && let Ok(mbox) = gunzip_capped(&gz, MAX_THREAD_INFLATED)
+    {
+        return Ok(mbox);
+    }
     let escaped = glib::Uri::escape_string(trimmed, None, true);
     let url = format!("{BASE_URL}/{list}/{escaped}/t.mbox.gz");
-    let bytes = fetch_capped(&url, MAX_THREAD_DOWNLOAD, cancellable).await?;
-    gunzip_capped(&bytes, MAX_THREAD_INFLATED)
+    match fetch_capped(&url, MAX_THREAD_DOWNLOAD, cancellable).await {
+        Ok(gz) => {
+            // Cache only what inflates cleanly: an over-cap bomb is rejected
+            // every time anyway, so there is no point storing it.
+            let mbox = gunzip_capped(&gz, MAX_THREAD_INFLATED)?;
+            crate::cache::store(list, trimmed, &gz);
+            Ok(mbox)
+        }
+        Err(err) => {
+            // Offline fallback: any cached copy, however old, beats an error
+            // page — but a cancelled fetch means the page is gone, not that
+            // the user should see old mail.
+            if use_cache
+                && !err.is_cancelled()
+                && let Some(gz) = crate::cache::load_any(list, trimmed)
+                && let Ok(mbox) = gunzip_capped(&gz, MAX_THREAD_INFLATED)
+            {
+                return Ok(mbox);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Byte cap on the gzipped `t.mbox.gz` download. Comfortably clears any

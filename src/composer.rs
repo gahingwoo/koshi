@@ -298,8 +298,9 @@ fn sender_identity() -> String {
 /// differs.
 #[derive(Clone)]
 enum Surface {
-    /// The sticky bottom-bar composer: reset the draft and collapse the editor.
-    Inline(gtk::ToggleButton),
+    /// The bottom-sheet composer: reset the draft and close the sheet back
+    /// down to its bottom bar.
+    Inline(adw::BottomSheet),
     /// A standalone full-page composer: close the tab it lives in.
     Tab,
 }
@@ -310,9 +311,9 @@ impl Surface {
     /// surface to find and close its own tab.
     fn dismiss(&self, state: &ComposerState, from: &impl IsA<gtk::Widget>) {
         match self {
-            Surface::Inline(toggle) => {
+            Surface::Inline(sheet) => {
                 state.reset();
-                toggle.set_active(false);
+                sheet.set_open(false);
             }
             Surface::Tab => close_composer_tab(from),
         }
@@ -529,20 +530,22 @@ fn present_message(parent: &impl IsA<gtk::Widget>, heading: &str, body: &str) {
     dialog.present(Some(parent));
 }
 
-/// A handle to a built composer: the bottom-bar widget to insert into the page,
-/// plus the hooks a per-mail Reply button needs to retarget the draft at another
-/// message in the thread.
+/// A handle to a built composer: the bottom sheet to wrap the page's mail pane
+/// in, plus the hooks a per-mail Reply button needs to retarget the draft at
+/// another message in the thread.
 #[derive(Clone)]
 pub struct Composer {
-    widget: gtk::Box,
+    sheet: adw::BottomSheet,
     state: ComposerState,
-    expand_toggle: gtk::ToggleButton,
     body_view: gtk::TextView,
 }
 
 impl Composer {
-    pub fn widget(&self) -> &gtk::Box {
-        &self.widget
+    /// The composer's `BottomSheet`. The page mounts the mail pane as its
+    /// content, so the collapsed bottom bar rests under the thread and the
+    /// open editor slides over it.
+    pub fn widget(&self) -> &adw::BottomSheet {
+        &self.sheet
     }
 
     /// Point the composer at `reply`: the document is rebuilt against the new
@@ -575,7 +578,7 @@ impl Composer {
 
     fn apply_reply(&self, reply: ReplyContext) {
         self.state.retarget(reply);
-        self.expand_toggle.set_active(true);
+        self.sheet.set_open(true);
         self.body_view.grab_focus();
     }
 
@@ -601,11 +604,11 @@ impl Composer {
         buffer.insert(&mut iter, &text);
         buffer.place_cursor(&iter);
 
-        self.expand_toggle.set_active(true);
+        self.sheet.set_open(true);
         self.body_view.grab_focus();
         // Bring the cursor into view once the editor has a real allocation: the
-        // expander may only be expanding now, and scrolling a view that isn't
-        // laid out yet is a no-op.
+        // sheet may only be opening now, and scrolling a view that isn't laid
+        // out yet is a no-op.
         glib::idle_add_local_once(glib::clone!(
             #[weak(rename_to = view)]
             self.body_view,
@@ -617,10 +620,12 @@ impl Composer {
     }
 }
 
-/// Build the reply composer: one click-anywhere bar that is the bottom bar when
-/// collapsed and the editor's header when open, toggling the editor either way
-/// with a chevron that flips to match. The open editor is clamped to the mail
-/// page's reading width so it lines up with the message column.
+/// Build the reply composer as a bottom sheet: a "Reply" bottom bar that opens
+/// (by click or swipe — the sheet wires that itself) into the raw-message
+/// editor sliding up over the thread. Non-modal, so the thread stays readable
+/// and interactive while composing: per-mail Reply buttons and Quote in Reply
+/// keep working with the editor open. The editor is clamped to the mail page's
+/// reading width so it lines up with the message column.
 pub fn build_composer(reply: ReplyContext) -> Composer {
     let state = ComposerState::new(reply);
 
@@ -628,6 +633,11 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
     highlight::attach(&state.document);
     highlight::refresh(&state.document);
     state.document.connect_changed(highlight::refresh);
+
+    // The sheet is built first so the toolbar's dismissing buttons can close it.
+    let sheet = adw::BottomSheet::new();
+    sheet.set_modal(false);
+    let surface = Surface::Inline(sheet.clone());
 
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -638,18 +648,13 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         .margin_end(12)
         .build();
 
-    // Expansion state lives on a headless toggle so start_reply/insert_quote/
-    // Discard can flip it directly; the header bar below binds to it.
-    let expand_toggle = gtk::ToggleButton::new();
-    let surface = Surface::Inline(expand_toggle.clone());
-
     let toolbar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
         .build();
     toolbar.append(&build_insert_button(&state, &root));
     toolbar.append(&build_rewrap_button(&state));
-    toolbar.append(&build_open_as_tab_button(&state, &expand_toggle));
+    toolbar.append(&build_open_as_tab_button(&state, &sheet));
     let spacer = gtk::Box::builder().hexpand(true).build();
     toolbar.append(&spacer);
     toolbar.append(&build_discard_button(&state, &surface));
@@ -665,17 +670,12 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         .tightening_threshold(800)
         .child(&root)
         .build();
-    let editor_revealer = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::SlideUp)
-        .child(&editor_clamp)
-        .build();
+    sheet.set_sheet(Some(&editor_clamp));
 
-    // One full-width flat button is the whole composer's face: the bottom bar
-    // when collapsed, the editor's header when open. A click anywhere on it
-    // toggles the editor, and the chevron flips to show which way it goes. Its
-    // icon and label sit in the same reading-width clamp as the thread.
-    let chevron = gtk::Image::from_icon_name("pan-up-symbolic");
-    let header_content = gtk::Box::builder()
+    // The collapsed face of the composer: an icon and "Reply" in the same
+    // reading-width clamp as the thread. The sheet itself renders the bar's
+    // background and makes it clickable, so this is just the content.
+    let bar_content = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(12)
         .margin_top(9)
@@ -683,8 +683,8 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         .margin_start(12)
         .margin_end(12)
         .build();
-    header_content.append(&gtk::Image::from_icon_name("mail-reply-sender-symbolic"));
-    header_content.append(
+    bar_content.append(&gtk::Image::from_icon_name("mail-reply-sender-symbolic"));
+    bar_content.append(
         &gtk::Label::builder()
             .label("Reply")
             .halign(gtk::Align::Start)
@@ -692,69 +692,29 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
             .xalign(0.0)
             .build(),
     );
-    header_content.append(&chevron);
-    let header_clamp = adw::Clamp::builder()
+    let bar_clamp = adw::Clamp::builder()
         .maximum_size(1100)
         .tightening_threshold(800)
         .hexpand(true)
-        .child(&header_content)
+        .child(&bar_content)
         .build();
-    let header_bar = gtk::Button::builder()
-        .css_classes(["flat"])
-        .tooltip_text("Expand")
-        .child(&header_clamp)
-        .build();
-    header_bar.connect_clicked(glib::clone!(
-        #[weak]
-        expand_toggle,
-        move |_| expand_toggle.set_active(!expand_toggle.is_active())
-    ));
+    sheet.set_bottom_bar(Some(&bar_clamp));
 
-    // The one switch reveals the editor, flips the chevron and retitles the bar;
-    // opening also focuses the body, mirroring what start_reply does for
-    // per-mail Reply buttons.
-    expand_toggle
-        .bind_property("active", &editor_revealer, "reveal-child")
-        .sync_create()
-        .build();
-    expand_toggle.connect_toggled(glib::clone!(
+    // Opening lands the cursor in the editor, mirroring what start_reply does
+    // for per-mail Reply buttons.
+    sheet.connect_open_notify(glib::clone!(
         #[weak]
         body_view,
-        #[weak]
-        chevron,
-        #[weak]
-        header_bar,
-        move |toggle| {
-            let open = toggle.is_active();
-            chevron.set_icon_name(Some(if open {
-                "pan-down-symbolic"
-            } else {
-                "pan-up-symbolic"
-            }));
-            header_bar.set_tooltip_text(Some(if open { "Collapse" } else { "Expand" }));
-            if open {
+        move |sheet| {
+            if sheet.is_open() {
                 body_view.grab_focus();
             }
         }
     ));
 
-    // The composer floats over the bottom of the mail pane (see thread_page), so
-    // it needs an opaque background and a top divider of its own: bottom-
-    // anchored, it is the collapsed bar while shut and grows up over the content
-    // when open.
-    let widget = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .valign(gtk::Align::End)
-        .css_classes(["background"])
-        .build();
-    widget.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    widget.append(&header_bar);
-    widget.append(&editor_revealer);
-
     Composer {
-        widget,
+        sheet,
         state,
-        expand_toggle,
         body_view,
     }
 }
@@ -917,10 +877,7 @@ fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
 /// composer in its own tab, then returns the inline composer to rest so the same
 /// reply is not open in two places. The window opens the tab (via the enclosing
 /// `TabView`, found by walking up from the button); the draft continues there.
-fn build_open_as_tab_button(
-    state: &ComposerState,
-    expand_toggle: &gtk::ToggleButton,
-) -> gtk::Button {
+fn build_open_as_tab_button(state: &ComposerState, sheet: &adw::BottomSheet) -> gtk::Button {
     let button = gtk::Button::builder()
         .icon_name("view-fullscreen-symbolic")
         .tooltip_text("Open as a Tab")
@@ -931,7 +888,7 @@ fn build_open_as_tab_button(
         #[strong]
         state,
         #[weak]
-        expand_toggle,
+        sheet,
         move |button| {
             let Some(tab_view) = button
                 .ancestor(adw::TabView::static_type())
@@ -944,9 +901,9 @@ fn build_open_as_tab_button(
             let reply = state.initial.borrow().clone();
             let draft = state.document_text();
             crate::open_composer_in_new_tab(&tab_view, reply, Some(draft));
-            // The draft now lives in the tab; collapse and reset the inline bar.
+            // The draft now lives in the tab; close and reset the sheet.
             state.reset();
-            expand_toggle.set_active(false);
+            sheet.set_open(false);
         }
     ));
 

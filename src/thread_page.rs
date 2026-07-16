@@ -1773,37 +1773,25 @@ fn build_thread_content(
     // the thread.
     let search_bar = build_thread_search(&list_view, &view_toggle, Rc::new(mails.clone()), opened);
 
+    // The composer is a bottom sheet wrapped around the mail pane rather than
+    // a row below it in the layout. If it shared the layout, expanding it
+    // would shrink the scroller's viewport, and GtkListView re-anchors on a
+    // resize — so a partially-scrolled message would jump. The sheet's
+    // collapsed bottom bar reserves its own constant strip below the content,
+    // and the open editor slides up over it: the viewport never changes size,
+    // so the scroll position — the top line the reader is looking at — stays
+    // put.
+    let sheet = composer.widget();
+    sheet.set_content(Some(&pane));
+    sheet.set_vexpand(true);
+
     // The title stays pinned above the scrolling list rather than scrolling
     // away with it, so the subject and view toggle stay reachable.
     let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
     inner.append(&title_clamp);
     inner.append(&search_bar);
-    inner.append(&pane);
+    inner.append(sheet);
     overlay.set_child(Some(&inner));
-
-    // The composer floats over the bottom of the mail pane rather than living
-    // below it in the layout. If it shared the layout, expanding it would
-    // shrink the scroller's viewport, and GtkListView re-anchors on a resize
-    // — so a partially-scrolled message would jump. Instead a fixed strip is
-    // reserved at the bottom of the scroller for the collapsed bar (measured
-    // once, when the bar first maps), and the expanded editor overlays the
-    // bottom of the content. The viewport never changes size, so the scroll
-    // position — the top line the reader is looking at — stays put.
-    let composer_widget = composer.widget().clone();
-    pane.add_overlay(&composer_widget);
-    pane.set_measure_overlay(&composer_widget, false);
-
-    let reserved = Cell::new(false);
-    composer_widget.connect_map(glib::clone!(
-        #[weak]
-        scrolled,
-        move |bar| {
-            if reserved.replace(true) {
-                return;
-            }
-            scrolled.set_margin_bottom(bar.measure(gtk::Orientation::Vertical, -1).1);
-        }
-    ));
 
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content_box.append(&overlay);

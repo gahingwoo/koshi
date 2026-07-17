@@ -86,16 +86,21 @@ pub async fn send(req: Request, parent: &impl IsA<gtk::Widget>) -> io::Result<Ou
         launcher.setenv(key, value, true);
     }
     // A non-repo cwd: no repo-local config, no sendemail-validate hook. The
-    // scratch dir sits in the shared runtime dir, so under Flatpak the same
-    // path is also valid for the host-side git the portal starts there.
+    // scratch dir sits in the shared runtime dir, so under Flatpak its logical
+    // path is also valid for the host-side git the portal starts there. This
+    // set_cwd governs the *native* case; under Flatpak the host cwd is pinned
+    // by an explicit `--directory=` (see host_git_argv), because the portal
+    // cannot use this inherited-and-translated cwd.
     launcher.set_cwd(scratch.dir());
     launcher.set_stdin_file_path(Some("/dev/null"));
 
-    // Under Flatpak, route the command to the host and carry the environment
-    // as explicit flags — the portal forwards neither. Elsewhere a no-op.
+    // Under Flatpak, route the command to the host, carry the environment as
+    // explicit flags, and pin the host cwd to the scratch dir — the portal
+    // forwards none of these. Elsewhere a no-op.
     let argv = crate::flatpak::host_git_argv(
         build_argv(&req.from, &req.to, &req.cc, &scratch.eml_path()),
         &env,
+        scratch.dir(),
     );
 
     let osargv: Vec<&std::ffi::OsStr> = argv.iter().map(std::ffi::OsStr::new).collect();

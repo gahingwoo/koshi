@@ -14,7 +14,12 @@
 //!   askpass program — must exist *on the host*, and the portal refuses even
 //!   to start a command whose cwd does not. The one directory both sides see
 //!   at the same path is the per-app runtime dir
-//!   `$XDG_RUNTIME_DIR/app/$FLATPAK_ID`.
+//!   `$XDG_RUNTIME_DIR/app/$FLATPAK_ID` — but only by its *logical* path. That
+//!   dir is a bind mount whose internal path is `/run/flatpak/app/$FLATPAK_ID`,
+//!   so a child that `chdir`s into it reports that internal cwd via `getcwd`,
+//!   and `flatpak-spawn` would forward *that* to the host, where it does not
+//!   exist. So the host cwd must be pinned with an explicit `--directory=`
+//!   naming the logical path, never left to inherited-cwd forwarding.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,20 +66,29 @@ pub fn git_command() -> Command {
 }
 
 /// Wrap a `git …` argv to run on the host when sandboxed, forwarding `env`
-/// explicitly — the portal does not forward the sandbox environment (see
-/// module docs). Outside Flatpak the argv is returned untouched and `env` is
-/// the launcher's business.
-pub fn host_git_argv(argv: Vec<String>, env: &[(String, String)]) -> Vec<String> {
+/// explicitly and pinning the host cwd to `cwd` — the portal forwards neither
+/// the sandbox environment nor a usable cwd (see module docs). `cwd` must name
+/// a directory by its logical host path (e.g. under [`shared_runtime_dir`]).
+/// Outside Flatpak the argv is returned untouched, and both `env` and the cwd
+/// are the launcher's business.
+pub fn host_git_argv(argv: Vec<String>, env: &[(String, String)], cwd: &Path) -> Vec<String> {
     match app_id() {
-        Some(_) => wrap_host_argv(argv, env),
+        Some(_) => wrap_host_argv(argv, env, cwd),
         None => argv,
     }
 }
 
 /// The pure wrapping [`host_git_argv`] applies inside a sandbox, split out so
 /// it is testable without one.
-fn wrap_host_argv(argv: Vec<String>, env: &[(String, String)]) -> Vec<String> {
-    let mut wrapped = vec!["flatpak-spawn".to_string(), "--host".to_string()];
+fn wrap_host_argv(argv: Vec<String>, env: &[(String, String)], cwd: &Path) -> Vec<String> {
+    let mut wrapped = vec![
+        "flatpak-spawn".to_string(),
+        "--host".to_string(),
+        // Pin the host cwd to the logical path; without this the portal
+        // forwards the child's `getcwd`, which is the bind mount's internal
+        // `/run/flatpak/...` path and does not exist on the host.
+        format!("--directory={}", cwd.display()),
+    ];
     wrapped.extend(
         env.iter()
             .map(|(key, value)| format!("--env={key}={value}")),
@@ -88,7 +102,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wrapped_argv_forwards_env_before_the_command() {
+    fn wrapped_argv_pins_cwd_and_forwards_env_before_the_command() {
         let argv = vec!["git".to_string(), "send-email".to_string()];
         let env = vec![
             ("LC_ALL".to_string(), "C".to_string()),
@@ -97,12 +111,15 @@ mod tests {
                 "/run/user/1/app/x/askpass".to_string(),
             ),
         ];
-        let wrapped = wrap_host_argv(argv, &env);
+        let wrapped = wrap_host_argv(argv, &env, Path::new("/run/user/1/app/x/koshi/send-0"));
         assert_eq!(
             wrapped,
             [
                 "flatpak-spawn",
                 "--host",
+                // The host cwd is pinned explicitly (never inherited), and every
+                // env var git must see is forwarded, all before the command.
+                "--directory=/run/user/1/app/x/koshi/send-0",
                 "--env=LC_ALL=C",
                 "--env=GIT_ASKPASS=/run/user/1/app/x/askpass",
                 "git",

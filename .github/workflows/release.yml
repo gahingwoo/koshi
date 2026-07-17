@@ -64,6 +64,9 @@ jobs:
         with:
           manifest-path: ${{ env.MANIFEST }}
           bundle: koshi.flatpak
+          # The action's `branch` defaults to "master"; publish on "stable" to
+          # match the manifest's default-branch and the .flatpakrepo/.flatpakref.
+          branch: stable
           gpg-sign: ${{ secrets.FLATPAK_GPG_KEY_ID }}
           cache-key: flatpak-builder-${{ github.sha }}
 

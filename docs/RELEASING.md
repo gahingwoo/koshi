@@ -8,8 +8,15 @@ GitHub Pages, and cuts a GitHub Release with a one-shot `.flatpak` bundle.
 
 ## Releasing
 
-1. Bump the version in `Cargo.toml` and add a matching `<release>` entry to
-   `data/moe.nikableh.Koshi.metainfo.xml`. Commit on `main`.
+1. Bump the version everywhere it is pinned, and add a matching `<release>`
+   entry to `data/moe.nikableh.Koshi.metainfo.xml`:
+
+   - `Cargo.toml` — the package version.
+   - `flake.nix` — the `version` in the `packages.default` derivation.
+   - `Cargo.lock` — re-sync it (else the sandboxed `cargo build --locked`
+     fails): `cargo update --workspace --offline`.
+
+   Commit on `main`.
 2. Tag and push:
 
    ```sh

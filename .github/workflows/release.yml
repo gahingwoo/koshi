@@ -2,8 +2,9 @@ name: Release
 
 # Tag main with a version (e.g. `git tag v0.2.0 && git push origin v0.2.0`) to:
 #   1. build & GPG-sign the Flatpak,
-#   2. publish the signed OSTree repo to GitHub Pages (dl.nikableh.moe),
-#   3. create a GitHub Release with the .flatpak bundle attached.
+#   2. generate a build-provenance attestation for the bundle,
+#   3. publish the signed OSTree repo to GitHub Pages (dl.nikableh.moe),
+#   4. create a GitHub Release with the .flatpak bundle attached.
 #
 # Requires repo secrets FLATPAK_GPG_PRIVATE_KEY and FLATPAK_GPG_KEY_ID, Pages
 # set to "GitHub Actions" as its source, and (for public reach) a public repo.
@@ -17,9 +18,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # create the GitHub Release
-  pages: write      # deploy to GitHub Pages
-  id-token: write   # authenticate the Pages deployment
+  contents: write      # create the GitHub Release
+  pages: write         # deploy to GitHub Pages
+  id-token: write      # Pages deployment + Sigstore signing for attestations
+  attestations: write  # write the build-provenance attestation
 
 # Never let two publishes clobber each other's repo/summary.
 concurrency:
@@ -59,6 +61,13 @@ jobs:
           bundle: koshi.flatpak
           gpg-sign: ${{ secrets.FLATPAK_GPG_KEY_ID }}
           cache-key: flatpak-builder-${{ github.sha }}
+
+      # Signed, tamper-evident record of where and how the bundle was built.
+      # Verify a download with: gh attestation verify koshi.flatpak -R nikableh/koshi
+      - name: Attest build provenance of the bundle
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: koshi.flatpak
 
       - name: Regenerate signed repo summary & static deltas
         run: |

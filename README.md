@@ -21,8 +21,14 @@ flatpak install koshi moe.nikableh.Koshi
 ```
 
 Updates arrive through `flatpak update`. Prefer a one-off install without a
-remote? Grab the `.flatpak` bundle from the [latest release]. (Koshi is not on
-Flathub, which does not accept AI-assisted software.)
+remote? Grab the `.flatpak` bundle from the [latest release] and verify its
+build provenance:
+
+```sh
+gh attestation verify koshi.flatpak -R nikableh/koshi
+```
+
+(Koshi is not on Flathub, which does not accept AI-assisted software.)
 
 [latest release]: https://github.com/nikableh/koshi/releases/latest
 

@@ -36,6 +36,21 @@ remote provides it (usually Flathub); the `koshi.flatpakref` on the release and
 at `https://dl.nikableh.moe/koshi.flatpakref` adds Flathub automatically for a
 one-click install.
 
+### Verifying provenance
+
+Each release attaches a GitHub build-provenance attestation to the `.flatpak`
+bundle. Anyone can confirm the bundle they downloaded was built by this
+repository's workflow (not tampered with, not built elsewhere):
+
+```sh
+gh attestation verify koshi.flatpak -R nikableh/koshi
+```
+
+This is separate from the GPG repo signature — GPG proves the *remote* is ours;
+the attestation proves the *bundle* came from our CI. Public repos log the
+attestation in Sigstore's public transparency log; while the repo is private it
+uses GitHub's private Sigstore instance instead.
+
 ## Notes
 
 - **Network during build.** The manifest builds with `--share=network` so Cargo

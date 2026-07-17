@@ -9,7 +9,7 @@
 </p>
 
 Koshi is a native GTK4 + libadwaita app for browsing, searching, and replying
-to the mailing lists archived on [https://lore.kernel.org](https://lore.kernel.org).
+to the mailing lists archived on [lore.kernel.org](https://lore.kernel.org).
 
 ## Installing
 
@@ -20,15 +20,19 @@ flatpak remote-add --if-not-exists koshi https://dl.nikableh.moe/koshi.flatpakre
 flatpak install koshi moe.nikableh.Koshi
 ```
 
-Updates arrive through `flatpak update`. Prefer a one-off install without a
-remote? Grab the `.flatpak` bundle from the [latest release] and verify its
-build provenance:
+Updates arrive through `flatpak update`. For a one-off install without adding
+the remote, download the `.flatpak` bundle from the [latest release] and install
+it:
+
+```sh
+flatpak install koshi.flatpak
+```
+
+You can verify the bundle's build provenance before installing:
 
 ```sh
 gh attestation verify koshi.flatpak -R nikableh/koshi
 ```
-
-(Koshi is not on Flathub, which does not accept AI-assisted software.)
 
 [latest release]: https://github.com/nikableh/koshi/releases/latest
 
@@ -98,9 +102,8 @@ helpers, and `git send-email` setup work unchanged.
 
 Publishing is automated: tag `main` with a `v*` version and GitHub Actions
 builds, GPG-signs, and publishes the Flatpak to
-[dl.nikableh.moe](https://dl.nikableh.moe), then cuts a GitHub Release with a
-`.flatpak` bundle. See [docs/RELEASING.md](docs/RELEASING.md) for the one-time
-setup (signing key, secrets, Pages, DNS).
+[dl.nikableh.moe](https://dl.nikableh.moe), then creates a GitHub Release with a
+`.flatpak` bundle.
 
 ## License
 

@@ -46,12 +46,4 @@
     <keyword>lkml</keyword>
     <keyword>kernel</keyword>
   </keywords>
-
-  <releases>
-    <release version="0.2.0" date="2026-07-17">
-      <description>
-        <p>First public release.</p>
-      </description>
-    </release>
-  </releases>
 </component>

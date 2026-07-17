@@ -620,12 +620,22 @@ impl Composer {
     }
 }
 
-/// Style widgets named `drag-handle` like the sheet's own overlaid handle.
-/// The declarations are copied verbatim from libadwaita 1.9's
-/// `_bottom-sheet.scss`, only without its sheet-internal scoping
-/// (`> stack > widget >`), so the collapsed bottom bar can carry the same
+/// Style widgets named `drag-handle` like the sheet's own overlaid handle,
+/// and unify the sheet card's two shadows. The declarations are copied
+/// verbatim from libadwaita 1.9's `_bottom-sheet.scss`.
+///
+/// The handle rule drops the stylesheet's sheet-internal scoping
+/// (`> stack > widget >`) so the collapsed bottom bar can carry the same
 /// pill. The sheet's internal handle matches this selector too; the identical
 /// values make that a no-op.
+///
+/// The shadow rules pin the collapsed bar face (`.bottom-bar`) to the box
+/// shadow the open sheet wears instead of the stylesheet's heavier floating
+/// glow: the widget switches face 15% into the open swipe, and with the card
+/// no longer full-width (whose flush-left/right styling used to suppress the
+/// side shadows) the two recipes visibly morphed mid-open. `.hidden` must be
+/// restated because this application-priority provider outranks the theme's
+/// `.bottom-bar.hidden { box-shadow: none }`.
 fn install_handle_style() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -637,6 +647,21 @@ fn install_handle_style() {
                 min-height: 6px;
                 margin: 15px;
                 border-radius: 99px;
+            }
+            bottom-sheet > sheet.bottom-bar {
+                box-shadow: 0 0 14px 2px rgb(0 0 6 / 3%),
+                            0 0 5px 2px rgb(0 0 6 / 10%),
+                            0 0 0 1px rgb(0 0 0 / 5%);
+            }
+            @media (prefers-contrast: more) {
+                bottom-sheet > sheet.bottom-bar {
+                    box-shadow: 0 0 14px 2px rgb(0 0 6 / 3%),
+                                0 0 5px 2px rgb(0 0 6 / 10%),
+                                0 0 0 1px rgb(0 0 0 / 80%);
+                }
+            }
+            bottom-sheet > sheet.bottom-bar.hidden {
+                box-shadow: none;
             }",
         );
         let Some(display) = gdk::Display::default() else {

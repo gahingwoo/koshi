@@ -48,6 +48,11 @@
   </keywords>
 
   <releases>
+    <release version="0.2.1" date="2026-07-17">
+      <description>
+        <p>Fix sending emails from the Flatpak build.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-07-17">
       <description>
         <p>First public release.</p>

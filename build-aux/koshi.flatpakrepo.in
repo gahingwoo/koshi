@@ -1,0 +1,10 @@
+[Flatpak Repo]
+Title=Koshi
+Url=https://dl.nikableh.moe/repo/
+Homepage=https://github.com/nikableh/koshi
+Comment=Read and reply to kernel mailing lists
+Description=A native GTK/libadwaita client for the kernel mailing lists on lore.kernel.org
+Icon=https://dl.nikableh.moe/koshi.svg
+SuggestRemoteName=koshi
+DefaultBranch=stable
+GPGKey=@GPGKEY@

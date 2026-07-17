@@ -11,6 +11,21 @@
 Koshi is a native GTK4 + libadwaita app for browsing, searching, and replying
 to the mailing lists archived on [https://lore.kernel.org](https://lore.kernel.org).
 
+## Installing
+
+Koshi is distributed as a Flatpak from its own repository:
+
+```sh
+flatpak remote-add --if-not-exists koshi https://dl.nikableh.moe/koshi.flatpakrepo
+flatpak install koshi moe.nikableh.Koshi
+```
+
+Updates arrive through `flatpak update`. Prefer a one-off install without a
+remote? Grab the `.flatpak` bundle from the [latest release]. (Koshi is not on
+Flathub, which does not accept AI-assisted software.)
+
+[latest release]: https://github.com/nikableh/koshi/releases/latest
+
 ## Building
 
 ```sh
@@ -72,6 +87,14 @@ Inside the sandbox Koshi still uses the *host's* git for identity and
 sending — invocations cross over via `flatpak-spawn --host`
 (`--talk-name=org.freedesktop.Flatpak`), so your git config, credential
 helpers, and `git send-email` setup work unchanged.
+
+## Releasing
+
+Publishing is automated: tag `main` with a `v*` version and GitHub Actions
+builds, GPG-signs, and publishes the Flatpak to
+[dl.nikableh.moe](https://dl.nikableh.moe), then cuts a GitHub Release with a
+`.flatpak` bundle. See [docs/RELEASING.md](docs/RELEASING.md) for the one-time
+setup (signing key, secrets, Pages, DNS).
 
 ## License
 

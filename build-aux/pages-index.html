@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Koshi — Flatpak repository</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 44rem;
+      margin: 4rem auto;
+      padding: 0 1.25rem;
+      line-height: 1.6;
+    }
+    h1 { margin-bottom: 0.25rem; }
+    .sub { opacity: 0.7; margin-top: 0; }
+    pre {
+      background: rgba(127, 127, 127, 0.15);
+      padding: 0.9rem 1rem;
+      border-radius: 0.5rem;
+      overflow-x: auto;
+    }
+    code { font-family: ui-monospace, monospace; }
+    a { color: inherit; }
+    footer { margin-top: 3rem; opacity: 0.6; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>Koshi</h1>
+  <p class="sub">Read and reply to kernel mailing lists.</p>
+
+  <p>
+    This is the Flatpak repository for
+    <a href="https://github.com/nikableh/koshi">Koshi</a>. Add the remote and
+    install:
+  </p>
+
+  <pre><code>flatpak remote-add --if-not-exists koshi https://dl.nikableh.moe/koshi.flatpakrepo
+flatpak install koshi moe.nikableh.Koshi</code></pre>
+
+  <p>Then run it, or launch <strong>Koshi</strong> from your applications menu:</p>
+
+  <pre><code>flatpak run moe.nikableh.Koshi</code></pre>
+
+  <p>Updates arrive through the usual <code>flatpak update</code>.</p>
+
+  <p>
+    Prefer a one-off install without adding a remote? Grab the
+    <code>.flatpak</code> bundle from the
+    <a href="https://github.com/nikableh/koshi/releases/latest">latest release</a>.
+  </p>
+
+  <footer>
+    Signed with the repository's GPG key. Source and issues on
+    <a href="https://github.com/nikableh/koshi">GitHub</a>.
+  </footer>
+</body>
+</html>

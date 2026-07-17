@@ -1,0 +1,11 @@
+[Flatpak Ref]
+Name=moe.nikableh.Koshi
+Branch=stable
+Title=Koshi
+Url=https://dl.nikableh.moe/repo/
+Homepage=https://github.com/nikableh/koshi
+Comment=Read and reply to kernel mailing lists
+Icon=https://dl.nikableh.moe/koshi.svg
+IsRuntime=false
+RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
+GPGKey=@GPGKEY@

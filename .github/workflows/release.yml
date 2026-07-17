@@ -1,0 +1,142 @@
+name: Release
+
+# Tag main with a version (e.g. `git tag v0.2.0 && git push origin v0.2.0`) to:
+#   1. build & GPG-sign the Flatpak,
+#   2. publish the signed OSTree repo to GitHub Pages (dl.nikableh.moe),
+#   3. create a GitHub Release with the .flatpak bundle attached.
+#
+# Requires repo secrets FLATPAK_GPG_PRIVATE_KEY and FLATPAK_GPG_KEY_ID, Pages
+# set to "GitHub Actions" as its source, and (for public reach) a public repo.
+# See docs/RELEASING.md for the one-time setup.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual runs build & publish Pages but skip the GitHub Release (no tag).
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the GitHub Release
+  pages: write      # deploy to GitHub Pages
+  id-token: write   # authenticate the Pages deployment
+
+# Never let two publishes clobber each other's repo/summary.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  APP_ID: moe.nikableh.Koshi
+  MANIFEST: build-aux/moe.nikableh.Koshi.json
+
+jobs:
+  build:
+    name: Build & sign Flatpak
+    runs-on: ubuntu-latest
+    container:
+      # Matches runtime-version "50" in the manifest. If this tag 404s, bump to
+      # the newest available gnome-* tag at ghcr.io/flathub-infra/flatpak-github-actions.
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Import GPG signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+        run: |
+          GNUPGHOME="$(mktemp -d)"
+          chmod 700 "$GNUPGHOME"
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+      - name: Build Flatpak bundle (signed)
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: ${{ env.MANIFEST }}
+          bundle: koshi.flatpak
+          gpg-sign: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      - name: Regenerate signed repo summary & static deltas
+        run: |
+          flatpak build-update-repo \
+            --generate-static-deltas \
+            --prune \
+            --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}" \
+            repo
+
+      - name: Assemble Pages site and release assets
+        run: |
+          set -eu
+          KEYID="${{ secrets.FLATPAK_GPG_KEY_ID }}"
+
+          mkdir -p site dist
+          cp -a repo site/repo
+
+          # Public key: attached to the release and used to fill the templates.
+          gpg --batch --export "$KEYID" > site/koshi.gpg
+          KEY_B64="$(base64 -w0 site/koshi.gpg)"
+
+          # base64 alphabet has no '|', so it's safe as a sed replacement.
+          sed "s|@GPGKEY@|$KEY_B64|" build-aux/koshi.flatpakrepo.in > site/koshi.flatpakrepo
+          sed "s|@GPGKEY@|$KEY_B64|" build-aux/koshi.flatpakref.in  > site/koshi.flatpakref
+
+          cp build-aux/pages-index.html site/index.html
+          cp data/icons/scalable/apps/${APP_ID}.svg site/koshi.svg
+          echo "dl.nikableh.moe" > site/CNAME
+
+          # Release assets (bundle + verification material).
+          cp koshi.flatpak       dist/koshi.flatpak
+          cp site/koshi.gpg      dist/koshi.gpg
+          cp site/koshi.flatpakrepo dist/koshi.flatpakrepo
+          cp site/koshi.flatpakref  dist/koshi.flatpakref
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+
+  deploy-pages:
+    name: Publish to dl.nikableh.moe
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/koshi.flatpak
+            dist/koshi.gpg
+            dist/koshi.flatpakrepo
+            dist/koshi.flatpakref
+          generate_release_notes: true
+          fail_on_unmatched_files: true

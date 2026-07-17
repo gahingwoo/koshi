@@ -87,6 +87,10 @@
             # won't work without it.
             pkgs.flatpak
             pkgs.flatpak-builder
+            # flatpak-builder (1.4.x) runs `appstreamcli compose` on the HOST
+            # to process the metainfo, not the SDK's copy — so the build aborts
+            # at that step unless appstreamcli is on PATH.
+            pkgs.appstream
           ];
 
           # `cargo run` bypasses wrapGAppsHook4, so expose GSettings schemas

@@ -41,6 +41,12 @@ jobs:
       # the newest available gnome-* tag at ghcr.io/flathub-infra/flatpak-github-actions.
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
       options: --privileged
+    # One fixed GNUPGHOME shared by every step AND the flatpak-builder action's
+    # export subprocess (a mktemp/GITHUB_ENV path isn't reliably seen by the
+    # action inside the container), so the imported signing key is always found.
+    # Literal path: the `runner` context is not available in job-level env.
+    env:
+      GNUPGHOME: /tmp/koshi-gnupg
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -49,10 +55,9 @@ jobs:
         env:
           GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
         run: |
-          GNUPGHOME="$(mktemp -d)"
+          mkdir -p "$GNUPGHOME"
           chmod 700 "$GNUPGHOME"
           printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
-          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
 
       - name: Build Flatpak bundle (signed)
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
@@ -75,6 +80,7 @@ jobs:
             --generate-static-deltas \
             --prune \
             --gpg-sign="${{ secrets.FLATPAK_GPG_KEY_ID }}" \
+            --gpg-homedir="$GNUPGHOME" \
             repo
 
       - name: Assemble Pages site and release assets
@@ -94,7 +100,7 @@ jobs:
           sed "s|@GPGKEY@|$KEY_B64|" build-aux/koshi.flatpakref.in  > site/koshi.flatpakref
 
           cp build-aux/pages-index.html site/index.html
-          cp data/icons/scalable/apps/${APP_ID}.svg site/koshi.svg
+          cp "data/icons/scalable/apps/${APP_ID}.svg" site/koshi.svg
           echo "dl.nikableh.moe" > site/CNAME
 
           # Release assets (bundle + verification material).

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>moe.nikableh.Koshi</id>
+
+  <name>Koshi</name>
+  <summary>Read and reply to kernel mailing lists</summary>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <developer id="moe.nikableh">
+    <name>Nika Krasnova</name>
+  </developer>
+
+  <description>
+    <p>
+      Koshi is a native GTK4 and libadwaita application for browsing, searching,
+      and replying to the mailing lists archived on lore.kernel.org.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Browse and search patches and threads from the kernel mailing lists</li>
+      <li>Read threaded conversations with a native Adwaita interface</li>
+      <li>Compose and send replies using your existing git identity</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">moe.nikableh.Koshi.desktop</launchable>
+
+  <url type="homepage">https://github.com/nikableh/koshi</url>
+  <url type="bugtracker">https://github.com/nikableh/koshi/issues</url>
+  <url type="vcs-browser">https://github.com/nikableh/koshi</url>
+
+  <content_rating type="oars-1.1" />
+
+  <categories>
+    <category>Network</category>
+    <category>Email</category>
+  </categories>
+
+  <keywords>
+    <keyword>mail</keyword>
+    <keyword>email</keyword>
+    <keyword>mailing-list</keyword>
+    <keyword>lore</keyword>
+    <keyword>lkml</keyword>
+    <keyword>kernel</keyword>
+  </keywords>
+
+  <releases>
+    <release version="0.2.0" date="2026-07-17">
+      <description>
+        <p>First public release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

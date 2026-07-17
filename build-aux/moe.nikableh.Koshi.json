@@ -3,6 +3,7 @@
     "runtime": "org.gnome.Platform",
     "runtime-version": "50",
     "sdk": "org.gnome.Sdk",
+    "default-branch": "stable",
     "sdk-extensions": [
         "org.freedesktop.Sdk.Extension.rust-stable"
     ],
@@ -34,6 +35,7 @@
                 "install -Dm755 target/release/koshi /app/bin/koshi",
                 "install -Dm755 target/release/koshi-askpass /app/bin/koshi-askpass",
                 "install -Dm644 data/moe.nikableh.Koshi.desktop /app/share/applications/moe.nikableh.Koshi.desktop",
+                "install -Dm644 data/moe.nikableh.Koshi.metainfo.xml /app/share/metainfo/moe.nikableh.Koshi.metainfo.xml",
                 "install -Dm644 data/icons/scalable/apps/moe.nikableh.Koshi.svg /app/share/icons/hicolor/scalable/apps/moe.nikableh.Koshi.svg",
                 "install -Dm644 data/icons/symbolic/apps/moe.nikableh.Koshi-symbolic.svg /app/share/icons/hicolor/symbolic/apps/moe.nikableh.Koshi-symbolic.svg"
             ],

@@ -1,0 +1,54 @@
+{
+    "id": "moe.nikableh.Koshi",
+    "runtime": "org.gnome.Platform",
+    "runtime-version": "50",
+    "sdk": "org.gnome.Sdk",
+    "sdk-extensions": [
+        "org.freedesktop.Sdk.Extension.rust-stable"
+    ],
+    "command": "koshi",
+    "finish-args": [
+        "--share=ipc",
+        "--socket=fallback-x11",
+        "--socket=wayland",
+        "--device=dri",
+        "--share=network",
+        "--talk-name=org.freedesktop.Flatpak",
+        "--talk-name=org.freedesktop.Notifications"
+    ],
+    "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin",
+        "build-args": [
+            "--share=network"
+        ],
+        "env": {
+            "CARGO_HOME": "/run/build/koshi/cargo"
+        }
+    },
+    "modules": [
+        {
+            "name": "koshi",
+            "buildsystem": "simple",
+            "build-commands": [
+                "cargo build --release --locked",
+                "install -Dm755 target/release/koshi /app/bin/koshi",
+                "install -Dm755 target/release/koshi-askpass /app/bin/koshi-askpass",
+                "install -Dm644 data/moe.nikableh.Koshi.desktop /app/share/applications/moe.nikableh.Koshi.desktop",
+                "install -Dm644 data/icons/scalable/apps/moe.nikableh.Koshi.svg /app/share/icons/hicolor/scalable/apps/moe.nikableh.Koshi.svg",
+                "install -Dm644 data/icons/symbolic/apps/moe.nikableh.Koshi-symbolic.svg /app/share/icons/hicolor/symbolic/apps/moe.nikableh.Koshi-symbolic.svg"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "../",
+                    "skip": [
+                        ".git",
+                        ".direnv",
+                        "target",
+                        "result"
+                    ]
+                }
+            ]
+        }
+    ]
+}

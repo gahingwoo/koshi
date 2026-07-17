@@ -55,32 +55,48 @@ pub enum Outcome {
 /// The scratch message file is removed before returning, whatever the outcome.
 pub async fn send(req: Request, parent: &impl IsA<gtk::Widget>) -> io::Result<Outcome> {
     let scratch = Scratch::create(&req.eml)?;
-    let argv = build_argv(&req.from, &req.to, &req.cc, &scratch.eml_path());
 
-    let launcher = gio::SubprocessLauncher::new(
-        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
-    );
-    // Force git's terminal reader onto stdin so a stray prompt hits EOF and
-    // takes its default rather than blocking on /dev/tty.
-    launcher.setenv("GIT_SEND_EMAIL_NOTTY", "1", true);
-    // A needed password with no helper becomes a clean error, not a hang.
-    launcher.setenv("GIT_TERMINAL_PROMPT", "0", true);
-    // Backstops against anything trying to open an editor.
-    launcher.setenv("GIT_EDITOR", "true", true);
-    // Stable, parseable diagnostics regardless of the user's locale.
-    launcher.setenv("LC_ALL", "C", true);
-    // A non-repo cwd: no repo-local config, no sendemail-validate hook.
-    launcher.set_cwd(scratch.dir());
-    launcher.set_stdin_file_path(Some("/dev/null"));
+    let mut env: Vec<(String, String)> = [
+        // Force git's terminal reader onto stdin so a stray prompt hits EOF
+        // and takes its default rather than blocking on /dev/tty.
+        ("GIT_SEND_EMAIL_NOTTY", "1"),
+        // A needed password with no helper becomes a clean error, not a hang.
+        ("GIT_TERMINAL_PROMPT", "0"),
+        // Backstops against anything trying to open an editor.
+        ("GIT_EDITOR", "true"),
+        // Stable, parseable diagnostics regardless of the user's locale.
+        ("LC_ALL", "C"),
+    ]
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .into();
 
     // A GUI password prompt when git needs one, best-effort: if the bridge
     // can't be set up, git simply falls back and (with GIT_TERMINAL_PROMPT=0)
     // fails cleanly rather than hanging. Kept alive until the child exits.
     let askpass = crate::askpass::AskpassServer::start(parent);
     match &askpass {
-        Ok(server) => server.install(&launcher),
+        Ok(server) => env.extend(server.env()),
         Err(error) => log::warn!("SMTP password prompt unavailable: {error}"),
     }
+
+    let launcher = gio::SubprocessLauncher::new(
+        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
+    );
+    for (key, value) in &env {
+        launcher.setenv(key, value, true);
+    }
+    // A non-repo cwd: no repo-local config, no sendemail-validate hook. The
+    // scratch dir sits in the shared runtime dir, so under Flatpak the same
+    // path is also valid for the host-side git the portal starts there.
+    launcher.set_cwd(scratch.dir());
+    launcher.set_stdin_file_path(Some("/dev/null"));
+
+    // Under Flatpak, route the command to the host and carry the environment
+    // as explicit flags — the portal forwards neither. Elsewhere a no-op.
+    let argv = crate::flatpak::host_git_argv(
+        build_argv(&req.from, &req.to, &req.cc, &scratch.eml_path()),
+        &env,
+    );
 
     let osargv: Vec<&std::ffi::OsStr> = argv.iter().map(std::ffi::OsStr::new).collect();
     let subprocess = launcher.spawn(&osargv).map_err(to_io)?;
@@ -185,7 +201,11 @@ impl Scratch {
             now.as_nanos(),
             SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed),
         );
-        let dir = glib::user_runtime_dir().join("koshi").join(unique);
+        // The shared runtime dir, so a host-side git (Flatpak) can read the
+        // message at the same path.
+        let dir = crate::flatpak::shared_runtime_dir()
+            .join("koshi")
+            .join(unique);
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)

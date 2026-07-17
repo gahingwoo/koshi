@@ -8,8 +8,11 @@
 //! it loads none of the GUI libraries); when that binary is not installed beside
 //! Koshi (e.g. a bare `cargo run`, which builds only one binary), Koshi falls
 //! back to re-exec'ing *itself* — [`helper_prompt`] detects that before any GTK
-//! setup and [`run_helper`] does the same exchange. Either way Koshi sets
-//! `GIT_ASKPASS` itself, so git never reaches an inherited, foreign askpass.
+//! setup and [`run_helper`] does the same exchange. Under Flatpak, where git
+//! runs on the host and cannot execute a sandbox path, `GIT_ASKPASS` is instead
+//! a host-side script that re-enters the sandbox as the helper (see
+//! [`write_host_askpass`]). In every case Koshi sets `GIT_ASKPASS` itself, so
+//! git never reaches an inherited, foreign askpass.
 //!
 //! Security properties (the password's whole path is GTK entry → socket →
 //! helper stdout → git):
@@ -29,7 +32,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -148,7 +151,6 @@ impl AskpassServer {
     /// so the caller can fall back to git's own (clean) failure.
     pub fn start(parent: &impl IsA<gtk::Widget>) -> io::Result<Self> {
         let parent: gtk::Widget = parent.clone().upcast();
-        let helper = askpass_program()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
@@ -158,16 +160,23 @@ impl AskpassServer {
             now.as_nanos(),
             SERVER_COUNTER.fetch_add(1, Ordering::Relaxed),
         );
-        let dir = glib::user_runtime_dir().join("koshi").join(unique);
+        // Under Flatpak git runs on the *host*, so the askpass program and
+        // socket live in the runtime dir both sides see at the same path.
+        let dir = crate::flatpak::shared_runtime_dir()
+            .join("koshi")
+            .join(unique);
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&dir)?;
 
         // git runs GIT_ASKPASS through a shell, which word-splits on the path;
-        // a symlink under our own space keeps it free of shell metacharacters.
+        // a name under our own space keeps it free of shell metacharacters.
         let askpass = dir.join("askpass");
-        std::os::unix::fs::symlink(&helper, &askpass)?;
+        match crate::flatpak::app_id() {
+            Some(app_id) => write_host_askpass(&askpass, &app_id)?,
+            None => std::os::unix::fs::symlink(askpass_program()?, &askpass)?,
+        }
 
         let socket = dir.join("askpass.sock");
         let token = random_token()?;
@@ -214,13 +223,46 @@ impl AskpassServer {
         })
     }
 
-    /// Point a subprocess launcher at this server: `GIT_ASKPASS` plus the socket
-    /// path and token the re-exec'd helper needs to reach back.
-    pub fn install(&self, launcher: &gio::SubprocessLauncher) {
-        launcher.setenv("GIT_ASKPASS", self.dir.join("askpass"), true);
-        launcher.setenv(SOCKET_ENV, self.dir.join("askpass.sock"), true);
-        launcher.setenv(TOKEN_ENV, &self.token, true);
+    /// The environment git needs to reach this server: `GIT_ASKPASS` plus the
+    /// socket path and one-time token the helper presents. Returned as data —
+    /// not set on a launcher directly — because under Flatpak these must also
+    /// travel to the host as explicit `--env=` flags.
+    pub fn env(&self) -> Vec<(String, String)> {
+        vec![
+            (
+                "GIT_ASKPASS".to_string(),
+                self.dir.join("askpass").to_string_lossy().into_owned(),
+            ),
+            (
+                SOCKET_ENV.to_string(),
+                self.dir.join("askpass.sock").to_string_lossy().into_owned(),
+            ),
+            (TOKEN_ENV.to_string(), self.token.clone()),
+        ]
     }
+}
+
+/// Write the `GIT_ASKPASS` program for the Flatpak case: host git cannot
+/// execute a path inside the sandbox, so the program is a host-side shell
+/// script that re-enters the sandbox as a second instance of the app running
+/// the helper binary. The socket and token are forwarded explicitly — git
+/// carries `KOSHI_ASKPASS_*` in the environment it gives the script, and the
+/// helper instance needs them back inside. The socket path itself is valid in
+/// all three contexts because it lives in the shared per-app runtime dir.
+fn write_host_askpass(path: &std::path::Path, app_id: &str) -> io::Result<()> {
+    let script = format!(
+        "#!/bin/sh\n\
+         exec flatpak run \
+         --env={SOCKET_ENV}=\"${SOCKET_ENV}\" \
+         --env={TOKEN_ENV}=\"${TOKEN_ENV}\" \
+         --command={HELPER_BINARY} {app_id} \"$@\"\n"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(path)?;
+    file.write_all(script.as_bytes())
 }
 
 impl Drop for AskpassServer {

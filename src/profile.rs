@@ -7,7 +7,6 @@
 //! against fixed input.
 
 use std::cell::RefCell;
-use std::process::Command;
 use std::rc::Rc;
 
 /// One `key = value` pair from a `[sendemail]` section, carrying the
@@ -185,7 +184,7 @@ pub fn invalidate() {
 /// Returns an empty profile when git is missing or has nothing configured, so
 /// callers never have to distinguish the two.
 pub fn load() -> Profile {
-    let output = Command::new("git")
+    let output = crate::flatpak::git_command()
         .args(["config", "--list", "-z", "--show-scope"])
         .output();
     match output {
@@ -219,7 +218,7 @@ fn strip_local_scope(raw: &str) -> String {
 /// `git send-email` (and Koshi's own view) uses that identity. Returns
 /// whether the write succeeded.
 pub fn set_active_identity(name: &str) -> bool {
-    let ok = Command::new("git")
+    let ok = crate::flatpak::git_command()
         .args(["config", "--global", "sendemail.identity", name])
         .status()
         .map(|status| status.success())
@@ -235,7 +234,7 @@ pub fn reject_smtp_credential(host: &str, username: &str) {
     use std::io::Write;
     use std::process::Stdio;
 
-    let Ok(mut child) = Command::new("git")
+    let Ok(mut child) = crate::flatpak::git_command()
         .args(["credential", "reject"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

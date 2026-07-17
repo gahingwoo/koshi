@@ -3,6 +3,7 @@ mod cache;
 mod composer;
 mod favorites;
 mod favorites_page;
+mod flatpak;
 mod highlight;
 mod inbox_page;
 mod list_page;

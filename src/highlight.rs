@@ -114,6 +114,81 @@ pub fn classify(text: &str) -> Vec<Span> {
     spans
 }
 
+/// Per line of `text`, `true` if the line must be preserved verbatim by a
+/// rewrap pass and `false` if it is plain prose safe to reflow. Structural
+/// lines are quoted lines (any depth) and every part of a unified diff —
+/// headers, hunks, added/removed and context lines — reusing the same state
+/// machine [`classify`] drives. When a diff is present, the `---` scissors and
+/// diffstat that git format-patch places just above it are protected too, so
+/// the whole patch survives; that back-fill only runs when a real diff was
+/// found, keeping it from firing on a prose `---` rule or an `a | b` table.
+pub fn preserve_mask(text: &str) -> Vec<bool> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut mask = vec![false; lines.len()];
+    let mut state = State::None;
+    let mut state_depth = 0usize;
+    let mut first_diff: Option<usize> = None;
+
+    for (n, line) in lines.iter().enumerate() {
+        let (depth, prefix) = split_quote(line);
+        if depth != state_depth {
+            state = State::None;
+            state_depth = depth;
+        }
+        let content = line[prefix..].strip_suffix('\r').unwrap_or(&line[prefix..]);
+        let next_is_plus = lines.get(n + 1).is_some_and(|next| {
+            let (d, p) = split_quote(next);
+            d == depth && next[p..].starts_with("+++ ")
+        });
+        let (next_state, outcome) = step(state, content, next_is_plus, depth > 0);
+        state = next_state;
+
+        let in_diff = matches!(outcome, Outcome::InDiff(_));
+        if in_diff && first_diff.is_none() {
+            first_diff = Some(n);
+        }
+        mask[n] = depth > 0 || in_diff;
+    }
+
+    if let Some(first) = first_diff {
+        // Walk back over the blank gap and the diffstat/scissors block above
+        // the first diff line, stopping at the commit message prose.
+        for n in (0..first).rev() {
+            let line = lines[n].trim_end_matches('\r');
+            if line.trim().is_empty() {
+                continue;
+            }
+            if is_diffstat_line(line) {
+                mask[n] = true;
+            } else {
+                break;
+            }
+        }
+    }
+    mask
+}
+
+/// Whether `line` looks like a git-format-patch diffstat entry or the `---`
+/// scissors that separates the commit message from the diff. Only consulted
+/// for the lines immediately above a confirmed diff, so the loose matching
+/// here cannot mis-fire on unrelated prose.
+fn is_diffstat_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    // The `---` scissors git format-patch places between message and diff.
+    if trimmed == "---" {
+        return true;
+    }
+    // A per-file stat: " path/to/file | 3 +-" (or "| Bin ..." / "old => new |").
+    if line.starts_with(' ') && trimmed.contains(" | ") {
+        return true;
+    }
+    // The summary: " 2 files changed, 3 insertions(+), 1 deletion(-)".
+    if trimmed.contains("changed") && trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    false
+}
+
 fn push(spans: &mut Vec<Span>, line: usize, start: usize, end: usize, kind: Option<Kind>) {
     if let Some(kind) = kind
         && start < end
@@ -643,6 +718,57 @@ mod tests {
             lines[span.line].push(span.kind);
         }
         lines
+    }
+
+    #[test]
+    fn preserve_mask_marks_prose_reflowable() {
+        let mask = preserve_mask("first line\nsecond line\n\nthird");
+        assert_eq!(mask, vec![false, false, false, false]);
+    }
+
+    #[test]
+    fn preserve_mask_protects_quotes() {
+        let mask = preserve_mask("reply\n> quoted\n>> deeper\nmore reply");
+        assert_eq!(mask, vec![false, true, true, false]);
+    }
+
+    #[test]
+    fn preserve_mask_protects_the_whole_patch() {
+        let body = "\
+Fix the frobnicator.
+
+---
+ src/frob.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/frob.c b/src/frob.c
+index 1111111..2222222 100644
+--- a/src/frob.c
++++ b/src/frob.c
+@@ -1,2 +1,2 @@
+ keep
+-old line
++new line";
+        let mask = preserve_mask(body);
+        // The commit message and the two blank gaps stay reflowable.
+        assert!(!mask[0], "commit message frozen");
+        assert!(!mask[1], "blank after message frozen");
+        assert!(!mask[5], "blank before diff frozen");
+        // The scissors, diffstat, and every diff line are preserved.
+        for (n, line) in body.split('\n').enumerate() {
+            if n == 0 || line.trim().is_empty() {
+                continue;
+            }
+            assert!(mask[n], "line {n} not preserved: {line:?}");
+        }
+    }
+
+    #[test]
+    fn preserve_mask_leaves_a_lone_rule_alone_without_a_diff() {
+        // A prose "---" with no diff after it is not a scissors, so it is not
+        // force-frozen (it reflows to itself harmlessly either way).
+        let mask = preserve_mask("intro\n\n---\n\nmore prose");
+        assert_eq!(mask, vec![false, false, false, false, false]);
     }
 
     #[test]

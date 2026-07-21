@@ -234,11 +234,20 @@ fn append_signature(body: &str, signature: &str) -> String {
 }
 
 /// Greedy-wrap `text` at `width` columns on word boundaries. Blank lines are
-/// kept as paragraph breaks, quoted lines (starting with ">") pass through
-/// untouched, and words longer than `width` (long URLs) stay on their own line
-/// unbroken. Width is counted in chars, not display cells, so wide CJK glyphs
-/// count as one column.
-fn rewrap(text: &str, width: usize) -> String {
+/// kept as paragraph breaks; structural lines pass through untouched — quoted
+/// lines and every part of a unified diff (see [`highlight::preserve_mask`]) —
+/// and a trailing copy of `signature` is preserved verbatim so a configured
+/// signature at the end of the body is never reflowed. Words longer than
+/// `width` (long URLs) stay on their own line unbroken. Width is counted in
+/// chars, not display cells, so wide CJK glyphs count as one column.
+fn rewrap(text: &str, width: usize, signature: &str) -> String {
+    // Peel a signature block off the end so it survives verbatim. It only
+    // counts as the signature when it sits at the very end of the body; a
+    // matching block with prose after it is just text, and gets rewrapped.
+    let (text, sig_tail) = split_signature(text, signature);
+
+    let mask = highlight::preserve_mask(text);
+    let lines: Vec<&str> = text.split('\n').collect();
     let mut out: Vec<String> = Vec::new();
     let mut para: Vec<&str> = Vec::new();
 
@@ -266,13 +275,13 @@ fn rewrap(text: &str, width: usize) -> String {
         para.clear();
     };
 
-    for raw_line in text.lines() {
-        if raw_line.trim().is_empty() {
-            flush(&mut para, &mut out);
-            out.push(String::new());
-        } else if raw_line.starts_with('>') {
+    for (i, raw_line) in lines.iter().enumerate() {
+        if mask[i] {
             flush(&mut para, &mut out);
             out.push(raw_line.to_string());
+        } else if raw_line.trim().is_empty() {
+            flush(&mut para, &mut out);
+            out.push(String::new());
         } else {
             para.push(raw_line);
         }
@@ -280,10 +289,29 @@ fn rewrap(text: &str, width: usize) -> String {
     flush(&mut para, &mut out);
 
     let mut result = out.join("\n");
-    if text.ends_with('\n') && !result.is_empty() {
-        result.push('\n');
-    }
+    result.push_str(sig_tail);
     result
+}
+
+/// Split a trailing `signature` block off `text`, returning `(head, tail)`
+/// where `tail` is the verbatim signature (including any trailing newlines)
+/// and `head` is everything before it. The signature must sit at the end of
+/// the body on a line boundary; otherwise the whole text is the head and the
+/// tail is empty. An empty configured signature never matches.
+fn split_signature<'a>(text: &'a str, signature: &str) -> (&'a str, &'a str) {
+    let sig = signature.trim_end_matches('\n');
+    if sig.is_empty() {
+        return (text, "");
+    }
+    let end = text.trim_end_matches('\n').len();
+    match end.checked_sub(sig.len()) {
+        Some(start)
+            if &text[start..end] == sig && (start == 0 || text.as_bytes()[start - 1] == b'\n') =>
+        {
+            (&text[..start], &text[start..])
+        }
+        _ => (text, ""),
+    }
 }
 
 /// The `From:` identity for a reply — the sender git will actually send as,
@@ -964,8 +992,14 @@ fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
         #[strong]
         state,
         move |_| {
-            // Rewrap only the body; the headers are never wrapped.
-            state.replace_body(&rewrap(&state.body_text(), WRAP_WIDTH));
+            // Rewrap only the body; the headers are never wrapped. The
+            // configured signature is passed so a copy at the end of the body
+            // survives verbatim rather than being reflowed.
+            state.replace_body(&rewrap(
+                &state.body_text(),
+                WRAP_WIDTH,
+                &settings::reply_signature(),
+            ));
         }
     ));
     button
@@ -1175,7 +1209,7 @@ mod tests {
     #[test]
     fn rewrap_wraps_long_lines_at_word_boundaries() {
         let input = "one two three ".repeat(10); // 140 chars on one line
-        let wrapped = rewrap(input.trim_end(), 72);
+        let wrapped = rewrap(input.trim_end(), 72, "");
         assert!(wrapped.lines().count() > 1);
         for line in wrapped.lines() {
             assert!(line.chars().count() <= 72, "line too long: {line:?}");
@@ -1194,7 +1228,7 @@ mod tests {
     fn rewrap_leaves_quoted_lines_untouched() {
         let quoted = format!("> {}", "quoted words repeated ".repeat(8).trim_end());
         let input = format!("{quoted}\n\nA reply line");
-        let wrapped = rewrap(&input, 72);
+        let wrapped = rewrap(&input, 72, "");
         assert!(wrapped.lines().next().unwrap() == quoted, "quote rewrapped");
         assert!(wrapped.ends_with("A reply line"));
     }
@@ -1203,18 +1237,21 @@ mod tests {
     fn rewrap_preserves_paragraph_breaks() {
         let long = "word ".repeat(30);
         let input = format!("{}\n\n{}", long.trim_end(), "short second paragraph");
-        let wrapped = rewrap(&input, 72);
+        let wrapped = rewrap(&input, 72, "");
         assert!(wrapped.contains("\n\n"), "blank line lost: {wrapped:?}");
         assert!(wrapped.ends_with("short second paragraph"));
         // Consecutive lines of one paragraph are joined before wrapping.
-        assert_eq!(rewrap("joined\nacross\nlines", 72), "joined across lines");
+        assert_eq!(
+            rewrap("joined\nacross\nlines", 72, ""),
+            "joined across lines"
+        );
     }
 
     #[test]
     fn rewrap_keeps_unbreakable_words_whole() {
         let url = format!("https://example.com/{}", "x".repeat(80));
         let input = format!("see {url} for details");
-        let wrapped = rewrap(&input, 72);
+        let wrapped = rewrap(&input, 72, "");
         assert!(
             wrapped.lines().any(|line| line == url),
             "URL broken: {wrapped:?}"
@@ -1223,8 +1260,8 @@ mod tests {
 
     #[test]
     fn rewrap_preserves_trailing_newline() {
-        assert_eq!(rewrap("line\n", 72), "line\n");
-        assert_eq!(rewrap("line", 72), "line");
+        assert_eq!(rewrap("line\n", 72, ""), "line\n");
+        assert_eq!(rewrap("line", 72, ""), "line");
     }
 
     #[test]
@@ -1234,8 +1271,93 @@ mod tests {
             "word ".repeat(40).trim_end(),
             "tail ".repeat(30).trim_end()
         );
-        let once = rewrap(&input, 72);
-        assert_eq!(rewrap(&once, 72), once);
+        let once = rewrap(&input, 72, "");
+        assert_eq!(rewrap(&once, 72, ""), once);
+    }
+
+    #[test]
+    fn rewrap_preserves_a_diff_verbatim() {
+        // A prose intro (long enough to wrap) followed by a git-format-patch
+        // body: the whole patch — scissors, diffstat, header, hunk, +/- and
+        // context lines — must come through byte-for-byte.
+        let intro = "word ".repeat(30);
+        let patch = "\
+---
+ src/frob.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/frob.c b/src/frob.c
+index 1111111..2222222 100644
+--- a/src/frob.c
++++ b/src/frob.c
+@@ -1,2 +1,2 @@
+ keep this context line long enough that it would wrap if it were ever treated as prose
+-old line
++new line";
+        let input = format!("{}\n\n{patch}\n", intro.trim_end());
+        let wrapped = rewrap(&input, 72, "");
+        assert!(wrapped.contains(patch), "patch was mangled:\n{wrapped}");
+        // The intro before the patch still wrapped.
+        assert!(
+            wrapped.lines().take_while(|l| *l != "---").count() > 1,
+            "intro not wrapped: {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn rewrap_preserves_the_configured_signature() {
+        // A signature without any "-- " marker, sitting at the end, survives
+        // verbatim even though it looks like ordinary prose.
+        let signature = "Nika Krasnova\nhttps://nikableh.moe";
+        let intro = "word ".repeat(30);
+        let input = format!("{}\n\n{signature}\n", intro.trim_end());
+        let wrapped = rewrap(&input, 72, signature);
+        assert!(
+            wrapped.ends_with(&format!("{signature}\n")),
+            "signature reflowed: {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn rewrap_reflows_signature_lookalike_that_is_not_at_the_end() {
+        // The same text as the signature, but with prose after it, is not the
+        // signature — it must be rewrapped like any other prose.
+        let signature = "Nika Krasnova and a long trailing line that would wrap when reflowed here";
+        let input = format!("{signature}\n\nmore prose after the block\n");
+        let wrapped = rewrap(&input, 72, signature);
+        assert!(
+            !wrapped.contains(signature),
+            "lookalike block was frozen: {wrapped:?}"
+        );
+        assert!(wrapped.ends_with("more prose after the block\n"));
+    }
+
+    #[test]
+    fn rewrap_empty_signature_never_freezes() {
+        // A deliberate "no signature" must not peel anything off the end.
+        let long = "word ".repeat(30);
+        let input = format!("{}\n", long.trim_end());
+        let wrapped = rewrap(&input, 72, "");
+        assert!(wrapped.lines().count() > 1, "body not wrapped: {wrapped:?}");
+    }
+
+    #[test]
+    fn rewrap_handles_a_patch_and_signature_together() {
+        // prose + diff + signature: the diff and the signature are both
+        // preserved, and the whole thing is idempotent.
+        let intro = "word ".repeat(20);
+        let signature = "-- \nNika";
+        let input = format!(
+            "{}\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n\n{signature}\n",
+            intro.trim_end()
+        );
+        let once = rewrap(&input, 72, signature);
+        assert!(once.contains("@@ -1 +1 @@"), "hunk lost: {once}");
+        assert!(
+            once.ends_with(&format!("{signature}\n")),
+            "sig lost: {once}"
+        );
+        assert_eq!(rewrap(&once, 72, signature), once, "not idempotent");
     }
 
     #[test]

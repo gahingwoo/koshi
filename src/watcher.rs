@@ -14,7 +14,6 @@
 //! limiter trips, it answers *everything* with 503, including whatever page
 //! the user is trying to read.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use adw::prelude::*;
@@ -195,7 +194,7 @@ async fn poll_one(
             .iter()
             .filter(|d| !seen.contains(d.message_id.as_str()))
         {
-            notify_new_message(app, &digest.author, &digest.subject);
+            notify_new_message(app, &digest.message_id, &digest.author, &digest.subject);
         }
     }
 
@@ -217,39 +216,31 @@ async fn poll_one(
 /// title, the subject as the body — mirroring how a desktop mail client
 /// announces an arrival.
 ///
-/// Sent straight to `org.freedesktop.Notifications` rather than through
-/// `GApplication::send_notification`. Under GNOME the latter routes via
-/// `org.gtk.Notifications`, which only displays a notification for an app GNOME
-/// Shell has indexed from an *installed* `.desktop` file — so an uninstalled
-/// build (`cargo run`), or one whose desktop file was added to an already
-/// running session, has every notification silently dropped with an `InvalidApp`
-/// error. The freedesktop service imposes no such requirement, so the banner
-/// shows however Koshi was launched.
-fn notify_new_message(app: &adw::Application, author: &str, subject: &str) {
+/// Sent through the XDG desktop portal (`org.freedesktop.portal.Notification`)
+/// rather than the bare `org.freedesktop.Notifications` service or GTK's own
+/// `GApplication::send_notification`. The portal is the sandbox-friendly route:
+/// it needs no D-Bus hole poked in the Flatpak manifest (the desktop portal is
+/// always reachable), attributes the banner to Koshi's app id on its own, and
+/// works identically installed or run from `cargo`. It replaces the earlier
+/// direct call, which required a `--talk-name` grant and a hand-extracted icon
+/// file for the notification daemon to read.
+///
+/// `id` is the message's own Message-Id: the portal replaces a notification
+/// whose id it has already seen, so reusing it dedupes a message that somehow
+/// surfaces twice without coalescing distinct arrivals.
+fn notify_new_message(app: &adw::Application, id: &str, author: &str, subject: &str) {
     let Some(connection) = app.dbus_connection() else {
         log::warn!("no session bus; cannot notify about \"{subject}\"");
         return;
     };
-    // org.freedesktop.Notifications.Notify — signature `susssasa{sv}i`.
-    let icon = notification_icon();
-    let params = (
-        "Koshi",                                 // app_name
-        0u32,                                    // replaces_id: never coalesce
-        icon.as_str(),                           // app_icon: Koshi's symbolic icon
-        author,                                  // summary (notification title)
-        subject,                                 // body
-        &[] as &[&str],                          // actions: none
-        HashMap::<String, glib::Variant>::new(), // hints: none
-        -1i32,                                   // expire_timeout: server default
-    )
-        .to_variant();
+    let params = add_notification_params(id, author, subject);
     connection.call(
-        Some("org.freedesktop.Notifications"),
-        "/org/freedesktop/Notifications",
-        "org.freedesktop.Notifications",
-        "Notify",
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.portal.Notification",
+        "AddNotification",
         Some(&params),
-        Some(glib::VariantTy::new("(u)").expect("valid reply signature")),
+        None,
         gio::DBusCallFlags::NONE,
         -1,
         gio::Cancellable::NONE,
@@ -261,44 +252,43 @@ fn notify_new_message(app: &adw::Application, author: &str, subject: &str) {
     );
 }
 
-/// The bundled symbolic app icon, as a gresource path.
-const ICON_RESOURCE: &str =
-    "/moe/nikableh/Koshi/icons/symbolic/apps/moe.nikableh.Koshi-symbolic.svg";
-
-thread_local! {
-    /// Filesystem path to Koshi's notification icon, or `None` before the first
-    /// notification materialises it. See [`notification_icon`].
-    static NOTIFICATION_ICON: RefCell<Option<String>> = const { RefCell::new(None) };
+/// The `(sa{sv})` argument tuple for
+/// `org.freedesktop.portal.Notification.AddNotification`: the notification id
+/// and its property dictionary (title, body, icon).
+fn add_notification_params(id: &str, author: &str, subject: &str) -> glib::Variant {
+    let mut notification: HashMap<&str, glib::Variant> = HashMap::new();
+    notification.insert("title", author.to_variant());
+    notification.insert("body", subject.to_variant());
+    // Serialized GIcon (sv): a themed icon, tried in order. The app id resolves
+    // to Koshi's installed icon; `mail-unread` is the themed fallback for an
+    // uninstalled build whose icon isn't in the theme yet.
+    notification.insert(
+        "icon",
+        ("themed", ["moe.nikableh.Koshi", "mail-unread"].to_variant()).to_variant(),
+    );
+    (id, notification).to_variant()
 }
 
-/// The `app_icon` to hand `org.freedesktop.Notifications`: an absolute path to
-/// Koshi's symbolic icon, written out from the bundled gresource on first use.
-///
-/// The notification daemon is a separate process and can't read Koshi's
-/// in-process resources, so the icon has to exist as a real file; extracting it
-/// works whether or not Koshi is installed with its icon in a system theme. The
-/// `-symbolic.svg` filename is preserved so the shell recolours it for the
-/// current theme (light icon on a dark banner). Extraction is done once per run
-/// and cached; if it fails, the themed `mail-unread` stands in.
-fn notification_icon() -> String {
-    NOTIFICATION_ICON.with_borrow_mut(|cached| {
-        if let Some(path) = cached {
-            return path.clone();
-        }
-        let path = extract_notification_icon().unwrap_or_else(|| "mail-unread".to_string());
-        *cached = Some(path.clone());
-        path
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Write the bundled icon to `$XDG_CACHE_HOME/koshi/` and return its path, or
-/// `None` if the resource is missing or the file can't be written.
-fn extract_notification_icon() -> Option<String> {
-    let bytes = gio::resources_lookup_data(ICON_RESOURCE, gio::ResourceLookupFlags::NONE).ok()?;
-    let dir = glib::user_cache_dir().join("koshi");
-    std::fs::create_dir_all(&dir).ok()?;
-    // Keep the -symbolic.svg name so the shell recolours it.
-    let path = dir.join("moe.nikableh.Koshi-symbolic.svg");
-    std::fs::write(&path, bytes.as_ref()).ok()?;
-    path.into_os_string().into_string().ok()
+    /// The params must serialise to exactly what `AddNotification` expects —
+    /// `(sa{sv})` — including the icon nested as a boxed `(sv)`. A mismatch here
+    /// is only caught at the D-Bus call otherwise, never at compile time.
+    #[test]
+    fn add_notification_params_has_portal_signature() {
+        let params = add_notification_params("<id@lore>", "Linus", "Re: patch");
+        assert_eq!(params.type_().as_str(), "(sa{sv})");
+
+        // Each a{sv} entry is (key: s, value: v); unbox the value and confirm
+        // the icon is a serialised GIcon tuple `(sv)`.
+        let dict = params.child_value(1);
+        let icon = dict
+            .iter()
+            .find(|entry| entry.child_value(0).str() == Some("icon"))
+            .and_then(|entry| entry.child_value(1).as_variant())
+            .expect("icon key present");
+        assert_eq!(icon.type_().as_str(), "(sv)");
+    }
 }

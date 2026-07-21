@@ -14,8 +14,7 @@
         "--socket=wayland",
         "--device=dri",
         "--share=network",
-        "--talk-name=org.freedesktop.Flatpak",
-        "--talk-name=org.freedesktop.Notifications"
+        "--talk-name=org.freedesktop.Flatpak"
     ],
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin",

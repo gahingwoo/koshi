@@ -100,6 +100,24 @@ impl ComposerState {
         body
     }
 
+    /// The body-relative line range covered by the current selection, or
+    /// `None` when nothing is selected or the selection lies entirely within
+    /// the header block. Lines are counted from the first body line so the
+    /// range indexes straight into [`ComposerState::body_text`].
+    fn selected_body_lines(&self) -> Option<std::ops::Range<usize>> {
+        let (start, end) = self.document.selection_bounds()?;
+        let body_first = self
+            .document
+            .iter_at_offset(body_start_offset(&self.document_text()))
+            .line();
+        if end.line() < body_first {
+            return None;
+        }
+        let from = (start.line() - body_first).max(0) as usize;
+        let to = (end.line() - body_first) as usize + 1;
+        Some(from..to)
+    }
+
     /// Replace just the body region in one undoable step, leaving the headers
     /// untouched. `TextBuffer::set_text` would wrap delete+insert in an
     /// *irreversible* action that drops the undo stack, so edits the user should
@@ -233,6 +251,12 @@ fn append_signature(body: &str, signature: &str) -> String {
     out
 }
 
+/// [`rewrap_range`] over the whole body — every line is eligible to reflow.
+#[cfg(test)]
+fn rewrap(text: &str, width: usize, signature: &str) -> String {
+    rewrap_range(text, width, signature, None)
+}
+
 /// Greedy-wrap `text` at `width` columns on word boundaries. Blank lines are
 /// kept as paragraph breaks; structural lines pass through untouched — quoted
 /// lines and every part of a unified diff (see [`highlight::preserve_mask`]) —
@@ -240,7 +264,17 @@ fn append_signature(body: &str, signature: &str) -> String {
 /// signature at the end of the body is never reflowed. Words longer than
 /// `width` (long URLs) stay on their own line unbroken. Width is counted in
 /// chars, not display cells, so wide CJK glyphs count as one column.
-fn rewrap(text: &str, width: usize, signature: &str) -> String {
+///
+/// When `selection` is `Some`, only lines whose index falls in the range are
+/// reflowed; every other line passes through verbatim (so "Rewrap Selection"
+/// touches just the chosen lines while still honouring the structural and
+/// signature rules across the whole body). `None` reflows the whole body.
+fn rewrap_range(
+    text: &str,
+    width: usize,
+    signature: &str,
+    selection: Option<std::ops::Range<usize>>,
+) -> String {
     // Peel a signature block off the end so it survives verbatim. It only
     // counts as the signature when it sits at the very end of the body; a
     // matching block with prose after it is just text, and gets rewrapped.
@@ -276,7 +310,8 @@ fn rewrap(text: &str, width: usize, signature: &str) -> String {
     };
 
     for (i, raw_line) in lines.iter().enumerate() {
-        if mask[i] {
+        let selected = selection.as_ref().is_none_or(|r| r.contains(&i));
+        if !selected || mask[i] {
             flush(&mut para, &mut out);
             out.push(raw_line.to_string());
         } else if raw_line.trim().is_empty() {
@@ -985,21 +1020,25 @@ fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
         // Bundled icon: icon-development-kit's arrow-hook-left-horizontal2
         // flipped vertically (see data/icons/).
         .icon_name("koshi-rewrap-symbolic")
-        .tooltip_text("Rewrap Lines")
+        .tooltip_text("Rewrap Selection")
         .css_classes(["flat"])
         .build();
     button.connect_clicked(glib::clone!(
         #[strong]
         state,
         move |_| {
-            // Rewrap only the body; the headers are never wrapped. The
-            // configured signature is passed so a copy at the end of the body
-            // survives verbatim rather than being reflowed.
-            state.replace_body(&rewrap(
-                &state.body_text(),
-                WRAP_WIDTH,
-                &settings::reply_signature(),
-            ));
+            // Rewrap only the selected lines. Headers are never wrapped (the
+            // selection is mapped into the body), and the configured signature
+            // is passed so a copy at the end of the body survives verbatim
+            // rather than being reflowed. With nothing selected, do nothing.
+            if let Some(selection) = state.selected_body_lines() {
+                state.replace_body(&rewrap_range(
+                    &state.body_text(),
+                    WRAP_WIDTH,
+                    &settings::reply_signature(),
+                    Some(selection),
+                ));
+            }
         }
     ));
     button
@@ -1358,6 +1397,51 @@ index 1111111..2222222 100644
             "sig lost: {once}"
         );
         assert_eq!(rewrap(&once, 72, signature), once, "not idempotent");
+    }
+
+    #[test]
+    fn rewrap_preserves_a_git_format_patch_version_footer() {
+        // git format-patch ends a patch with "-- \n<version>"; the sigdash
+        // must not be joined onto the version line (the reported "-- 2.55.0").
+        let intro = "word ".repeat(20);
+        let input = format!(
+            "{}\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n-- \n2.55.0\n",
+            intro.trim_end()
+        );
+        // No configured signature: the sigdash alone must protect the footer.
+        let wrapped = rewrap(&input, 72, "");
+        assert!(
+            wrapped.contains("-- \n2.55.0"),
+            "footer joined: {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn rewrap_range_touches_only_selected_lines() {
+        // Two long prose paragraphs separated by a blank line; select only the
+        // second (lines 2..3). The first must stay on one over-long line.
+        let first = "one two three four five six seven eight nine ten eleven twelve thirteen";
+        let second = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi";
+        let input = format!("{first}\n\n{second}");
+        let wrapped = rewrap_range(&input, 40, "", Some(2..3));
+        // First paragraph untouched (still one line, over width).
+        assert!(
+            wrapped.lines().next().unwrap() == first,
+            "unselected line changed: {wrapped:?}"
+        );
+        // Second paragraph got wrapped to <= 40 cols.
+        let tail: Vec<&str> = wrapped.lines().skip(2).collect();
+        assert!(tail.len() > 1, "selection not wrapped: {wrapped:?}");
+        assert!(tail.iter().all(|l| l.chars().count() <= 40));
+    }
+
+    #[test]
+    fn rewrap_range_keeps_diff_verbatim_even_when_selected() {
+        // Selecting across a diff still preserves it — structure wins over the
+        // selection.
+        let input = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b".to_string();
+        let wrapped = rewrap_range(&input, 72, "", Some(0..6));
+        assert_eq!(wrapped, input, "selected diff was reflowed: {wrapped:?}");
     }
 
     #[test]

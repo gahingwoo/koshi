@@ -122,12 +122,18 @@ pub fn classify(text: &str) -> Vec<Span> {
 /// diffstat that git format-patch places just above it are protected too, so
 /// the whole patch survives; that back-fill only runs when a real diff was
 /// found, keeping it from firing on a prose `---` rule or an `a | b` table.
+///
+/// A bare `-- ` line (the RFC 3676 signature separator, which git
+/// format-patch emits above its version footer) freezes everything from there
+/// to the end, so a trailing signature or `-- \n2.55.0` footer is never
+/// reflowed even when it is not the user's configured signature.
 pub fn preserve_mask(text: &str) -> Vec<bool> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut mask = vec![false; lines.len()];
     let mut state = State::None;
     let mut state_depth = 0usize;
     let mut first_diff: Option<usize> = None;
+    let mut in_signature = false;
 
     for (n, line) in lines.iter().enumerate() {
         let (depth, prefix) = split_quote(line);
@@ -147,7 +153,11 @@ pub fn preserve_mask(text: &str) -> Vec<bool> {
         if in_diff && first_diff.is_none() {
             first_diff = Some(n);
         }
-        mask[n] = depth > 0 || in_diff;
+        // An unquoted `-- ` sigdash starts a signature that runs to the end.
+        if depth == 0 && content == "-- " {
+            in_signature = true;
+        }
+        mask[n] = in_signature || depth > 0 || in_diff;
     }
 
     if let Some(first) = first_diff {
@@ -769,6 +779,13 @@ index 1111111..2222222 100644
         // force-frozen (it reflows to itself harmlessly either way).
         let mask = preserve_mask("intro\n\n---\n\nmore prose");
         assert_eq!(mask, vec![false, false, false, false, false]);
+    }
+
+    #[test]
+    fn preserve_mask_freezes_after_a_sigdash() {
+        // Everything from a bare "-- " to the end is a signature/footer.
+        let mask = preserve_mask("prose line\n\n-- \n2.55.0");
+        assert_eq!(mask, vec![false, false, true, true]);
     }
 
     #[test]

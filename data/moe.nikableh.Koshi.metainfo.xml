@@ -27,6 +27,33 @@
 
   <launchable type="desktop-id">moe.nikableh.Koshi.desktop</launchable>
 
+  <screenshots>
+    <screenshot type="default">
+      <caption>Reading a patch with a highlighted diff</caption>
+      <image>https://raw.githubusercontent.com/nikableh/koshi/main/data/screenshots/Screenshot-3.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Pick any list mirrored on lore.kernel.org</caption>
+      <image>https://raw.githubusercontent.com/nikableh/koshi/main/data/screenshots/Screenshot-1.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Browse patches and threads in a list</caption>
+      <image>https://raw.githubusercontent.com/nikableh/koshi/main/data/screenshots/Screenshot-2.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Follow a thread with the overview sidebar</caption>
+      <image>https://raw.githubusercontent.com/nikableh/koshi/main/data/screenshots/Screenshot-4.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Reply using your existing git identity</caption>
+      <image>https://raw.githubusercontent.com/nikableh/koshi/main/data/screenshots/Screenshot-5.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Compose in a focused, full-width editor</caption>
+      <image>https://raw.githubusercontent.com/nikableh/koshi/main/data/screenshots/Screenshot-6.png</image>
+    </screenshot>
+  </screenshots>
+
   <url type="homepage">https://github.com/nikableh/koshi</url>
   <url type="bugtracker">https://github.com/nikableh/koshi/issues</url>
   <url type="vcs-browser">https://github.com/nikableh/koshi</url>

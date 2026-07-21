@@ -11,6 +11,17 @@
 Koshi is a native GTK4 + libadwaita app for browsing, searching, and replying
 to the mailing lists archived on [lore.kernel.org](https://lore.kernel.org).
 
+## Screenshots
+
+<p align="center">
+  <img src="data/screenshots/Screenshot-3.png" width="49%" alt="Reading a patch with a highlighted diff">
+  <img src="data/screenshots/Screenshot-1.png" width="49%" alt="Pick any list mirrored on lore.kernel.org">
+</p>
+<p align="center">
+  <img src="data/screenshots/Screenshot-4.png" width="49%" alt="Follow a thread with the overview sidebar">
+  <img src="data/screenshots/Screenshot-5.png" width="49%" alt="Reply using your existing git identity">
+</p>
+
 ## Installing
 
 Koshi is distributed as a Flatpak from its own repository:

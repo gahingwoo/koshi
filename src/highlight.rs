@@ -270,6 +270,13 @@ const ALL_TAGS: [&str; 6] = [
 const SEARCH_TAG: &str = "koshi-search";
 const SEARCH_CURRENT_TAG: &str = "koshi-search-current";
 
+/// Composer-only trailing-whitespace tag. Like the search tags it stays out of
+/// ALL_TAGS and paints a background, so the quote/diff refresh never strips it
+/// and the underlying text coloring shows through. Only the editable composer
+/// applies it (via [`mark_trailing_whitespace`]); read-only bodies create the
+/// tag but never use it, so received mail is not littered with the flag.
+const TRAILING_TAG: &str = "koshi-trailing-ws";
+
 /// GNOME palette colors per scheme: quote, then add, remove, hunk, header,
 /// meta.
 struct Palette {
@@ -282,6 +289,8 @@ struct Palette {
     /// Backgrounds for the search match and the current search match.
     search: &'static str,
     search_current: &'static str,
+    /// Background flagging trailing whitespace in the composer.
+    trailing: &'static str,
 }
 
 const LIGHT: Palette = Palette {
@@ -293,6 +302,7 @@ const LIGHT: Palette = Palette {
     meta: "#5e5c64",
     search: "#f9f06b",
     search_current: "#ffbe6f",
+    trailing: "#f66151",
 };
 
 const DARK: Palette = Palette {
@@ -304,6 +314,7 @@ const DARK: Palette = Palette {
     meta: "#9a9996",
     search: "#665c00",
     search_current: "#a15d00",
+    trailing: "#c01c28",
 };
 
 fn tag_name(kind: Kind) -> &'static str {
@@ -332,7 +343,7 @@ pub fn attach(buffer: &gtk::TextBuffer) {
     for name in [HUNK_TAG, HEADER_TAG] {
         buffer.create_tag(Some(name), &[("weight", &700i32)]);
     }
-    for name in [SEARCH_TAG, SEARCH_CURRENT_TAG] {
+    for name in [SEARCH_TAG, SEARCH_CURRENT_TAG, TRAILING_TAG] {
         buffer.create_tag(Some(name), &[]);
     }
 
@@ -375,10 +386,12 @@ fn apply_colors(buffer: &gtk::TextBuffer, dark: bool) {
             tag.set_property("foreground-rgba", rgba);
         }
     }
-    // Search tags carry a background rather than a foreground.
+    // Search and trailing-whitespace tags carry a background rather than a
+    // foreground.
     for (name, hex) in [
         (SEARCH_TAG, palette.search),
         (SEARCH_CURRENT_TAG, palette.search_current),
+        (TRAILING_TAG, palette.trailing),
     ] {
         if let Some(tag) = table.lookup(name) {
             let rgba = gdk::RGBA::parse(hex).expect("palette hex is valid");
@@ -421,6 +434,48 @@ pub fn clear_search(buffer: &gtk::TextBuffer) {
         if let Some(tag) = table.lookup(name) {
             buffer.remove_tag(&tag, &start, &end);
         }
+    }
+}
+
+/// The trailing whitespace in `text`, as absolute character-offset ranges
+/// `start..end` covering the run of spaces/tabs at the end of each line.
+///
+/// Every stray run is flagged, with no exceptions — including the signature
+/// separator line `"-- "`: its trailing space is easy to lose track of, so it
+/// gets the same visible flag as any other. A line that is nothing but
+/// whitespace flags in full. Offsets are character offsets, the addressing the
+/// buffer glue uses.
+pub fn trailing_whitespace(text: &str) -> Vec<(i32, i32)> {
+    let mut ranges = Vec::new();
+    let mut line_start = 0i32;
+    for line in text.split('\n') {
+        let chars = line.chars().count() as i32;
+        let kept = line.trim_end_matches([' ', '\t']).chars().count() as i32;
+        if kept < chars {
+            ranges.push((line_start + kept, line_start + chars));
+        }
+        // Advance past this line and the '\n' that split() consumed.
+        line_start += chars + 1;
+    }
+    ranges
+}
+
+/// Flag trailing whitespace in an editable composer buffer: clear the previous
+/// flags, then paint the redish background over each stray run. Applying and
+/// removing tags emits no "changed", so this is safe to call from a changed
+/// handler alongside [`refresh`]. Read-only bodies never call this.
+pub fn mark_trailing_whitespace(buffer: &gtk::TextBuffer) {
+    let table = buffer.tag_table();
+    let Some(tag) = table.lookup(TRAILING_TAG) else {
+        return;
+    };
+    let (start, end) = buffer.bounds();
+    buffer.remove_tag(&tag, &start, &end);
+    let text = buffer.text(&start, &end, true);
+    for (from, to) in trailing_whitespace(&text) {
+        let a = buffer.iter_at_offset(from);
+        let b = buffer.iter_at_offset(to);
+        buffer.apply_tag(&tag, &a, &b);
     }
 }
 
@@ -776,6 +831,24 @@ diff --git a/f b/f
         let lines = kinds_by_line(body);
         assert!(lines[5].is_empty());
         assert_eq!(lines[6], [Kind::DiffAdd]);
+    }
+
+    #[test]
+    fn trailing_whitespace_flags_every_stray_run() {
+        // "a" clean; "b  " has two trailing spaces; the sig separator "-- " is
+        // flagged like anything else; "\t" tab-only line flags in full; the
+        // closing "c" is clean.
+        let text = "a\nb  \n-- \n\t\nc";
+        // "a\n" = offsets 0,1; "b  \n" starts at 2, its "  " span is 3..5.
+        // "-- \n" starts at 6, its trailing space is 8..9; "\t\n" starts at 10,
+        // span 10..11.
+        assert_eq!(trailing_whitespace(text), [(3, 5), (8, 9), (10, 11)]);
+    }
+
+    #[test]
+    fn trailing_whitespace_leaves_clean_lines_alone() {
+        assert!(trailing_whitespace("clean line").is_empty());
+        assert!(trailing_whitespace("a\nb\nc").is_empty());
     }
 
     #[test]

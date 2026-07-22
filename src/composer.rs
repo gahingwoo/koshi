@@ -686,8 +686,8 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
 
     let (body_editor, body_view) = build_body_editor(&state.document, true);
     highlight::attach(&state.document);
-    highlight::refresh(&state.document);
-    state.document.connect_changed(highlight::refresh);
+    refresh_highlighting(&state.document);
+    state.document.connect_changed(refresh_highlighting);
 
     // The sheet is built first so the toolbar's dismissing buttons can close it.
     // Not full-width: the sheet card itself keeps the thread's reading width
@@ -806,6 +806,15 @@ pub fn build_composer(reply: ReplyContext) -> Composer {
         state,
         body_view,
     }
+}
+
+/// Recolor the composer document on every edit: the quote/diff pass plus the
+/// trailing-whitespace flag, which is a composer-only concern (received mail is
+/// read-only and left as-is). Neither pass emits "changed", so wiring this as
+/// the changed handler does not loop.
+fn refresh_highlighting(buffer: &gtk::TextBuffer) {
+    highlight::refresh(buffer);
+    highlight::mark_trailing_whitespace(buffer);
 }
 
 /// A monospace editor over the raw message, with a dim 72-column ruler overlaid
@@ -1012,8 +1021,8 @@ pub fn build_composer_page(reply: ReplyContext, seed: Option<String>) -> adw::Na
 
     let (body_editor, body_view) = build_body_editor(&state.document, false);
     highlight::attach(&state.document);
-    highlight::refresh(&state.document);
-    state.document.connect_changed(highlight::refresh);
+    refresh_highlighting(&state.document);
+    state.document.connect_changed(refresh_highlighting);
 
     let surface = Surface::Tab;
 

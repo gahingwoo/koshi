@@ -161,20 +161,14 @@ fn rate_limited(err: &lore::Error) -> bool {
 /// The seen set only grows, so a transiently short fetch can't resurrect old
 /// messages as "new". A failed fetch leaves the subscription untouched to retry
 /// next cycle; the error is surfaced so [`poll_all`] can spot rate limiting.
-async fn poll_one(
-    app: &adw::Application,
-    subscription: Subscription,
-) -> Result<(), lore::Error> {
+async fn poll_one(app: &adw::Application, subscription: Subscription) -> Result<(), lore::Error> {
     let cancellable = gio::Cancellable::new();
     // Live, never cached: a poll exists to see messages the cache can't have
     // yet. As a side effect each poll refreshes the cache entry, so a
     // subscribed thread reopens with its newest replies already on disk.
-    let mbox = lore::fetch_thread_mbox_live(
-        &subscription.list,
-        &subscription.message_id,
-        &cancellable,
-    )
-    .await?;
+    let mbox =
+        lore::fetch_thread_mbox_live(&subscription.list, &subscription.message_id, &cancellable)
+            .await?;
 
     let digests = thread_message_digests(&mbox);
     if digests.is_empty() {

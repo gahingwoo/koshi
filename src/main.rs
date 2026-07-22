@@ -1021,21 +1021,17 @@ fn build_cache_group() -> adw::PreferencesGroup {
                 .modal(true)
                 .build();
             let parent = choose.root().and_downcast::<gtk::Window>();
-            dialog.select_folder(
-                parent.as_ref(),
-                gio::Cancellable::NONE,
-                move |result| {
-                    // A dismissed chooser is not an error worth reporting.
-                    if let Ok(file) = result
-                        && let Some(path) = file.path()
-                    {
-                        settings::set_cache_dir(Some(&path));
-                        reset.set_visible(true);
-                        folder_row.set_subtitle(&cache::dir().display().to_string());
-                        clear_row.set_subtitle(&cache_size_label());
-                    }
-                },
-            );
+            dialog.select_folder(parent.as_ref(), gio::Cancellable::NONE, move |result| {
+                // A dismissed chooser is not an error worth reporting.
+                if let Ok(file) = result
+                    && let Some(path) = file.path()
+                {
+                    settings::set_cache_dir(Some(&path));
+                    reset.set_visible(true);
+                    folder_row.set_subtitle(&cache::dir().display().to_string());
+                    clear_row.set_subtitle(&cache_size_label());
+                }
+            });
         }
     ));
 

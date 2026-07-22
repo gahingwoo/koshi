@@ -187,10 +187,8 @@ mod tests {
 
     impl ScratchCache {
         fn new(test_name: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "koshi-cache-{test_name}-{}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("koshi-cache-{test_name}-{}", std::process::id()));
             fs::create_dir_all(&dir).unwrap();
             settings::init(dir.join("settings.json"));
             settings::set_cache_dir(Some(&dir.join("mail")));

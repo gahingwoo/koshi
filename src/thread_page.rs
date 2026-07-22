@@ -1328,8 +1328,12 @@ fn build_thread_content(
     };
     let subs: Rc<Vec<Option<Subscription>>> =
         Rc::new(thread.iter().map(|mail| subscription_of(mail)).collect());
-    let replies: Rc<Vec<composer::ReplyContext>> =
-        Rc::new(thread.iter().map(|mail| build_reply_context(mail)).collect());
+    let replies: Rc<Vec<composer::ReplyContext>> = Rc::new(
+        thread
+            .iter()
+            .map(|mail| build_reply_context(mail))
+            .collect(),
+    );
     let op_fav = favorite_of(op);
     let op_sub = subscription_of(op);
     let op_reply = build_reply_context(op);

@@ -21,6 +21,12 @@ soup = { package = "soup3", version = "0.9" }
 flate2 = "1"
 quick-xml = "0.38"
 serde_json = "1"
+# Line wrapping for the composer's "Rewrap Selection". Only the greedy
+# (FirstFit) algorithm and display-width counting are used, so smawk and
+# unicode-linebreak are left off.
+textwrap = { version = "0.16", default-features = false, features = [
+    "unicode-width",
+] }
 
 [build-dependencies]
 glib-build-tools = "0.21"

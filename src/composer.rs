@@ -257,13 +257,14 @@ fn rewrap(text: &str, width: usize, signature: &str) -> String {
     rewrap_range(text, width, signature, None)
 }
 
-/// Greedy-wrap `text` at `width` columns on word boundaries. Blank lines are
-/// kept as paragraph breaks; structural lines pass through untouched — quoted
-/// lines and every part of a unified diff (see [`highlight::preserve_mask`]) —
-/// and a trailing copy of `signature` is preserved verbatim so a configured
-/// signature at the end of the body is never reflowed. Words longer than
-/// `width` (long URLs) stay on their own line unbroken. Width is counted in
-/// chars, not display cells, so wide CJK glyphs count as one column.
+/// Greedy-wrap `text` at `width` display columns on word boundaries, using the
+/// `textwrap` crate for the wrapping itself. Blank lines are kept as paragraph
+/// breaks; structural lines pass through untouched — quoted lines, every part
+/// of a unified diff (see [`highlight::preserve_mask`]) and git trailers (see
+/// [`is_trailer_line`]) — and a trailing copy of `signature` is preserved
+/// verbatim so a configured signature at the end of the body is never
+/// reflowed. Long words (URLs) are never broken. Width is counted in display
+/// cells, so a wide CJK glyph counts as two columns.
 ///
 /// When `selection` is `Some`, only lines whose index falls in the range are
 /// reflowed; every other line passes through verbatim (so "Rewrap Selection"
@@ -282,36 +283,36 @@ fn rewrap_range(
 
     let mask = highlight::preserve_mask(text);
     let lines: Vec<&str> = text.split('\n').collect();
+    // Greedy fill, never break a long word (keeps URLs whole), no hyphenation.
+    let options = textwrap::Options::new(width)
+        .break_words(false)
+        .word_splitter(textwrap::WordSplitter::NoHyphenation)
+        .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit);
     let mut out: Vec<String> = Vec::new();
     let mut para: Vec<&str> = Vec::new();
 
     let flush = |para: &mut Vec<&str>, out: &mut Vec<String>| {
-        let mut line = String::new();
-        let mut line_len = 0usize;
-        for word in para.iter().flat_map(|l| l.split_whitespace()) {
-            let word_len = word.chars().count();
-            if line.is_empty() {
-                line.push_str(word);
-                line_len = word_len;
-            } else if line_len + 1 + word_len <= width {
-                line.push(' ');
-                line.push_str(word);
-                line_len += 1 + word_len;
-            } else {
-                out.push(std::mem::take(&mut line));
-                line.push_str(word);
-                line_len = word_len;
-            }
+        if para.is_empty() {
+            return;
         }
-        if !line.is_empty() {
-            out.push(line);
-        }
+        // Collapse the paragraph's lines (and any stray runs of whitespace)
+        // into one string, then let textwrap re-break it.
+        let joined = para
+            .iter()
+            .flat_map(|l| l.split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.extend(
+            textwrap::wrap(&joined, &options)
+                .into_iter()
+                .map(|line| line.into_owned()),
+        );
         para.clear();
     };
 
     for (i, raw_line) in lines.iter().enumerate() {
         let selected = selection.as_ref().is_none_or(|r| r.contains(&i));
-        if !selected || mask[i] {
+        if !selected || mask[i] || is_trailer_line(raw_line) {
             flush(&mut para, &mut out);
             out.push(raw_line.to_string());
         } else if raw_line.trim().is_empty() {
@@ -326,6 +327,21 @@ fn rewrap_range(
     let mut result = out.join("\n");
     result.push_str(sig_tail);
     result
+}
+
+/// Whether `line` is a git-style trailer (`Token: value`) that must stay on
+/// its own line even when long — `Signed-off-by:`, `Fixes:`, `Link:`, `Cc:`,
+/// and the like. The token is a single word of letters, digits and hyphens,
+/// which keeps prose such as "Note that: ..." (a multi-word key) or a bare URL
+/// from matching.
+fn is_trailer_line(line: &str) -> bool {
+    let Some((token, rest)) = line.split_once(':') else {
+        return false;
+    };
+    token.starts_with(|c: char| c.is_ascii_alphabetic())
+        && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && rest.starts_with(' ')
+        && !rest.trim().is_empty()
 }
 
 /// Split a trailing `signature` block off `text`, returning `(head, tail)`
@@ -1414,6 +1430,74 @@ index 1111111..2222222 100644
             wrapped.contains("-- \n2.55.0"),
             "footer joined: {wrapped:?}"
         );
+    }
+
+    #[test]
+    fn rewrap_keeps_trailers_one_per_line() {
+        // Long trailers must never be wrapped or merged with each other.
+        let sob = "Signed-off-by: A Long Name That Would Otherwise Wrap Past The Limit <alongaddress@example.org>";
+        let link = "Link: https://lore.kernel.org/r/20250722000000.123456-1-someone@example.org";
+        let cc = "Cc: A Maintainer With A Long Name <maintainer@example.org>";
+        let input = format!("Body prose to reflow here.\n\n{sob}\n{link}\n{cc}\n");
+        let wrapped = rewrap(&input, 72, "");
+        for trailer in [sob, link, cc] {
+            assert!(
+                wrapped.lines().any(|line| line == trailer),
+                "trailer wrapped or merged: {trailer}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrap_round_trips_a_realistic_patch() {
+        // The `git am` proxy: everything below the commit message — trailers,
+        // scissors, diffstat, a multi-hunk diff with context (incl. a blank
+        // context line) and the version footer — must survive byte-for-byte,
+        // and a second rewrap must change nothing.
+        let commit = "Guard the KVM MSI routing setup behind accel_msi_via_irqfd_enabled so a TCG or otherwise irqfd-less accelerator no longer trips the routing assertions when it configures MSI-X.";
+        let diff = "\
+diff --git a/hw/vfio/pci.c b/hw/vfio/pci.c
+index 380dd8c15f8d5bb98b725075978eef2e4e1e6c2d..a3147d28665abd29fd804bd08bdffc3c7440033c 100644
+--- a/hw/vfio/pci.c
++++ b/hw/vfio/pci.c
+@@ -699,7 +699,7 @@ static int vfio_msix_vector_do_use(PCIDevice *pdev, unsigned int nr,
+         if (msg) {
+             if (vdev->defer_kvm_irq_routing) {
+                 vfio_pci_add_kvm_msi_virq(vdev, vector, nr, true);
+-            } else {
++            } else if (accel_msi_via_irqfd_enabled()) {
+                 vfio_route_change = accel_irqchip_begin_route_changes();
+                 vfio_pci_add_kvm_msi_virq(vdev, vector, nr, true);
+                 accel_irqchip_commit_route_changes(&vfio_route_change);
+@@ -801,7 +801,9 @@ void vfio_pci_prepare_kvm_msi_virq_batch(VFIOPCIDevice *vdev)
+ {
+     assert(!vdev->defer_kvm_irq_routing);
+     vdev->defer_kvm_irq_routing = true;
+-    vfio_route_change = accel_irqchip_begin_route_changes();
++    if (accel_msi_via_irqfd_enabled()) {
++        vfio_route_change = accel_irqchip_begin_route_changes();
++    }
+ }
+
+ void vfio_pci_commit_kvm_msi_virq_batch(VFIOPCIDevice *vdev)";
+        let trailers = "Signed-off-by: Nika Krasnova <nika@nikableh.moe>\nReviewed-by: Someone Else <someone@example.org>\nLink: https://lore.kernel.org/r/20250722000000.1-1-nika@nikableh.moe";
+        let diffstat =
+            " hw/vfio/pci.c | 6 ++++--\n 1 file changed, 4 insertions(+), 2 deletions(-)";
+        let verbatim = format!("{trailers}\n---\n{diffstat}\n\n{diff}\n-- \n2.55.0\n");
+        let input = format!("{commit}\n\n{verbatim}");
+
+        let wrapped = rewrap(&input, 72, "");
+        assert!(
+            wrapped.contains(&verbatim),
+            "patch below the commit message changed:\n{wrapped}"
+        );
+        // The commit message prose above it was reflowed to width.
+        assert!(
+            wrapped.lines().next().unwrap().chars().count() <= 72,
+            "commit message not wrapped: {wrapped:?}"
+        );
+        // Idempotent — the real correctness bar.
+        assert_eq!(rewrap(&wrapped, 72, ""), wrapped, "not idempotent");
     }
 
     #[test]

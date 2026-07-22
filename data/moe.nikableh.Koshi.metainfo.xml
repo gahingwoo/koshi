@@ -84,9 +84,21 @@
   </keywords>
 
   <releases>
+    <release version="0.3.0" date="2026-07-22">
+      <description>
+        <ul>
+          <li>Send notifications through the XDG Notification portal instead of org.freedesktop.Notifications.</li>
+          <li>Highlight trailing whitespace in the composer.</li>
+          <li>Improve the composer's "Rewrap" button.</li>
+          <li>Update AppStream metadata and app icon.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-07-17">
       <description>
-        <p>Fix sending emails from the Flatpak build.</p>
+        <ul>
+          <li>Fix sending emails from the Flatpak build.</li>
+        </ul>
       </description>
     </release>
     <release version="0.2.0" date="2026-07-17">

@@ -21,7 +21,7 @@
         packages.default =
           let
             pname = "koshi";
-            version = "0.2.1";
+            version = "0.3.0";
             src = self;
           in
           pkgs.rustPlatform.buildRustPackage {

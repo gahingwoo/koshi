@@ -1099,7 +1099,7 @@ fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
         // Bundled icon: icon-development-kit's arrow-hook-left-horizontal2
         // flipped vertically (see data/icons/).
         .icon_name("koshi-rewrap-symbolic")
-        .tooltip_text("Rewrap Selection")
+        .tooltip_text("Rewrap")
         .css_classes(["flat"])
         .build();
     button.connect_clicked(glib::clone!(

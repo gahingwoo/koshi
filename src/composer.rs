@@ -329,19 +329,45 @@ fn rewrap_range(
     result
 }
 
-/// Whether `line` is a git-style trailer (`Token: value`) that must stay on
-/// its own line even when long — `Signed-off-by:`, `Fixes:`, `Link:`, `Cc:`,
-/// and the like. The token is a single word of letters, digits and hyphens,
-/// which keeps prose such as "Note that: ..." (a multi-word key) or a bare URL
-/// from matching.
+/// The recognized git/kernel commit trailers, kept one-per-line by rewrap even
+/// when long. Only these exact keys count (matched case-insensitively on the
+/// token before the colon), so a prose line that merely starts `Word:` is
+/// still reflowed. Keep this list sorted for scanning.
+const TRAILER_TOKENS: [&str; 19] = [
+    "Acked-by",
+    "BugLink",
+    "Cc",
+    "Change-Id",
+    "Closes",
+    "Co-authored-by",
+    "Co-developed-by",
+    "Debugged-by",
+    "Fixes",
+    "Link",
+    "Originally-by",
+    "Reported-and-tested-by",
+    "Reported-by",
+    "Requested-by",
+    "Reviewed-and-tested-by",
+    "Reviewed-by",
+    "Signed-off-by",
+    "Suggested-by",
+    "Tested-by",
+];
+
+/// Whether `line` is one of the recognized git/kernel trailers in
+/// [`TRAILER_TOKENS`] (`Token: value`) that must stay on its own line even when
+/// long. Only those exact keys match, so prose such as "Note that: ..." or
+/// "TODO: something" is still reflowed as ordinary text.
 fn is_trailer_line(line: &str) -> bool {
     let Some((token, rest)) = line.split_once(':') else {
         return false;
     };
-    token.starts_with(|c: char| c.is_ascii_alphabetic())
-        && token.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        && rest.starts_with(' ')
+    rest.starts_with(' ')
         && !rest.trim().is_empty()
+        && TRAILER_TOKENS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(token))
 }
 
 /// Split a trailing `signature` block off `text`, returning `(head, tail)`
@@ -1446,6 +1472,27 @@ index 1111111..2222222 100644
                 "trailer wrapped or merged: {trailer}"
             );
         }
+    }
+
+    #[test]
+    fn rewrap_reflows_non_trailer_colon_lines() {
+        // A `Word: value` line that is not a recognized trailer is ordinary
+        // prose and must reflow with the surrounding text.
+        let lookalike = "Note: this line only looks like a trailer but the key is not one of the recognized git trailers so it should reflow together with the rest of the paragraph past the limit";
+        let wrapped = rewrap(lookalike, 72, "");
+        assert!(wrapped.lines().count() > 1, "not wrapped: {wrapped:?}");
+        assert!(wrapped.lines().all(|l| l.chars().count() <= 72));
+        // It was not kept verbatim on its own line.
+        assert!(!wrapped.contains(lookalike));
+    }
+
+    #[test]
+    fn rewrap_preserves_a_bare_sigdash_footer() {
+        // Paste routinely strips the sigdash trailing space, leaving a bare
+        // "--"; the footer must still stay split.
+        let input = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n--\n2.55.0\n";
+        let wrapped = rewrap(input, 72, "");
+        assert!(wrapped.contains("--\n2.55.0"), "footer joined: {wrapped:?}");
     }
 
     #[test]

@@ -123,10 +123,10 @@ pub fn classify(text: &str) -> Vec<Span> {
 /// the whole patch survives; that back-fill only runs when a real diff was
 /// found, keeping it from firing on a prose `---` rule or an `a | b` table.
 ///
-/// A bare `-- ` line (the RFC 3676 signature separator, which git
-/// format-patch emits above its version footer) freezes everything from there
-/// to the end, so a trailing signature or `-- \n2.55.0` footer is never
-/// reflowed even when it is not the user's configured signature.
+/// A sigdash line — `-- ` (RFC 3676) or a bare `--` once the trailing space
+/// has been stripped in transit — freezes everything from there to the end,
+/// so a trailing signature or `-- \n2.55.0` footer is never reflowed even when
+/// it is not the user's configured signature.
 pub fn preserve_mask(text: &str) -> Vec<bool> {
     let lines: Vec<&str> = text.split('\n').collect();
     let mut mask = vec![false; lines.len()];
@@ -153,8 +153,12 @@ pub fn preserve_mask(text: &str) -> Vec<bool> {
         if in_diff && first_diff.is_none() {
             first_diff = Some(n);
         }
-        // An unquoted `-- ` sigdash starts a signature that runs to the end.
-        if depth == 0 && content == "-- " {
+        // An unquoted sigdash starts a signature that runs to the end. It is
+        // `-- ` (RFC 3676) but the trailing space is routinely lost in transit
+        // and on paste, so a bare `--` line counts too. Guarded by `!in_diff`
+        // so a removed line whose content is `-`/`- ` inside a hunk never trips
+        // it.
+        if depth == 0 && !in_diff && content.trim_end() == "--" {
             in_signature = true;
         }
         mask[n] = in_signature || depth > 0 || in_diff;
@@ -783,9 +787,24 @@ index 1111111..2222222 100644
 
     #[test]
     fn preserve_mask_freezes_after_a_sigdash() {
-        // Everything from a bare "-- " to the end is a signature/footer.
-        let mask = preserve_mask("prose line\n\n-- \n2.55.0");
-        assert_eq!(mask, vec![false, false, true, true]);
+        // Everything from a "-- " to the end is a signature/footer, and a bare
+        // "--" (trailing space stripped in transit) counts the same.
+        assert_eq!(
+            preserve_mask("prose line\n\n-- \n2.55.0"),
+            vec![false, false, true, true]
+        );
+        assert_eq!(
+            preserve_mask("prose line\n\n--\n2.55.0"),
+            vec![false, false, true, true]
+        );
+    }
+
+    #[test]
+    fn preserve_mask_sigdash_does_not_fire_inside_a_hunk() {
+        // A removed line whose content is a single "-" reads as "--" but must
+        // stay diff content, not start a signature.
+        let mask = preserve_mask("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n--\n+x");
+        assert!(mask.iter().all(|&m| m), "diff line dropped: {mask:?}");
     }
 
     #[test]

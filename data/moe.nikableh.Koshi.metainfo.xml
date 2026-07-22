@@ -60,6 +60,15 @@
 
   <content_rating type="oars-1.1" />
 
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+
   <categories>
     <category>Network</category>
     <category>Email</category>

@@ -100,22 +100,37 @@ impl ComposerState {
         body
     }
 
-    /// The body-relative line range covered by the current selection, or
-    /// `None` when nothing is selected or the selection lies entirely within
-    /// the header block. Lines are counted from the first body line so the
-    /// range indexes straight into [`ComposerState::body_text`].
+    /// The body-relative line range for a rewrap. With a selection, that is the
+    /// lines it spans; with just a cursor, the paragraph it sits in (so placing
+    /// the caret on a line is enough — no selection needed). `None` when the
+    /// target lies in the header block or on a blank line with no selection.
+    /// Lines are counted from the first body line so the range indexes straight
+    /// into [`ComposerState::body_text`].
     fn selected_body_lines(&self) -> Option<std::ops::Range<usize>> {
-        let (start, end) = self.document.selection_bounds()?;
         let body_first = self
             .document
             .iter_at_offset(body_start_offset(&self.document_text()))
             .line();
-        if end.line() < body_first {
-            return None;
+        match self.document.selection_bounds() {
+            Some((start, end)) => {
+                if end.line() < body_first {
+                    return None;
+                }
+                let from = (start.line() - body_first).max(0) as usize;
+                let to = (end.line() - body_first) as usize + 1;
+                Some(from..to)
+            }
+            None => {
+                let caret = self
+                    .document
+                    .iter_at_mark(&self.document.get_insert())
+                    .line();
+                if caret < body_first {
+                    return None;
+                }
+                paragraph_range(&self.body_text(), (caret - body_first) as usize)
+            }
         }
-        let from = (start.line() - body_first).max(0) as usize;
-        let to = (end.line() - body_first) as usize + 1;
-        Some(from..to)
     }
 
     /// Replace just the body region in one undoable step, leaving the headers
@@ -188,6 +203,27 @@ fn reply_body_seed() -> String {
     } else {
         format!("\n\n{signature}\n")
     }
+}
+
+/// The line range of the paragraph containing `line` in `body`: the contiguous
+/// run of non-blank lines around it. `None` when `line` is past the end or on a
+/// blank line (there is no paragraph to rewrap under a bare cursor there).
+/// Structural lines inside the run are still frozen by [`rewrap_range`], so the
+/// run may safely reach up to a diff or trailer block.
+fn paragraph_range(body: &str, line: usize) -> Option<std::ops::Range<usize>> {
+    let lines: Vec<&str> = body.split('\n').collect();
+    if line >= lines.len() || lines[line].trim().is_empty() {
+        return None;
+    }
+    let mut start = line;
+    while start > 0 && !lines[start - 1].trim().is_empty() {
+        start -= 1;
+    }
+    let mut end = line;
+    while end + 1 < lines.len() && !lines[end + 1].trim().is_empty() {
+        end += 1;
+    }
+    Some(start..end + 1)
 }
 
 /// The char offset of the first body character: just past the blank line that
@@ -1070,10 +1106,11 @@ fn build_rewrap_button(state: &ComposerState) -> gtk::Button {
         #[strong]
         state,
         move |_| {
-            // Rewrap only the selected lines. Headers are never wrapped (the
-            // selection is mapped into the body), and the configured signature
-            // is passed so a copy at the end of the body survives verbatim
-            // rather than being reflowed. With nothing selected, do nothing.
+            // Rewrap the selected lines, or — with no selection — the
+            // paragraph under the cursor. Headers are never wrapped (the range
+            // is mapped into the body), and the configured signature is passed
+            // so a copy at the end of the body survives verbatim rather than
+            // being reflowed.
             if let Some(selection) = state.selected_body_lines() {
                 state.replace_body(&rewrap_range(
                     &state.body_text(),
@@ -1474,6 +1511,21 @@ index 1111111..2222222 100644
                 "trailer wrapped or merged: {trailer}"
             );
         }
+    }
+
+    #[test]
+    fn paragraph_range_expands_around_the_cursor() {
+        let body = "first para line one\nfirst para line two\n\nsecond paragraph\n\n";
+        // A cursor anywhere in the first paragraph selects both of its lines.
+        assert_eq!(paragraph_range(body, 0), Some(0..2));
+        assert_eq!(paragraph_range(body, 1), Some(0..2));
+        // The second paragraph is a single line.
+        assert_eq!(paragraph_range(body, 3), Some(3..4));
+        // A blank line has no paragraph to rewrap.
+        assert_eq!(paragraph_range(body, 2), None);
+        assert_eq!(paragraph_range(body, 4), None);
+        // Past the end.
+        assert_eq!(paragraph_range(body, 99), None);
     }
 
     #[test]

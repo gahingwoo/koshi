@@ -333,8 +333,9 @@ fn rewrap_range(
 /// when long. Only these exact keys count (matched case-insensitively on the
 /// token before the colon), so a prose line that merely starts `Word:` is
 /// still reflowed. Keep this list sorted for scanning.
-const TRAILER_TOKENS: [&str; 19] = [
+const TRAILER_TOKENS: [&str; 20] = [
     "Acked-by",
+    "Assisted-by",
     "BugLink",
     "Cc",
     "Change-Id",
@@ -1464,9 +1465,10 @@ index 1111111..2222222 100644
         let sob = "Signed-off-by: A Long Name That Would Otherwise Wrap Past The Limit <alongaddress@example.org>";
         let link = "Link: https://lore.kernel.org/r/20250722000000.123456-1-someone@example.org";
         let cc = "Cc: A Maintainer With A Long Name <maintainer@example.org>";
-        let input = format!("Body prose to reflow here.\n\n{sob}\n{link}\n{cc}\n");
+        let assisted = "Assisted-by: Another Long Contributor Name Here <assist@example.org>";
+        let input = format!("Body prose to reflow here.\n\n{sob}\n{link}\n{cc}\n{assisted}\n");
         let wrapped = rewrap(&input, 72, "");
-        for trailer in [sob, link, cc] {
+        for trailer in [sob, link, cc, assisted] {
             assert!(
                 wrapped.lines().any(|line| line == trailer),
                 "trailer wrapped or merged: {trailer}"

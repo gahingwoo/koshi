@@ -168,6 +168,9 @@ impl MessageRow {
         // Counted once here so the reseed walk stays O(1) per row: bodies
         // run to megabytes and reseed is called on every row of every pass.
         imp.body_lines.set(mail.body.lines().count().max(1) as i32);
+        let (quote_lines, diff_lines) = highlight::foldable_line_counts(&mail.body);
+        imp.quote_lines.set(quote_lines as i32);
+        imp.diff_lines.set(diff_lines as i32);
         *imp.mail.borrow_mut() = Some(mail);
 
         // Seed the row's height before any of its widgetry exists: the
@@ -190,14 +193,68 @@ impl MessageRow {
             return;
         }
         let (unit, header) = key;
-        let height = imp
-            .body_lines
-            .get()
-            .max(1)
+        self.set_size_request(-1, self.compute_height(unit, header));
+    }
+
+    /// The row height for `unit`/`header` line/header estimates, minus
+    /// whatever is currently folded away. A folded-and-quoted diff line is
+    /// subtracted once per active fold, which can under-estimate slightly —
+    /// harmless, since this only seeds height ahead of realization (see
+    /// reseed's doc comment); once laid out, natural sizing takes over.
+    fn compute_height(&self, unit: i32, header: i32) -> i32 {
+        let imp = self.imp();
+        let hidden = if imp.quote_folded.get() {
+            imp.quote_lines.get()
+        } else {
+            0
+        } + if imp.diff_folded.get() {
+            imp.diff_lines.get()
+        } else {
+            0
+        };
+        let visible_lines = (imp.body_lines.get() - hidden).max(1);
+        visible_lines
             .saturating_mul(unit)
             .saturating_add(header)
-            .saturating_add(ROW_CHROME_HEIGHT);
-        self.set_size_request(-1, height);
+            .saturating_add(ROW_CHROME_HEIGHT)
+    }
+
+    /// Recompute and apply this row's height after a fold toggle, without
+    /// re-measuring the (unchanged) global line/header estimates reseed uses.
+    fn apply_fold_height(&self) {
+        let imp = self.imp();
+        if imp.mail.borrow().is_none() {
+            return;
+        }
+        let (unit, header) = imp.seed_key.get();
+        self.set_size_request(-1, self.compute_height(unit, header));
+    }
+
+    /// Fold or unfold quoted text in this row's body and resize to fit.
+    fn set_quote_folded(&self, folded: bool) {
+        let imp = self.imp();
+        imp.quote_folded.set(folded);
+        if let Some(view) = imp.view.get() {
+            highlight::set_quote_folded(&view.buffer(), folded);
+        }
+        update_fold_label(
+            imp.quote_toggle.get(),
+            "quoted text",
+            imp.quote_lines.get(),
+            folded,
+        );
+        self.apply_fold_height();
+    }
+
+    /// Fold or unfold diff hunks in this row's body and resize to fit.
+    fn set_diff_folded(&self, folded: bool) {
+        let imp = self.imp();
+        imp.diff_folded.set(folded);
+        if let Some(view) = imp.view.get() {
+            highlight::set_diff_folded(&view.buffer(), folded);
+        }
+        update_fold_label(imp.diff_toggle.get(), "diff", imp.diff_lines.get(), folded);
+        self.apply_fold_height();
     }
 
     fn is_filled(&self) -> bool {
@@ -237,6 +294,28 @@ impl MessageRow {
         if filled {
             let view = imp.ensure_view().clone();
             view.buffer().set_text(&mail.body);
+            // The buffer (and its tag table) is reused across rebinds, so a
+            // previous message's fold state must not leak into this one - a
+            // fresh message always opens fully expanded.
+            highlight::set_quote_folded(&view.buffer(), false);
+            highlight::set_diff_folded(&view.buffer(), false);
+            imp.quote_folded.set(false);
+            imp.diff_folded.set(false);
+            let quote_lines = imp.quote_lines.get();
+            let diff_lines = imp.diff_lines.get();
+            if let Some(toggle) = imp.quote_toggle.get() {
+                toggle.set_visible(quote_lines > 0);
+                toggle.set_active(false);
+                update_fold_label(Some(toggle), "quoted text", quote_lines, false);
+            }
+            if let Some(toggle) = imp.diff_toggle.get() {
+                toggle.set_visible(diff_lines > 0);
+                toggle.set_active(false);
+                update_fold_label(Some(toggle), "diff", diff_lines, false);
+            }
+            if let Some(fold_row) = imp.fold_row.get() {
+                fold_row.set_visible(quote_lines > 0 || diff_lines > 0);
+            }
 
             // First body anywhere: learn the real line height so every seed
             // from here on is exact. Measured as the advance between a one-
@@ -278,6 +357,9 @@ impl MessageRow {
                 view.buffer().set_text("");
             }
             self.remove_header();
+            if let Some(fold_row) = imp.fold_row.get() {
+                fold_row.set_visible(false);
+            }
         }
         imp.filled.set(filled);
         imp.highlighted.set(false);
@@ -294,9 +376,10 @@ impl MessageRow {
             return;
         };
         let composer = imp.composer.get().expect("MessageRow composer set");
+        let list_slug = imp.list.get().expect("MessageRow list set");
         let is_op = imp.is_op.get();
 
-        let header = build_header_list(mail, &overlay, composer);
+        let header = build_header_list(mail, &overlay, composer, list_slug);
         // Selectable header labels replace right-clicks with their own stock
         // menu, shadowing the row's; hand them the mail actions as an extra
         // section. The action names resolve against the "mailview" group the
@@ -358,6 +441,18 @@ impl MessageRow {
             return;
         }
         imp.highlighted.set(true);
+    }
+}
+
+/// Set a fold toggle's label to reflect its current state: what folding it
+/// would hide (with a count) while expanded, that it is currently hidden
+/// while folded. A no-op if the toggle was never built (row not yet filled).
+fn update_fold_label(button: Option<&gtk::ToggleButton>, what: &str, lines: i32, folded: bool) {
+    let Some(button) = button else { return };
+    if folded {
+        button.set_label(&format!("Show {what} ({lines} lines hidden)"));
+    } else {
+        button.set_label(&format!("Hide {what}"));
     }
 }
 
@@ -426,6 +521,18 @@ mod imp {
         /// computed with, so reseed is a cheap no-op while the estimates
         /// are unchanged.
         pub(super) seed_key: Cell<(i32, i32)>,
+        /// The row holding the "Quoted text" / "Diff" fold toggles, hidden
+        /// when the bound message has neither.
+        pub(super) fold_row: OnceCell<gtk::Box>,
+        pub(super) quote_toggle: OnceCell<gtk::ToggleButton>,
+        pub(super) diff_toggle: OnceCell<gtk::ToggleButton>,
+        /// Distinct quoted/diff line counts for the bound message, from
+        /// [`highlight::foldable_line_counts`] - used both to decide whether
+        /// to show each fold toggle and to size the row while folded.
+        pub(super) quote_lines: Cell<i32>,
+        pub(super) diff_lines: Cell<i32>,
+        pub(super) quote_folded: Cell<bool>,
+        pub(super) diff_folded: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -466,6 +573,7 @@ mod imp {
                 .right_margin(12)
                 .top_margin(12)
                 .bottom_margin(12)
+                .css_classes(["koshi-body-text"])
                 .build();
 
             // Bodies don't wrap (patches carry deliberately long lines), so a
@@ -478,6 +586,41 @@ mod imp {
                 .propagate_natural_height(true)
                 .build();
 
+            // Quote/diff fold toggles: message-independent widgetry built
+            // once, like the view above; fill_header shows/hides and resets
+            // them per message since a recycled row can go from a message
+            // with a huge patch to one with none.
+            let quote_toggle = gtk::ToggleButton::builder()
+                .css_classes(["flat"])
+                .halign(gtk::Align::Start)
+                .visible(false)
+                .build();
+            let diff_toggle = gtk::ToggleButton::builder()
+                .css_classes(["flat"])
+                .halign(gtk::Align::Start)
+                .visible(false)
+                .build();
+            let fold_row = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(6)
+                .visible(false)
+                .build();
+            fold_row.append(&quote_toggle);
+            fold_row.append(&diff_toggle);
+
+            let row_weak = self.obj().downgrade();
+            quote_toggle.connect_toggled(move |button| {
+                if let Some(row) = row_weak.upgrade() {
+                    row.set_quote_folded(button.is_active());
+                }
+            });
+            let row_weak = self.obj().downgrade();
+            diff_toggle.connect_toggled(move |button| {
+                if let Some(row) = row_weak.upgrade() {
+                    row.set_diff_folded(button.is_active());
+                }
+            });
+
             // The column the fill mounts the header card into, above the
             // body. Its top margin and spacing are part of the row height
             // seed (ROW_CHROME_HEIGHT) — keep them in step.
@@ -486,7 +629,11 @@ mod imp {
                 .spacing(12)
                 .margin_top(12)
                 .build();
+            content.append(&fold_row);
             content.append(&hscroll);
+            self.fold_row.set(fold_row).ok();
+            self.quote_toggle.set(quote_toggle).ok();
+            self.diff_toggle.set(diff_toggle).ok();
 
             // The ListView is the ScrolledWindow's scrollable child (so it can
             // virtualize), which means the reading-width clamp lives per row
@@ -793,7 +940,26 @@ fn parse_thread(mbox: &[u8]) -> Vec<Mail> {
         .iter()
         .map(|raw| parse_message(&unescape_mboxrd(raw)))
         .collect();
-    in_thread_order(mails)
+    in_thread_order(dedup_by_message_id(mails))
+}
+
+/// Drop repeated copies of the same message, keeping the first. lore mirrors
+/// a message once per mailing list it was posted to, so a thread cross-posted
+/// to more than one list can come back from `t.mbox.gz` with the same
+/// Message-ID twice - which would otherwise show up as a genuinely
+/// duplicated row in both the thread view and the overview sidebar, and (via
+/// [`thread_message_digests`], which also goes through this function) as a
+/// duplicate notification from the watcher.
+fn dedup_by_message_id(mails: Vec<Mail>) -> Vec<Mail> {
+    let mut seen = std::collections::HashSet::new();
+    mails
+        .into_iter()
+        .filter(|mail| match &mail.message_id {
+            Some(id) => seen.insert(id.trim().trim_matches(['<', '>']).to_string()),
+            // No Message-ID to key on - never dedupe what we cannot compare.
+            None => true,
+        })
+        .collect()
 }
 
 /// The minimum the subscription watcher needs from a fetched thread: each
@@ -1291,7 +1457,7 @@ fn build_thread_content(
     let overlay = adw::ToastOverlay::new();
     // The composer opens targeting the OP; each mail's Reply button can
     // retarget it later.
-    let composer = composer::build_composer(build_reply_context(op));
+    let composer = composer::build_composer(build_reply_context(op, list));
 
     // Favorites toggled through the header star and through a message's
     // context menu must agree; the hub keeps every view of a Message-ID in
@@ -1331,12 +1497,12 @@ fn build_thread_content(
     let replies: Rc<Vec<composer::ReplyContext>> = Rc::new(
         thread
             .iter()
-            .map(|mail| build_reply_context(mail))
+            .map(|mail| build_reply_context(mail, list))
             .collect(),
     );
     let op_fav = favorite_of(op);
     let op_sub = subscription_of(op);
-    let op_reply = build_reply_context(op);
+    let op_reply = build_reply_context(op, list);
     // The message single view currently shows; the star, Reply and overview
     // highlight all track it. Single view is the default and opens on `opened`.
     let single_shown = Rc::new(Cell::new(opened));
@@ -3093,19 +3259,19 @@ fn add_label_extra_menus(widget: &gtk::Widget, menu: &gio::Menu) {
 /// Reply prefill: To = the author, Cc = everyone else on the thread,
 /// Re:-prefixed subject and the mail's Message-ID for threading. Parsed
 /// address lists are preferred; raw header values are the fallback.
-fn build_reply_context(mail: &Mail) -> composer::ReplyContext {
+fn build_reply_context(mail: &Mail, list: &str) -> composer::ReplyContext {
     // Cc the sender to themselves unless they have turned it off, so a copy of
     // the reply lands in their own mailbox.
     let cc_self = settings::cc_self()
         .then(|| profile::cached().sender_header())
         .flatten();
-    reply_context(mail, cc_self.as_deref())
+    reply_context(mail, cc_self.as_deref(), list)
 }
 
 /// The pure core of [`build_reply_context`]: given the optional address to Cc
 /// the sender at, build the reply prefill. Split out so recipient handling is
 /// unit-testable without touching git config or the settings store.
-fn reply_context(mail: &Mail, cc_self: Option<&str>) -> composer::ReplyContext {
+fn reply_context(mail: &Mail, cc_self: Option<&str>, list: &str) -> composer::ReplyContext {
     let mut cc: Vec<String> = Vec::new();
     if mail.to_addrs.is_empty() {
         cc.push(mail.to.clone());
@@ -3130,6 +3296,11 @@ fn reply_context(mail: &Mail, cc_self: Option<&str>) -> composer::ReplyContext {
         subject: composer::reply_subject(&mail.subject),
         in_reply_to: mail.message_id.clone().unwrap_or_default(),
         references: mail.references.clone().unwrap_or_default(),
+        // Any Message-ID in the thread reopens the same thread (Koshi always
+        // fetches a whole thread by any one of its messages), so the mail
+        // being replied to works as well as the thread root would.
+        list: Some(list.to_string()),
+        thread_message_id: mail.message_id.clone(),
     }
 }
 
@@ -3533,14 +3704,14 @@ pub(crate) fn add_star_and_bell(
 }
 
 /// A flat Reply icon button that retargets the composer to `mail`.
-fn build_reply_button(mail: &Mail, composer: &composer::Composer) -> gtk::Button {
+fn build_reply_button(mail: &Mail, composer: &composer::Composer, list_slug: &str) -> gtk::Button {
     let button = gtk::Button::builder()
         .icon_name("mail-reply-sender-symbolic")
         .tooltip_text("Reply")
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
         .build();
-    let reply = build_reply_context(mail);
+    let reply = build_reply_context(mail, list_slug);
     button.connect_clicked(glib::clone!(
         #[strong]
         composer,
@@ -3558,6 +3729,7 @@ fn build_header_list(
     mail: &Mail,
     overlay: &adw::ToastOverlay,
     composer: &composer::Composer,
+    list_slug: &str,
 ) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -3583,7 +3755,7 @@ fn build_header_list(
     let subject_row = build_single_line_row("Subject", &mail.subject, &visible_titles);
     subject_row.set_tooltip_text(Some(&mail.subject));
     if let Some(content) = subject_row.child().and_downcast::<gtk::Box>() {
-        content.append(&build_reply_button(mail, composer));
+        content.append(&build_reply_button(mail, composer, list_slug));
     }
     list.append(&subject_row);
 
@@ -3778,7 +3950,7 @@ fn build_mail_actions(
     list: &str,
 ) -> [gio::SimpleAction; 4] {
     let reply = gio::SimpleAction::new("reply", None);
-    let reply_context = build_reply_context(mail);
+    let reply_context = build_reply_context(mail, list);
     reply.connect_activate(glib::clone!(
         #[strong]
         composer,
@@ -3946,7 +4118,7 @@ mod tests {
     #[test]
     fn reply_context_targets_the_clicked_message() {
         let thread = parse_thread(RAW_THREAD);
-        let reply = reply_context(&thread[1], None);
+        let reply = reply_context(&thread[1], None, "lkml");
         assert_eq!(reply.to, "sashiko-bot@kernel.org");
         assert!(reply.cc.contains("Linus Walleij <linusw@kernel.org>"));
         assert!(reply.cc.contains("linux-watchdog@vger.kernel.org"));
@@ -3958,16 +4130,19 @@ mod tests {
             reply.in_reply_to,
             "<20260619204041.040D71F000E9@smtp.kernel.org>"
         );
+        // The list carries through so a sent reply can reopen the thread.
+        assert_eq!(reply.list.as_deref(), Some("lkml"));
+        assert_eq!(reply.thread_message_id, thread[1].message_id);
     }
 
     #[test]
     fn reply_context_adds_self_to_cc_once() {
         let to = mail("t@x", None, "Subj", "Author <author@x>");
         // A brand-new address is appended to Cc.
-        let with_self = reply_context(&to, Some("Me <me@x>"));
+        let with_self = reply_context(&to, Some("Me <me@x>"), "lkml");
         assert!(with_self.cc.contains("Me <me@x>"));
         // Turning it off leaves Cc without it.
-        let without = reply_context(&to, None);
+        let without = reply_context(&to, None, "lkml");
         assert!(!without.cc.contains("me@x"));
     }
 
@@ -3976,7 +4151,7 @@ mod tests {
         // Replying to yourself: self is the reply target, so it must not also
         // appear in Cc.
         let own = mail("t@x", None, "Subj", "Me <me@x>");
-        let reply = reply_context(&own, Some("Me <me@x>"));
+        let reply = reply_context(&own, Some("Me <me@x>"), "lkml");
         assert_eq!(reply.to, "Me <me@x>");
         assert!(!reply.cc.contains("me@x"));
     }
@@ -4028,6 +4203,34 @@ mod tests {
                      Subject: no id here\n\n\
                      body\n";
         assert!(thread_message_digests(mbox).is_empty());
+    }
+
+    #[test]
+    fn a_message_id_repeated_in_the_mbox_is_only_kept_once() {
+        // lore mirrors a message once per mailing list it was cross-posted
+        // to, so a thread spanning more than one list can come back from
+        // t.mbox.gz with the exact same Message-ID twice - both in
+        // parse_thread (a duplicated row in the thread view) and, since
+        // thread_message_digests goes through it too, as a duplicate
+        // notification from the watcher.
+        let mbox = b"From a@b Thu Jan  1 00:00:00 1970\n\
+                     From: Nika Krasnova <nika@example.moe>\n\
+                     Subject: bleh\n\
+                     Message-ID: <root@example>\n\n\
+                     body\n\
+                     From a@b Thu Jan  1 00:00:00 1970\n\
+                     From: Nika Krasnova <nika@example.moe>\n\
+                     Subject: bleh\n\
+                     Message-ID: <root@example>\n\n\
+                     body\n\
+                     From c@d Thu Jan  1 00:00:00 1970\n\
+                     From: reply-guy@example.org\n\
+                     Subject: Re: bleh\n\
+                     Message-ID: <reply@example>\n\
+                     In-Reply-To: <root@example>\n\n\
+                     ok\n";
+        assert_eq!(parse_thread(mbox).len(), 2);
+        assert_eq!(thread_message_digests(mbox).len(), 2);
     }
 
     #[test]
@@ -4114,6 +4317,28 @@ mod tests {
             body: String::new(),
             raw: String::new(),
         }
+    }
+
+    #[test]
+    fn dedup_by_message_id_keeps_only_the_first_copy() {
+        let mails = vec![
+            mail("root@x", None, "bleh", "Nika"),
+            mail("root@x", None, "bleh", "Nika"),
+            mail("reply@x", Some("root@x"), "Re: bleh", "Miguel"),
+        ];
+        let deduped = dedup_by_message_id(mails);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].message_id.as_deref(), Some("<root@x>"));
+        assert_eq!(deduped[1].message_id.as_deref(), Some("<reply@x>"));
+    }
+
+    #[test]
+    fn dedup_by_message_id_never_drops_messages_with_no_id_to_compare() {
+        let mut a = mail("root@x", None, "bleh", "Nika");
+        a.message_id = None;
+        let mut b = mail("root@x", None, "bleh", "Nika");
+        b.message_id = None;
+        assert_eq!(dedup_by_message_id(vec![a, b]).len(), 2);
     }
 
     #[test]

@@ -29,6 +29,13 @@ pub struct ReplyContext {
     /// The parent message's `References` header, carried (not edited) so the
     /// reply can extend the chain.
     pub references: String,
+    /// The lore list and a Message-ID of the thread being replied to — any
+    /// member of the thread works, since Koshi always fetches a whole thread
+    /// by any one of its messages. `None` for a from-scratch compose, which
+    /// has no thread to link back to. Carried through only so a successful
+    /// send can log it in [`crate::sent`] for the Sent page's "view thread".
+    pub list: Option<String>,
+    pub thread_message_id: Option<String>,
 }
 
 impl ReplyContext {
@@ -42,6 +49,8 @@ impl ReplyContext {
             subject: String::new(),
             in_reply_to: String::new(),
             references: String::new(),
+            list: None,
+            thread_message_id: None,
         }
     }
 }
@@ -566,11 +575,22 @@ fn build_send_button(state: &ComposerState, surface: &Surface) -> gtk::Button {
 fn send_now(state: &ComposerState, button: &gtk::Button, surface: &Surface) {
     let doc = normalize_document(&state.document_text());
     let (headers, _) = message::parse_headers(&doc);
+    let to = header_owned(&headers, "To");
+    let cc = header_owned(&headers, "Cc");
+    let subject = header_owned(&headers, "Subject");
     let request = send::Request {
         from: header_owned(&headers, "From"),
-        to: header_owned(&headers, "To"),
-        cc: header_owned(&headers, "Cc"),
+        to: to.clone(),
+        cc: cc.clone(),
         eml: doc,
+    };
+    // The thread this is a reply to (if any) rides the composer's own
+    // ReplyContext, not the editable headers - see the doc comment on
+    // ReplyContext::list. Read now, before the async send, since a fast
+    // Discard/retarget elsewhere could otherwise change it out from under us.
+    let (list, thread_message_id) = {
+        let initial = state.initial.borrow();
+        (initial.list.clone(), initial.thread_message_id.clone())
     };
     // Resolve the toast surface now, while the button is still in the tree.
     let overlay = button
@@ -590,6 +610,18 @@ fn send_now(state: &ComposerState, button: &gtk::Button, surface: &Surface) {
             button.set_sensitive(true);
             match outcome {
                 Ok(send::Outcome::Sent) => {
+                    crate::sent::record(crate::sent::SentMessage {
+                        subject,
+                        to,
+                        cc,
+                        sent_at: glib::DateTime::now_local()
+                            .ok()
+                            .and_then(|now| now.format("%a, %d %b %Y %H:%M").ok())
+                            .map(Into::into)
+                            .unwrap_or_default(),
+                        list,
+                        thread_message_id,
+                    });
                     if let Some(overlay) = &overlay {
                         overlay.add_toast(adw::Toast::new("Reply sent"));
                     }
@@ -971,6 +1003,7 @@ fn build_body_editor(buffer: &gtk::TextBuffer, compact: bool) -> (gtk::Overlay, 
         .right_margin(8)
         .top_margin(8)
         .bottom_margin(8)
+        .css_classes(["koshi-body-text"])
         .build();
     strip_extra_context_items(&view);
 

@@ -119,6 +119,114 @@ fn write_key(key: &str, new: serde_json::Value) {
     }
 }
 
+/// The default, minimum, and maximum body text size, in pixels. The default
+/// matches the size GTK's own monospace font stack renders at; the range
+/// keeps the Preferences spinner from producing an unreadably small or
+/// absurdly large body.
+pub const DEFAULT_BODY_FONT_SIZE: u32 = 13;
+pub const MIN_BODY_FONT_SIZE: u32 = 8;
+pub const MAX_BODY_FONT_SIZE: u32 = 32;
+
+/// The font size for message bodies (reading pane and composer), in pixels.
+/// Defaults to [`DEFAULT_BODY_FONT_SIZE`] and is clamped to the spinner's
+/// range so a hand-edited store can't request an unusable size.
+pub fn body_font_size() -> u32 {
+    let stored = STORE_PATH
+        .with_borrow(|path| path.clone())
+        .and_then(|path| fs::read_to_string(&path).ok())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .as_ref()
+        .and_then(|value| value.get("bodyFontSize"))
+        .and_then(serde_json::Value::as_u64);
+    match stored {
+        Some(size) => (size as u32).clamp(MIN_BODY_FONT_SIZE, MAX_BODY_FONT_SIZE),
+        None => DEFAULT_BODY_FONT_SIZE,
+    }
+}
+
+/// Persist the body font size, preserving any other settings already in the
+/// file.
+pub fn set_body_font_size(px: u32) {
+    write_key("bodyFontSize", serde_json::Value::from(px));
+}
+
+/// The default, minimum, and maximum interface text scale, as a percentage of
+/// the system's own default size. Unlike [`DEFAULT_BODY_FONT_SIZE`] (a fixed
+/// pixel size for message bodies only), this scales every label, button and
+/// menu in the app, so it is expressed relative to whatever the system
+/// default already is rather than an absolute size.
+pub const DEFAULT_UI_TEXT_SCALE: u32 = 100;
+pub const MIN_UI_TEXT_SCALE: u32 = 50;
+pub const MAX_UI_TEXT_SCALE: u32 = 200;
+
+/// The interface text scale, as a percentage. Defaults to
+/// [`DEFAULT_UI_TEXT_SCALE`] (unchanged) and is clamped to the spinner's
+/// range so a hand-edited store can't request an unusable scale.
+pub fn ui_text_scale() -> u32 {
+    let stored = STORE_PATH
+        .with_borrow(|path| path.clone())
+        .and_then(|path| fs::read_to_string(&path).ok())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+        .as_ref()
+        .and_then(|value| value.get("uiTextScale"))
+        .and_then(serde_json::Value::as_u64);
+    match stored {
+        Some(scale) => (scale as u32).clamp(MIN_UI_TEXT_SCALE, MAX_UI_TEXT_SCALE),
+        None => DEFAULT_UI_TEXT_SCALE,
+    }
+}
+
+/// Persist the interface text scale, preserving any other settings already in
+/// the file.
+pub fn set_ui_text_scale(percent: u32) {
+    write_key("uiTextScale", serde_json::Value::from(percent));
+}
+
+/// The user's chosen color scheme: follow the system, or always light/dark
+/// regardless of it. Stored as one of these exact strings; anything else
+/// (absent, or a hand-edited store with a stray value) reads back as
+/// [`Theme::System`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Theme::System => "system",
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        match value {
+            "light" => Theme::Light,
+            "dark" => Theme::Dark,
+            _ => Theme::System,
+        }
+    }
+}
+
+/// The user's chosen theme. Defaults to [`Theme::System`].
+pub fn theme() -> Theme {
+    read_key("theme")
+        .and_then(|value| value.as_str().map(Theme::from_str))
+        .unwrap_or_default()
+}
+
+/// Persist the theme, preserving any other settings already in the file.
+pub fn set_theme(theme: Theme) {
+    write_key(
+        "theme",
+        serde_json::Value::String(theme.as_str().to_owned()),
+    );
+}
+
 /// Koshi's default gap between subscription polls, in minutes.
 pub const DEFAULT_POLL_INTERVAL_MINUTES: u32 = 5;
 
@@ -263,6 +371,77 @@ mod tests {
         assert!(!send_user_agent());
         set_send_user_agent(true);
         assert!(send_user_agent());
+    }
+
+    #[test]
+    fn body_font_size_defaults_without_a_store() {
+        assert_eq!(body_font_size(), DEFAULT_BODY_FONT_SIZE);
+    }
+
+    #[test]
+    fn body_font_size_survives_a_reload() {
+        let store = ScratchStore::new("settings-font-size");
+        init(store.path());
+        set_body_font_size(18);
+        assert_eq!(body_font_size(), 18);
+    }
+
+    #[test]
+    fn body_font_size_is_clamped_to_the_spinner_range() {
+        let store = ScratchStore::new("settings-font-size-clamp");
+        init(store.path());
+        fs::write(store.path(), r#"{"bodyFontSize": 1}"#).unwrap();
+        assert_eq!(body_font_size(), MIN_BODY_FONT_SIZE);
+        fs::write(store.path(), r#"{"bodyFontSize": 999}"#).unwrap();
+        assert_eq!(body_font_size(), MAX_BODY_FONT_SIZE);
+    }
+
+    #[test]
+    fn theme_defaults_to_system_without_a_store() {
+        assert_eq!(theme(), Theme::System);
+    }
+
+    #[test]
+    fn theme_survives_a_reload() {
+        let store = ScratchStore::new("settings-theme");
+        init(store.path());
+        set_theme(Theme::Dark);
+        assert_eq!(theme(), Theme::Dark);
+        set_theme(Theme::Light);
+        assert_eq!(theme(), Theme::Light);
+        set_theme(Theme::System);
+        assert_eq!(theme(), Theme::System);
+    }
+
+    #[test]
+    fn theme_falls_back_to_system_for_a_stray_value() {
+        let store = ScratchStore::new("settings-theme-stray");
+        init(store.path());
+        fs::write(store.path(), r#"{"theme": "purple"}"#).unwrap();
+        assert_eq!(theme(), Theme::System);
+    }
+
+    #[test]
+    fn ui_text_scale_defaults_without_a_store() {
+        assert_eq!(ui_text_scale(), DEFAULT_UI_TEXT_SCALE);
+    }
+
+    #[test]
+    fn ui_text_scale_survives_a_reload() {
+        let store = ScratchStore::new("settings-ui-scale");
+        init(store.path());
+        set_ui_text_scale(125);
+        assert_eq!(ui_text_scale(), 125);
+    }
+
+    #[test]
+    fn ui_text_scale_is_clamped_to_the_spinner_range() {
+        let store = ScratchStore::new("settings-ui-scale-clamp");
+        init(store.path());
+        fs::write(store.path(), r#"{"uiTextScale": 1}"#).unwrap();
+        assert_eq!(ui_text_scale(), MIN_UI_TEXT_SCALE);
+        fs::write(store.path(), r#"{"uiTextScale": 999}"#).unwrap();
+        assert_eq!(ui_text_scale(), MAX_UI_TEXT_SCALE);
     }
 
     #[test]

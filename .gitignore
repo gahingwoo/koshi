@@ -4,3 +4,4 @@ result-*
 .direnv/
 /.flatpak/
 /.vscode/
+.DS_Store

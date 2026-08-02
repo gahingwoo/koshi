@@ -4,11 +4,19 @@ name: Release
 #   1. build & GPG-sign the Flatpak,
 #   2. generate a build-provenance attestation for the bundle,
 #   3. publish the signed OSTree repo to GitHub Pages (dl.nikableh.moe),
-#   4. create a GitHub Release with the .flatpak bundle attached.
+#   4. build the standalone macOS .app (build-aux/macos/bundle.sh) and pack
+#      it into a .dmg,
+#   5. create a GitHub Release with the .flatpak and .dmg attached.
 #
 # Requires repo secrets FLATPAK_GPG_PRIVATE_KEY and FLATPAK_GPG_KEY_ID, Pages
 # set to "GitHub Actions" as its source, and (for public reach) a public repo.
 # See docs/RELEASING.md for the one-time setup.
+#
+# The .dmg is ad-hoc signed only (no Apple Developer ID/notarization), so
+# Gatekeeper will flag it as from an unidentified developer on first launch -
+# right-click > Open, or System Settings > Privacy & Security > Open Anyway,
+# clears it. Notarizing would need a paid Developer ID and its own secrets;
+# out of scope until someone asks for it.
 
 on:
   push:
@@ -124,6 +132,45 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  build-macos:
+    name: Build macOS app (.dmg)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        # rust: cargo/rustc (edition 2024). gtk4/libadwaita/libsoup@3: the
+        # runtime stack bundle.sh links against and then bundles into the
+        # .app. dylibbundler: copies and relinks every dependent dylib.
+        # librsvg: gdk-pixbuf's SVG loader, and rsvg-convert for the app icon.
+        # adwaita-icon-theme: neither gtk4 nor libadwaita depends on it, but
+        # bundle.sh copies it in for the symbolic icons Koshi's UI uses -
+        # without it explicitly listed here, a runner with no other GTK app
+        # ever built on it (unlike a dev's already-populated Homebrew prefix)
+        # won't have it.
+        run: brew install rust gtk4 libadwaita libsoup@3 dylibbundler librsvg adwaita-icon-theme
+
+      - name: Build Koshi.app
+        run: bash build-aux/macos/bundle.sh
+
+      - name: Package as .dmg
+        run: |
+          set -eu
+          STAGE="$(mktemp -d)/Koshi"
+          mkdir -p "$STAGE"
+          cp -R target/macos/Koshi.app "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          mkdir -p dist
+          hdiutil create -volname Koshi -srcfolder "$STAGE" -ov -format UDZO dist/koshi.dmg
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-macos
+          path: dist/
+          if-no-files-found: error
+
   deploy-pages:
     name: Publish to dl.nikableh.moe
     needs: build
@@ -138,14 +185,20 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build, build-macos]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
-      - name: Download release assets
+      - name: Download Linux release assets
         uses: actions/download-artifact@v4
         with:
           name: release-assets
+          path: dist
+
+      - name: Download macOS release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-macos
           path: dist
 
       - name: Publish release
@@ -156,5 +209,6 @@ jobs:
             dist/koshi.gpg
             dist/koshi.flatpakrepo
             dist/koshi.flatpakref
+            dist/koshi.dmg
           generate_release_notes: true
           fail_on_unmatched_files: true

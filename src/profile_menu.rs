@@ -90,9 +90,7 @@ fn build_content(
     }
 
     root.append(&build_header(profile));
-    if profile.identities.len() >= 2 {
-        root.append(&build_identities(popover, profile));
-    }
+    root.append(&build_identities(popover, button, profile));
     if let Some(transport) = build_transport(profile) {
         root.append(&transport);
     }
@@ -158,23 +156,35 @@ fn build_email_pill(email: &str) -> gtk::Widget {
     pill.upcast()
 }
 
-/// The identity switcher, shown only when two or more identities exist: one
-/// activatable row each, the active one marked with a checkmark. Activating a
-/// different row writes `sendemail.identity` and closes the popover.
-fn build_identities(popover: &gtk::Popover, profile: &Profile) -> gtk::Widget {
-    let group = adw::PreferencesGroup::new();
+/// The identity switcher and editor. One row per configured identity — with
+/// an edit button that opens [`build_identity_editor_dialog`] pre-filled —
+/// plus a trailing "Add Identity" row that opens the same dialog empty.
+/// Shown whenever there is any git profile at all, even with zero identities
+/// configured yet, since adding the first one is the point.
+///
+/// The row itself is only activatable (to switch identity) when there are two
+/// or more: with zero or one there is nothing to switch to, and clicking the
+/// lone row would be a confusing no-op. Activating a different row writes
+/// `sendemail.identity` and closes the popover.
+fn build_identities(
+    popover: &gtk::Popover,
+    button: &gtk::MenuButton,
+    profile: &Profile,
+) -> gtk::Widget {
+    let group = adw::PreferencesGroup::builder().title("Identities").build();
+    let switchable = profile.identities.len() >= 2;
 
     for identity in &profile.identities {
         let is_active = profile.active_identity.as_deref() == Some(identity.name.as_str());
 
         let row = adw::ActionRow::builder()
             .title(glib::markup_escape_text(&identity.name))
-            .activatable(true)
+            .activatable(switchable)
             .build();
         if let Some(email) = &identity.email {
             row.set_subtitle(&glib::markup_escape_text(email));
         }
-        if is_active {
+        if is_active && switchable {
             row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
         }
 
@@ -189,10 +199,255 @@ fn build_identities(popover: &gtk::Popover, profile: &Profile) -> gtk::Widget {
                 popover.popdown();
             }
         ));
+
+        let edit = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .valign(gtk::Align::Center)
+            .tooltip_text("Edit identity")
+            .css_classes(["flat"])
+            .build();
+        let identity = identity.clone();
+        edit.connect_clicked(glib::clone!(
+            #[weak]
+            popover,
+            #[weak]
+            button,
+            move |_| {
+                let dialog = build_identity_editor_dialog(Some(&identity));
+                dialog.present(button.root().and_downcast::<gtk::Window>().as_ref());
+                popover.popdown();
+            }
+        ));
+        row.add_suffix(&edit);
+
         group.add(&row);
     }
 
+    let add_row = adw::ActionRow::builder()
+        .title("Add Identity")
+        .activatable(true)
+        .build();
+    add_row.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
+    add_row.connect_activated(glib::clone!(
+        #[weak]
+        popover,
+        #[weak]
+        button,
+        move |_| {
+            let dialog = build_identity_editor_dialog(None);
+            dialog.present(button.root().and_downcast::<gtk::Window>().as_ref());
+            popover.popdown();
+        }
+    ));
+    group.add(&add_row);
+
     group.upcast()
+}
+
+/// The create/edit form for one `[sendemail "<name>"]` identity. Save writes
+/// straight to the user's global git config via
+/// [`profile::set_identity_setting`] — this dialog is a friendlier way to
+/// edit that file, not a parallel store, matching how the rest of Koshi's
+/// identity handling works (see the module doc on [`crate::profile`]).
+fn build_identity_editor_dialog(existing: Option<&profile::Identity>) -> adw::Dialog {
+    // Built without a child first so the buttons below can hold a weak
+    // reference to it and close it themselves on Save/Delete.
+    let dialog = adw::Dialog::builder()
+        .title(if existing.is_some() {
+            "Edit Identity"
+        } else {
+            "Add Identity"
+        })
+        .content_width(440)
+        .content_height(560)
+        .build();
+
+    let page = adw::PreferencesPage::new();
+    page.set_description(
+        "Identities are git send-email identities, kept in your global git \
+         configuration \u{2014} saving here writes straight there; nothing is \
+         stored by Koshi itself.",
+    );
+
+    let group = adw::PreferencesGroup::new();
+
+    let name_row = adw::EntryRow::builder().title("Identity name").build();
+    if let Some(identity) = existing {
+        name_row.set_text(identity.name.as_str());
+        // Renaming would mean moving every setting to a new git config
+        // subsection, which this editor does not do - keep it fixed once
+        // created, same as the git config file itself has no rename.
+        name_row.set_sensitive(false);
+    }
+    group.add(&name_row);
+
+    let field = |key: &str| -> String {
+        existing
+            .and_then(|identity| identity.settings.iter().find(|s| s.key == key))
+            .map(|s| s.value.clone())
+            .unwrap_or_default()
+    };
+
+    let from_row = adw::EntryRow::builder()
+        .title("From (Name <email>)")
+        .build();
+    from_row.set_text(&field("from"));
+    group.add(&from_row);
+
+    let smtp_server_row = adw::EntryRow::builder().title("SMTP server").build();
+    smtp_server_row.set_text(&field("smtpServer"));
+    group.add(&smtp_server_row);
+
+    let smtp_port_row = adw::EntryRow::builder().title("SMTP port").build();
+    smtp_port_row.set_text(&field("smtpServerPort"));
+    group.add(&smtp_port_row);
+
+    let encryption_row = adw::ComboRow::builder()
+        .title("Encryption")
+        .model(&gtk::StringList::new(&["None", "SSL", "TLS"]))
+        .build();
+    encryption_row.set_selected(
+        match field("smtpEncryption").to_ascii_lowercase().as_str() {
+            "ssl" => 1,
+            "tls" => 2,
+            _ => 0,
+        },
+    );
+    group.add(&encryption_row);
+
+    let smtp_user_row = adw::EntryRow::builder().title("SMTP username").build();
+    smtp_user_row.set_text(&field("smtpUser"));
+    group.add(&smtp_user_row);
+
+    let sendmail_row = adw::EntryRow::builder()
+        .title("Local sendmail command (instead of SMTP)")
+        .build();
+    sendmail_row.set_text(&field("sendmailCmd"));
+    group.add(&sendmail_row);
+
+    page.add(&group);
+
+    let overlay = adw::ToastOverlay::new();
+    let header = adw::HeaderBar::new();
+    // AdwDialog forces its own close button onto the header's start side with
+    // no way to move it - on macOS, replace it with one of our own on the end
+    // side, matching how the main window's buttons were moved there too. See
+    // the comment on main.rs's move_dialog_close_button_to_end.
+    #[cfg(target_os = "macos")]
+    {
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let close = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Close")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .build();
+        close.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| {
+                dialog.close();
+            }
+        ));
+        header.pack_end(&close);
+    }
+
+    let save = gtk::Button::builder()
+        .label("Save")
+        .css_classes(["suggested-action"])
+        .build();
+    header.pack_end(&save);
+    let is_new = existing.is_none();
+    save.connect_clicked(glib::clone!(
+        #[weak]
+        dialog,
+        #[weak]
+        overlay,
+        #[weak]
+        name_row,
+        #[weak]
+        from_row,
+        #[weak]
+        smtp_server_row,
+        #[weak]
+        smtp_port_row,
+        #[weak]
+        encryption_row,
+        #[weak]
+        smtp_user_row,
+        #[weak]
+        sendmail_row,
+        move |_| {
+            let name = name_row.text().trim().to_string();
+            if name.is_empty() {
+                overlay.add_toast(adw::Toast::new("Identity name is required"));
+                return;
+            }
+            let encryption = match encryption_row.selected() {
+                1 => "ssl",
+                2 => "tls",
+                _ => "",
+            };
+            let fields = [
+                ("from", from_row.text()),
+                ("smtpserver", smtp_server_row.text()),
+                ("smtpserverport", smtp_port_row.text()),
+                ("smtpencryption", encryption.into()),
+                ("smtpuser", smtp_user_row.text()),
+                ("sendmailcmd", sendmail_row.text()),
+            ];
+            let mut ok = true;
+            for (key, value) in fields {
+                let value = value.trim();
+                let value = (!value.is_empty()).then_some(value);
+                if !profile::set_identity_setting(&name, key, value) {
+                    ok = false;
+                }
+            }
+            if !ok {
+                overlay.add_toast(adw::Toast::new("Failed to save identity"));
+                return;
+            }
+            // A brand-new identity is the obvious thing to send as next;
+            // editing an existing one leaves whichever is active alone.
+            if is_new {
+                profile::set_active_identity(&name);
+            }
+            dialog.close();
+        }
+    ));
+
+    if let Some(identity) = existing {
+        let delete = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Delete identity")
+            .css_classes(["flat", "destructive-action"])
+            .build();
+        header.pack_start(&delete);
+        let name = identity.name.clone();
+        delete.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            #[weak]
+            overlay,
+            move |_| {
+                if profile::delete_identity(&name) {
+                    dialog.close();
+                } else {
+                    overlay.add_toast(adw::Toast::new("Failed to delete identity"));
+                }
+            }
+        ));
+    }
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&page));
+    overlay.set_child(Some(&toolbar));
+    dialog.set_child(Some(&overlay));
+
+    dialog
 }
 
 /// A single calm row saying where mail goes: server as title, "Port 465 · SSL"
@@ -347,17 +602,44 @@ fn build_sending_dialog(profile: &Profile) -> adw::Dialog {
         page.add(&build_forget_password_group(host, username, &overlay));
     }
 
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&adw::HeaderBar::new());
-    toolbar.set_content(Some(&page));
-    overlay.set_child(Some(&toolbar));
-
-    adw::Dialog::builder()
+    let dialog = adw::Dialog::builder()
         .title("Send Email")
         .content_width(460)
         .content_height(620)
-        .child(&overlay)
-        .build()
+        .build();
+
+    let header = adw::HeaderBar::new();
+    // See the comment on main.rs's move_dialog_close_button_to_end: AdwDialog
+    // forces its own close button onto the header's start side with no way to
+    // move it, so on macOS this replaces it with one of our own on the end
+    // side, matching the main window's buttons-on-the-right layout.
+    #[cfg(target_os = "macos")]
+    {
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let close = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Close")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .build();
+        close.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| {
+                dialog.close();
+            }
+        ));
+        header.pack_end(&close);
+    }
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&page));
+    overlay.set_child(Some(&toolbar));
+    dialog.set_child(Some(&overlay));
+
+    dialog
 }
 
 /// A group with one destructive action: forget the SMTP password kept for this

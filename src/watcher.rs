@@ -14,7 +14,9 @@
 //! limiter trips, it answers *everything* with 503, including whatever page
 //! the user is trying to read.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(not(target_os = "macos"))]
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
@@ -47,6 +49,13 @@ const POLL_SPACING_SECONDS: u32 = 2;
 /// concurrent cycles onto lore. The interval is re-read every cycle, so a
 /// change in Preferences is honoured from the following one.
 pub fn start(app: &adw::Application) {
+    // Ask up front rather than on the first notification: addNotificationRequest
+    // fails outright while authorization is still undecided, so requesting only
+    // when a message actually arrives would routinely lose a fresh install's
+    // very first notification to that race. See the macos_notify module doc.
+    #[cfg(target_os = "macos")]
+    macos_notify::request_authorization();
+
     let weak = app.downgrade();
     glib::spawn_future_local(async move {
         glib::timeout_future_seconds(STARTUP_POLL_DELAY_SECONDS).await;
@@ -222,6 +231,11 @@ async fn poll_one(app: &adw::Application, subscription: Subscription) -> Result<
 /// `id` is the message's own Message-Id: the portal replaces a notification
 /// whose id it has already seen, so reusing it dedupes a message that somehow
 /// surfaces twice without coalescing distinct arrivals.
+///
+/// macOS has no session D-Bus (and so no portal); [`macos_notify::notify`]
+/// below raises the same notification through `UNUserNotificationCenter`
+/// instead, the Cocoa-native equivalent.
+#[cfg(not(target_os = "macos"))]
 fn notify_new_message(app: &adw::Application, id: &str, author: &str, subject: &str) {
     let Some(connection) = app.dbus_connection() else {
         log::warn!("no session bus; cannot notify about \"{subject}\"");
@@ -246,9 +260,19 @@ fn notify_new_message(app: &adw::Application, id: &str, author: &str, subject: &
     );
 }
 
+/// See the doc comment on the non-macOS `notify_new_message` above; this is
+/// its `UNUserNotificationCenter` counterpart. `app` is unused here — Cocoa's
+/// notification center is a process-wide singleton, not reached through the
+/// session bus connection the portal needs.
+#[cfg(target_os = "macos")]
+fn notify_new_message(_app: &adw::Application, id: &str, author: &str, subject: &str) {
+    macos_notify::notify(id, author, subject);
+}
+
 /// The `(sa{sv})` argument tuple for
 /// `org.freedesktop.portal.Notification.AddNotification`: the notification id
 /// and its property dictionary (title, body, icon).
+#[cfg(not(target_os = "macos"))]
 fn add_notification_params(id: &str, author: &str, subject: &str) -> glib::Variant {
     let mut notification: HashMap<&str, glib::Variant> = HashMap::new();
     notification.insert("title", author.to_variant());
@@ -263,7 +287,7 @@ fn add_notification_params(id: &str, author: &str, subject: &str) -> glib::Varia
     (id, notification).to_variant()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
@@ -285,4 +309,112 @@ mod tests {
             .expect("icon key present");
         assert_eq!(icon.type_().as_str(), "(sv)");
     }
+}
+
+/// `UNUserNotificationCenter` backend for macOS, which has no session D-Bus
+/// (and so no XDG notification portal) for `notify_new_message` above to use.
+///
+/// Notifications need per-app authorization. [`macos_notify::request_authorization`]
+/// fires it once at startup ([`start`] calls it), so the system prompt has the
+/// whole [`STARTUP_POLL_DELAY_SECONDS`] head start (and realistically much
+/// longer, given typical poll intervals) to be answered before any message
+/// actually needs to notify — `addNotificationRequest` fails outright for a
+/// still-undecided authorization, so asking any later would routinely lose
+/// the very first notification of a fresh install to that race.
+/// [`macos_notify::notify`] requests again defensively (a no-op once already
+/// requested) in case it is ever reached without `start` having run first.
+#[cfg(target_os = "macos")]
+mod macos_notify {
+    use std::cell::Cell;
+
+    use objc2::runtime::Bool;
+    use objc2_foundation::{NSBundle, NSError, NSString};
+    use objc2_user_notifications::{
+        UNAuthorizationOptions, UNMutableNotificationContent, UNNotificationRequest,
+        UNUserNotificationCenter,
+    };
+
+    thread_local! {
+        /// Whether authorization has been requested this run yet.
+        static AUTHORIZATION_REQUESTED: Cell<bool> = const { Cell::new(false) };
+        /// The last known answer: `None` until the (async) system prompt has
+        /// actually been answered, then whatever it decided. Preferences
+        /// reads this to warn the user when it is `Some(false)` - the prompt
+        /// only ever appears once per install, so a denial is otherwise
+        /// invisible short of checking System Settings directly.
+        static AUTHORIZATION_GRANTED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+
+    /// Ask the user to allow notifications, if this run has not already
+    /// asked. A no-op outside an app bundle, for the same reason [`notify`]
+    /// skips there — see its doc comment.
+    pub(super) fn request_authorization() {
+        if NSBundle::mainBundle().bundleIdentifier().is_none() {
+            return;
+        }
+        if AUTHORIZATION_REQUESTED.replace(true) {
+            return;
+        }
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let options = UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound;
+        let handler = block2::RcBlock::new(|granted: Bool, _error: *mut NSError| {
+            let granted = granted.as_bool();
+            AUTHORIZATION_GRANTED.set(Some(granted));
+            if !granted {
+                log::warn!("notification authorization was not granted");
+            }
+        });
+        center.requestAuthorizationWithOptions_completionHandler(options, &handler);
+    }
+
+    /// Whether the system prompt has been answered *and* the answer was no -
+    /// `false` both when it was granted and while it is still undecided (the
+    /// prompt is asynchronous; the answer may not be in yet), so a caller
+    /// checking this to decide whether to show a warning never flashes one
+    /// before startup's authorization request has had a chance to resolve.
+    pub(super) fn is_denied() -> bool {
+        AUTHORIZATION_GRANTED.get() == Some(false)
+    }
+
+    pub(super) fn notify(id: &str, author: &str, subject: &str) {
+        // UNUserNotificationCenter reads the process's own bundle identifier
+        // internally and *aborts the whole process* (an uncaught
+        // NSInternalInconsistencyException, not a Rust-catchable error) when
+        // there isn't one - true for `cargo run`/`cargo test`, which run the
+        // bare binary outside any .app bundle. Notifications only work from
+        // the packaged .app (see build-aux/macos/bundle.sh); anywhere else,
+        // skip with a log line instead of taking the process down.
+        if NSBundle::mainBundle().bundleIdentifier().is_none() {
+            log::warn!("not running inside an app bundle; cannot notify about \"{subject}\"");
+            return;
+        }
+        request_authorization();
+
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let content = UNMutableNotificationContent::new();
+        content.setTitle(&NSString::from_str(author));
+        content.setBody(&NSString::from_str(subject));
+
+        let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
+            &NSString::from_str(id),
+            &content,
+            None,
+        );
+
+        let subject = subject.to_string();
+        let completion = block2::RcBlock::new(move |error: *mut NSError| {
+            if !error.is_null() {
+                log::warn!("notification failed for \"{subject}\"");
+            }
+        });
+        center.addNotificationRequest_withCompletionHandler(&request, Some(&completion));
+    }
+}
+
+/// Whether the user has explicitly declined the macOS notification
+/// authorization prompt, for Preferences to surface a warning — see
+/// [`macos_notify::is_denied`] for exactly what this does and does not mean.
+#[cfg(target_os = "macos")]
+pub fn notifications_denied() -> bool {
+    macos_notify::is_denied()
 }

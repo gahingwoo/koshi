@@ -227,6 +227,55 @@ pub fn set_active_identity(name: &str) -> bool {
     ok
 }
 
+/// Write (or, when `value` is `None`, clear) one `sendemail.<identity>.<key>`
+/// setting in the user's global git config — the same file [`load`] reads, so
+/// Koshi keeps no identity store of its own even when it is the one writing.
+/// `key` is the lowercase git config variable name (e.g. `"smtpserver"`, not
+/// `"smtpServer"`); git lowercases the section/variable regardless of what is
+/// passed, but the caller should not rely on that. Returns whether the write
+/// (or clear) succeeded; clearing a key that was never set counts as success,
+/// since the caller's intent — that key being absent — already holds.
+pub fn set_identity_setting(identity: &str, key: &str, value: Option<&str>) -> bool {
+    let config_key = format!("sendemail.{identity}.{key}");
+    let ok = match value {
+        Some(value) if !value.trim().is_empty() => crate::flatpak::git_command()
+            .args(["config", "--global", &config_key, value])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false),
+        _ => {
+            let status = crate::flatpak::git_command()
+                .args(["config", "--global", "--unset", &config_key])
+                .status();
+            match status {
+                // Exit code 5: "the key does not exist" - already absent.
+                Ok(status) => status.success() || status.code() == Some(5),
+                Err(_) => false,
+            }
+        }
+    };
+    invalidate();
+    ok
+}
+
+/// Remove a whole `[sendemail "<name>"]` section from the user's global git
+/// config, deleting the identity and every setting under it. Returns whether
+/// the removal succeeded.
+pub fn delete_identity(name: &str) -> bool {
+    let ok = crate::flatpak::git_command()
+        .args([
+            "config",
+            "--global",
+            "--remove-section",
+            &format!("sendemail.{name}"),
+        ])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    invalidate();
+    ok
+}
+
 /// Evict a stored send-email SMTP password from git's credential helpers, so
 /// the next send prompts for it again. Best-effort: a send with no helper
 /// simply has nothing to evict.

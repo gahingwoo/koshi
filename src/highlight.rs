@@ -351,6 +351,80 @@ const ALL_TAGS: [&str; 6] = [
     QUOTE_TAG, ADD_TAG, REMOVE_TAG, HUNK_TAG, HEADER_TAG, META_TAG,
 ];
 
+/// Fold tags: applied alongside the color tags above to every quote (any
+/// depth) and every diff span respectively. Folding a message toggles the
+/// tag's own `invisible` property rather than adding/removing it from text,
+/// so it stays in step with [`refresh`]/[`refresh_step`] re-tagging the same
+/// spans on every highlight pass.
+const FOLD_QUOTE_TAG: &str = "koshi-fold-quote";
+const FOLD_DIFF_TAG: &str = "koshi-fold-diff";
+const FOLD_TAGS: [&str; 2] = [FOLD_QUOTE_TAG, FOLD_DIFF_TAG];
+
+/// Per line of `text`, whether it is quoted (any depth) and whether it is
+/// part of a diff — unlike [`classify`]'s color spans, this covers *every*
+/// line a diff touches, including unchanged context lines, which carry no
+/// span (and so no color) but still have to fold away for a diff-fold to
+/// actually shrink the row instead of leaving a blank gap where they used to
+/// be. Reuses [`step`], the same state machine `classify` and `preserve_mask`
+/// both drive.
+fn fold_membership(text: &str) -> Vec<(bool, bool)> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut membership = Vec::with_capacity(lines.len());
+    let mut state = State::None;
+    let mut state_depth = 0usize;
+
+    for (n, line) in lines.iter().enumerate() {
+        let (depth, prefix) = split_quote(line);
+        if depth != state_depth {
+            state = State::None;
+            state_depth = depth;
+        }
+        let content = line[prefix..].strip_suffix('\r').unwrap_or(&line[prefix..]);
+        let next_is_plus = lines.get(n + 1).is_some_and(|next| {
+            let (d, p) = split_quote(next);
+            d == depth && next[p..].starts_with("+++ ")
+        });
+        let (next_state, outcome) = step(state, content, next_is_plus, depth > 0);
+        state = next_state;
+
+        membership.push((depth > 0, matches!(outcome, Outcome::InDiff(_))));
+    }
+    membership
+}
+
+/// How many lines of `text` are quoted, and how many are part of a diff —
+/// the same per-line membership folding uses, run once up front so a caller
+/// can size a row before folding and decide whether to show fold controls at
+/// all. A line quoting a diff counts in both.
+pub fn foldable_line_counts(text: &str) -> (usize, usize) {
+    let membership = fold_membership(text);
+    let quote_lines = membership.iter().filter(|(quote, _)| *quote).count();
+    let diff_lines = membership.iter().filter(|(_, diff)| *diff).count();
+    (quote_lines, diff_lines)
+}
+
+/// Fold (hide) or unfold quoted text in `buffer` — every quoted line, at any
+/// depth. A no-op if [`attach`] was never called on this buffer.
+pub fn set_quote_folded(buffer: &gtk::TextBuffer, folded: bool) {
+    set_folded(buffer, FOLD_QUOTE_TAG, folded);
+}
+
+/// Fold (hide) or unfold every line of a diff in `buffer` — headers, hunk
+/// markers, metadata, added/removed lines, and unchanged context lines
+/// alike. Context lines carry no color (see [`Kind`]), but still have to
+/// fold away with the rest of the hunk: leaving them visible would strand
+/// isolated fragments of unrelated-looking code with blank gaps around them
+/// instead of folding the hunk closed.
+pub fn set_diff_folded(buffer: &gtk::TextBuffer, folded: bool) {
+    set_folded(buffer, FOLD_DIFF_TAG, folded);
+}
+
+fn set_folded(buffer: &gtk::TextBuffer, tag_name: &str, folded: bool) {
+    if let Some(tag) = buffer.tag_table().lookup(tag_name) {
+        tag.set_property("invisible", folded);
+    }
+}
+
 /// Find-in-thread highlight tags. Deliberately kept out of ALL_TAGS: the
 /// quote/diff refresh must not strip them, and they paint a background (not a
 /// foreground), so a match keeps its line's quote/diff coloring underneath.
@@ -435,6 +509,10 @@ pub fn attach(buffer: &gtk::TextBuffer) {
     for name in [SEARCH_TAG, SEARCH_CURRENT_TAG, TRAILING_TAG] {
         buffer.create_tag(Some(name), &[]);
     }
+    // Unfolded (visible) by default; a fresh message always opens expanded.
+    for name in FOLD_TAGS {
+        buffer.create_tag(Some(name), &[("invisible", &false)]);
+    }
 
     let style = adw::StyleManager::default();
     apply_colors(buffer, style.is_dark());
@@ -450,6 +528,9 @@ pub fn attach(buffer: &gtk::TextBuffer) {
     buffer.add_weak_ref_notify_local(move || {
         adw::StyleManager::default().disconnect(handler);
         SPAN_CACHE.with_borrow_mut(|cache| {
+            cache.remove(&key);
+        });
+        FOLD_CACHE.with_borrow_mut(|cache| {
             cache.remove(&key);
         });
         PAINT_PROGRESS.with_borrow_mut(|progress| {
@@ -574,6 +655,49 @@ thread_local! {
     /// live buffers.
     static SPAN_CACHE: std::cell::RefCell<std::collections::HashMap<usize, Vec<Span>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Last fold membership applied per buffer, keyed the same way as
+    /// [`SPAN_CACHE`] and cleared by the same weak-ref notify.
+    static FOLD_CACHE: std::cell::RefCell<std::collections::HashMap<usize, Vec<(bool, bool)>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Apply or clear the fold tags a line's [`fold_membership`] calls for,
+/// touching only lines whose membership changed since the last call
+/// (mirroring how [`refresh`] diffs spans). Each tag covers the *whole*
+/// line, including its trailing newline — unlike a color span, folding only
+/// shrinks a row's height when the newline itself is hidden too, not just
+/// the glyphs before it.
+fn retag_fold_lines(buffer: &gtk::TextBuffer, text: &str, line_starts: &[i32], total_chars: i32) {
+    let key = buffer.as_ptr() as usize;
+    let membership = fold_membership(text);
+    let old = FOLD_CACHE
+        .with_borrow(|cache| cache.get(&key).cloned())
+        .unwrap_or_default();
+
+    let table = buffer.tag_table();
+    for (n, &(quote, diff)) in membership.iter().enumerate() {
+        if old.get(n) == Some(&(quote, diff)) {
+            continue;
+        }
+        let base = line_starts[n];
+        let line_end = line_starts.get(n + 1).copied().unwrap_or(total_chars);
+        let from = buffer.iter_at_offset(base);
+        let to = buffer.iter_at_offset(line_end);
+        for name in FOLD_TAGS {
+            if let Some(tag) = table.lookup(name) {
+                buffer.remove_tag(&tag, &from, &to);
+            }
+        }
+        if quote && let Some(tag) = table.lookup(FOLD_QUOTE_TAG) {
+            buffer.apply_tag(&tag, &from, &to);
+        }
+        if diff && let Some(tag) = table.lookup(FOLD_DIFF_TAG) {
+            buffer.apply_tag(&tag, &from, &to);
+        }
+    }
+    FOLD_CACHE.with_borrow_mut(|cache| {
+        cache.insert(key, membership);
+    });
 }
 
 /// Re-run classification over the whole buffer and retag only the lines
@@ -639,6 +763,8 @@ pub fn refresh(buffer: &gtk::TextBuffer) {
     SPAN_CACHE.with_borrow_mut(|cache| {
         cache.insert(key, spans);
     });
+
+    retag_fold_lines(buffer, &text, &line_starts, total_chars);
 }
 
 /// A partially applied highlight pass, so multi-megabyte bodies can be
@@ -647,6 +773,7 @@ pub fn refresh(buffer: &gtk::TextBuffer) {
 /// nearly every line).
 struct PaintProgress {
     spans: Vec<Span>,
+    fold_membership: Vec<(bool, bool)>,
     line_starts: Vec<i32>,
     total_chars: i32,
     next_line: usize,
@@ -683,6 +810,7 @@ pub fn refresh_step(buffer: &gtk::TextBuffer, lines: usize) -> bool {
             }
             PaintProgress {
                 spans: classify(&text),
+                fold_membership: fold_membership(&text),
                 line_starts,
                 total_chars: off,
                 next_line: 0,
@@ -705,13 +833,43 @@ pub fn refresh_step(buffer: &gtk::TextBuffer, lines: usize) -> bool {
         buffer.apply_tag_by_name(tag_name(span.kind), &from, &to);
         progress.next_span += 1;
     }
+
+    // Fold tags cover the whole line, including the newline, for the same
+    // [next_line, end_line) window the spans loop above just advanced
+    // through - see retag_fold_lines's doc comment for why.
+    let table = buffer.tag_table();
+    let chunk_end = end_line.min(progress.fold_membership.len());
+    for n in progress.next_line..chunk_end {
+        let (quote, diff) = progress.fold_membership[n];
+        if !quote && !diff {
+            continue;
+        }
+        let base = progress.line_starts[n];
+        let line_end = progress
+            .line_starts
+            .get(n + 1)
+            .copied()
+            .unwrap_or(progress.total_chars);
+        let from = buffer.iter_at_offset(base);
+        let to = buffer.iter_at_offset(line_end);
+        if quote && let Some(tag) = table.lookup(FOLD_QUOTE_TAG) {
+            buffer.apply_tag(&tag, &from, &to);
+        }
+        if diff && let Some(tag) = table.lookup(FOLD_DIFF_TAG) {
+            buffer.apply_tag(&tag, &from, &to);
+        }
+    }
+
     progress.next_line = end_line;
 
     if progress.next_line >= progress.line_starts.len() {
-        // Done: leave the final spans where refresh's diffing expects them,
-        // so a later full refresh sees the true tag state.
+        // Done: leave the final spans/membership where refresh's diffing
+        // expects them, so a later full refresh sees the true tag state.
         SPAN_CACHE.with_borrow_mut(|cache| {
             cache.insert(key, progress.spans);
+        });
+        FOLD_CACHE.with_borrow_mut(|cache| {
+            cache.insert(key, progress.fold_membership);
         });
         false
     } else {
@@ -1011,6 +1169,57 @@ diff --git a/f b/f
     fn trailing_whitespace_leaves_clean_lines_alone() {
         assert!(trailing_whitespace("clean line").is_empty());
         assert!(trailing_whitespace("a\nb\nc").is_empty());
+    }
+
+    #[test]
+    fn foldable_line_counts_separates_quote_from_diff() {
+        let body = "\
+reply line
+> quoted line one
+> quoted line two
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1 +1 @@
+-old
++new";
+        let (quote, diff) = foldable_line_counts(body);
+        assert_eq!(quote, 2);
+        assert_eq!(diff, 6);
+    }
+
+    #[test]
+    fn foldable_line_counts_double_counts_a_quoted_diff_line() {
+        // A line that is both quoted and part of a diff contributes to both
+        // counts - callers subtracting both when folding both may
+        // under-estimate the freed height slightly, which is fine for a
+        // pre-realization size estimate.
+        let (quote, diff) = foldable_line_counts("> diff --git a/f b/f");
+        assert_eq!(quote, 1);
+        assert_eq!(diff, 1);
+    }
+
+    #[test]
+    fn foldable_line_counts_are_zero_for_plain_prose() {
+        assert_eq!(foldable_line_counts("just a reply\nwith no quotes"), (0, 0));
+    }
+
+    #[test]
+    fn foldable_line_counts_includes_context_lines_in_a_hunk() {
+        // Context lines carry no color span (see kinds_by_line's own check
+        // that a context line is untagged), but they still have to fold with
+        // the rest of the hunk - otherwise folding "diff" strands them as
+        // isolated, unexplained fragments instead of closing the hunk.
+        let body = "\
+diff --git a/f b/f
+--- a/f
++++ b/f
+@@ -1,3 +1,3 @@
+ keep this line
+-old
++new";
+        let (_, diff) = foldable_line_counts(body);
+        assert_eq!(diff, 7, "the ' keep this line' context line must count too");
     }
 
     #[test]

@@ -13,6 +13,8 @@ mod profile;
 mod profile_menu;
 mod remote_page;
 mod send;
+mod sent;
+mod sent_page;
 mod settings;
 mod subscriptions;
 mod subscriptions_page;
@@ -21,7 +23,7 @@ mod thread_page;
 mod watcher;
 mod window_state;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -30,6 +32,7 @@ use gtk::{gio, glib};
 use favorites_page::{FAVORITES_PAGE_NAME, build_favorites_page};
 use inbox_page::{INBOX_LIST_TITLE, build_inbox_page, build_inbox_page_deferred};
 use profile_menu::build_profile_button;
+use sent_page::{SENT_PAGE_NAME, build_sent_page};
 use subscriptions_page::{SUBSCRIPTIONS_PAGE_NAME, build_subscriptions_page};
 use thread_list_page::{
     build_search_page, build_thread_list_page, build_thread_list_page_deferred,
@@ -77,11 +80,15 @@ fn main() -> glib::ExitCode {
         let data_dir = glib::user_data_dir().join("koshi");
         favorites::init(data_dir.join("favorites.json"));
         subscriptions::init(data_dir.join("subscriptions.json"));
+        sent::init(data_dir.join("sent.json"));
         window_state::init(data_dir.join("window-state.json"));
         // Preferences are user configuration, so they live in the config dir
         // ($XDG_CONFIG_HOME), not the data dir used for window state above.
         settings::init(glib::user_config_dir().join("koshi").join("settings.json"));
         load_css();
+        apply_body_font_size(settings::body_font_size());
+        apply_ui_text_scale(settings::ui_text_scale());
+        apply_theme(settings::theme());
         register_bundled_icons();
         // Use the bundled app icon for window/taskbar decorations. When Koshi
         // is installed its desktop file points the shell at the same icon; this
@@ -95,8 +102,9 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
-// The single user-approved custom-CSS exception: compact address chips.
-// Everything else must stay stock Adwaita.
+// The two user-approved custom-CSS exceptions: compact address chips, and the
+// user-adjustable body text size (below). Everything else must stay stock
+// Adwaita.
 fn load_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
@@ -109,6 +117,90 @@ fn load_css() {
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
     }
+}
+
+thread_local! {
+    // Reloaded (not re-added) on every Preferences change, so the display
+    // never accumulates one provider per adjustment.
+    static BODY_FONT_PROVIDER: gtk::CssProvider = {
+        let provider = gtk::CssProvider::new();
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+        provider
+    };
+}
+
+/// Apply the user's chosen body text size to every message body: the thread
+/// reading pane and the composer editor, both marked with the
+/// `koshi-body-text` class. Scoped to that class alone so nothing else in the
+/// UI moves off stock Adwaita sizing.
+pub(crate) fn apply_body_font_size(px: u32) {
+    BODY_FONT_PROVIDER.with(|provider| {
+        provider.load_from_string(&format!(
+            "textview.koshi-body-text {{ font-size: {px}px; }}"
+        ));
+    });
+}
+
+/// GTK's own fallback font resolution when nothing else has set one — used as
+/// the 100% baseline for [`apply_ui_text_scale`] when `gtk-xft-dpi` reads back
+/// `-1` ("use the default"), which it always does unless something (the
+/// desktop's own accessibility "large text" setting, or this function on an
+/// earlier call) has already set a real value. 96 dpi is the standard
+/// reference resolution X11/Pango assume in that case.
+const DEFAULT_DPI_1024: i32 = 96 * 1024;
+
+thread_local! {
+    /// The 100% baseline, captured from `gtk-xft-dpi` the first time
+    /// [`apply_ui_text_scale`] runs (before it ever overwrites that setting),
+    /// so a later change in Preferences scales from the system's real default
+    /// rather than compounding onto whatever the last scale left behind.
+    static BASELINE_DPI_1024: Cell<Option<i32>> = const { Cell::new(None) };
+}
+
+/// Apply the user's chosen interface text scale, as a percentage of the
+/// system default, to the *entire* application — every label, button and
+/// menu, not just message bodies. Unlike [`apply_body_font_size`] (a CSS rule
+/// scoped to one class), this adjusts `GtkSettings:gtk-xft-dpi`, the same
+/// font-resolution knob the desktop's own "large text" accessibility setting
+/// uses, so it reaches every widget uniformly including ones in popovers and
+/// dialogs that a CSS class on the main window would not.
+pub(crate) fn apply_ui_text_scale(percent: u32) {
+    let Some(display_settings) = gtk::Settings::default() else {
+        return;
+    };
+    let baseline = BASELINE_DPI_1024.with(|cell| {
+        if let Some(dpi) = cell.get() {
+            return dpi;
+        }
+        let current = display_settings.gtk_xft_dpi();
+        let dpi = if current > 0 {
+            current
+        } else {
+            DEFAULT_DPI_1024
+        };
+        cell.set(Some(dpi));
+        dpi
+    });
+    let scaled = (baseline as i64 * percent as i64 / 100) as i32;
+    display_settings.set_gtk_xft_dpi(scaled);
+}
+
+/// Apply the user's chosen theme via libadwaita's own color-scheme manager,
+/// so it takes effect exactly like the system appearance changing under a
+/// "System" choice would - every stock Adwaita color already responds to it.
+pub(crate) fn apply_theme(theme: settings::Theme) {
+    let scheme = match theme {
+        settings::Theme::System => adw::ColorScheme::Default,
+        settings::Theme::Light => adw::ColorScheme::ForceLight,
+        settings::Theme::Dark => adw::ColorScheme::ForceDark,
+    };
+    adw::StyleManager::default().set_color_scheme(scheme);
 }
 
 // Icons bundled in the gresource (e.g. the mirrored rewrap arrow) are not in
@@ -642,6 +734,25 @@ fn build_search_entry() -> gtk::SearchEntry {
         .build()
 }
 
+/// macOS shows real native traffic-light buttons, fixed at the OS's top-left
+/// corner, whenever a `GtkWindowControls` leaves `use-native-controls` at its
+/// default - AdwHeaderBar doesn't expose that as a property of its own, so
+/// this walks down to the two it builds internally (one per side, see its
+/// `windowcontrols.start`/`windowcontrols.end` CSS nodes) and turns it off on
+/// each, falling back to GTK's own drawn close/minimize/maximize buttons, the
+/// same ones every other platform already shows.
+#[cfg(target_os = "macos")]
+fn force_gtk_drawn_window_controls(widget: &gtk::Widget) {
+    if let Some(controls) = widget.downcast_ref::<gtk::WindowControls>() {
+        controls.set_use_native_controls(false);
+    }
+    let mut child = widget.first_child();
+    while let Some(w) = child {
+        force_gtk_drawn_window_controls(&w);
+        child = w.next_sibling();
+    }
+}
+
 fn build_header_bar(
     search_entry: &gtk::SearchEntry,
     tab_view: &adw::TabView,
@@ -649,6 +760,14 @@ fn build_header_bar(
     thread_overview: &gio::SimpleAction,
 ) -> adw::HeaderBar {
     let header = adw::HeaderBar::new();
+    #[cfg(target_os = "macos")]
+    {
+        header.set_decoration_layout(Some(":minimize,maximize,close"));
+        // AdwHeaderBar builds its internal windowcontrols children lazily,
+        // not yet present right after `new()` - connecting here instead of
+        // calling immediately guarantees they exist by the time this runs.
+        header.connect_map(|header| force_gtk_drawn_window_controls(header.upcast_ref()));
+    }
 
     let back_button = gtk::Button::builder()
         .icon_name("go-previous-symbolic")
@@ -725,6 +844,26 @@ fn build_header_bar(
         }
     ));
 
+    let sent_button = gtk::Button::builder()
+        .icon_name("mail-reply-sender-symbolic")
+        .tooltip_text("Sent")
+        .build();
+    sent_button.connect_clicked(glib::clone!(
+        #[weak]
+        tab_view,
+        move |_| {
+            let Some(nav) = selected_nav(&tab_view) else {
+                return;
+            };
+            let already_there = nav
+                .visible_page()
+                .is_some_and(|page| page.widget_name() == SENT_PAGE_NAME);
+            if !already_there {
+                nav.push(&build_sent_page(&nav));
+            }
+        }
+    ));
+
     let clamp = adw::Clamp::builder()
         .maximum_size(600)
         .tightening_threshold(400)
@@ -749,6 +888,7 @@ fn build_header_bar(
     header.pack_end(&build_profile_button());
     header.pack_end(&favorites_button);
     header.pack_end(&subscriptions_button);
+    header.pack_end(&sent_button);
     header.pack_end(&overview_button);
 
     header
@@ -810,13 +950,33 @@ fn setup_actions(
 
     app.add_action_entries([preferences, shortcuts, about, quit]);
 
-    app.set_accels_for_action("win.focus-search", &["<Control>l"]);
-    app.set_accels_for_action("win.close-tab", &["<Control>w"]);
+    // <Primary> rather than <Control>: GTK is documented to resolve it to Cmd
+    // on macOS and Ctrl everywhere else, so these are meant to match each
+    // platform's own muscle memory instead of only ever responding to a
+    // literal Ctrl press. Belt-and-braces on macOS specifically: this GTK
+    // backend's <Primary>-to-Cmd resolution has been unreliable in practice,
+    // so every action also gets an explicit <Meta> (literal Cmd) binding
+    // there, at no cost to the Linux bindings above.
+    accel(app, "win.focus-search", "<Primary>l", "<Meta>l");
+    accel(app, "win.close-tab", "<Primary>w", "<Meta>w");
     app.set_accels_for_action("win.toggle-thread-overview", &["F9"]);
-    app.set_accels_for_action("win.find-in-thread", &["<Control>f"]);
-    app.set_accels_for_action("app.preferences", &["<Control>comma"]);
-    app.set_accels_for_action("app.shortcuts", &["<Control>question"]);
-    app.set_accels_for_action("app.quit", &["<Control>q"]);
+    accel(app, "win.find-in-thread", "<Primary>f", "<Meta>f");
+    accel(app, "app.preferences", "<Primary>comma", "<Meta>comma");
+    accel(app, "app.shortcuts", "<Primary>question", "<Meta>question");
+    accel(app, "app.quit", "<Primary>q", "<Meta>q");
+}
+
+/// Bind `action` to `primary` (`<Primary>...`, the portable Ctrl/Cmd
+/// modifier) everywhere, plus `meta` (the literal Cmd modifier) as an extra
+/// binding on macOS only — see the comment above this function's call sites.
+fn accel(app: &adw::Application, action: &str, primary: &str, meta: &str) {
+    #[cfg(target_os = "macos")]
+    app.set_accels_for_action(action, &[primary, meta]);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = meta;
+        app.set_accels_for_action(action, &[primary]);
+    }
 }
 
 fn show_preferences(app: &adw::Application) {
@@ -824,6 +984,7 @@ fn show_preferences(app: &adw::Application) {
         .title("General")
         .icon_name("emblem-system-symbolic")
         .build();
+    page.add(&build_appearance_group());
     page.add(&build_replies_group());
     page.add(&build_signature_group());
     page.add(&build_notifications_group());
@@ -832,7 +993,119 @@ fn show_preferences(app: &adw::Application) {
 
     let dialog = adw::PreferencesDialog::new();
     dialog.add(&page);
+    #[cfg(target_os = "macos")]
+    dialog.connect_map(|d| move_dialog_close_button_to_end(d.upcast_ref(), d.upcast_ref()));
     dialog.present(app.active_window().as_ref());
+}
+
+/// AdwDialog forces any `AdwHeaderBar` placed inside it to show only a close
+/// button (see the "Header Bar Integration" section of Adw.Dialog's docs) at
+/// its own fixed position on the start (left) side via a private internal
+/// widget, with no public property to move it - unlike the main window's
+/// title buttons, this has nothing to do with macOS's native window chrome,
+/// it is libadwaita's own cross-platform dialog convention. Disabling the
+/// built-in title buttons and packing a plain close button of our own on the
+/// end (right) side is the only way to move it, so every dialog matches the
+/// main window's buttons-on-the-right layout on macOS.
+///
+/// `dialog` and `widget` are the same object in different types (the search
+/// needs `&gtk::Widget` to walk the tree; closing needs `&adw::Dialog`) -
+/// callers that already hold an `adw::HeaderBar` they built themselves should
+/// just call the two `set_show_*_title_buttons` calls directly instead of
+/// walking down to find it.
+#[cfg(target_os = "macos")]
+fn move_dialog_close_button_to_end(widget: &gtk::Widget, dialog: &adw::Dialog) {
+    if let Some(header) = widget.downcast_ref::<adw::HeaderBar>() {
+        header.set_show_start_title_buttons(false);
+        header.set_show_end_title_buttons(false);
+        let close = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Close")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat", "circular"])
+            .build();
+        close.connect_clicked(glib::clone!(
+            #[weak]
+            dialog,
+            move |_| {
+                dialog.close();
+            }
+        ));
+        header.pack_end(&close);
+        return;
+    }
+    let mut child = widget.first_child();
+    while let Some(w) = child {
+        move_dialog_close_button_to_end(&w, dialog);
+        child = w.next_sibling();
+    }
+}
+
+/// The Preferences group for reading-pane and composer text size, in pixels.
+fn build_appearance_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Appearance").build();
+
+    let theme_row = adw::ComboRow::builder()
+        .title("Theme")
+        .model(&gtk::StringList::new(&["System", "Light", "Dark"]))
+        .selected(match settings::theme() {
+            settings::Theme::System => 0,
+            settings::Theme::Light => 1,
+            settings::Theme::Dark => 2,
+        })
+        .build();
+    theme_row.connect_selected_notify(|row| {
+        let theme = match row.selected() {
+            1 => settings::Theme::Light,
+            2 => settings::Theme::Dark,
+            _ => settings::Theme::System,
+        };
+        settings::set_theme(theme);
+        apply_theme(theme);
+    });
+    group.add(&theme_row);
+
+    let adjustment = gtk::Adjustment::new(
+        settings::body_font_size() as f64,
+        settings::MIN_BODY_FONT_SIZE as f64,
+        settings::MAX_BODY_FONT_SIZE as f64,
+        1.0,
+        2.0,
+        0.0,
+    );
+    let row = adw::SpinRow::builder()
+        .title("Message text size")
+        .subtitle("Applies to the reading pane and the reply composer.")
+        .adjustment(&adjustment)
+        .build();
+    row.connect_value_notify(|row| {
+        let px = row.value() as u32;
+        settings::set_body_font_size(px);
+        apply_body_font_size(px);
+    });
+    group.add(&row);
+
+    let ui_adjustment = gtk::Adjustment::new(
+        settings::ui_text_scale() as f64,
+        settings::MIN_UI_TEXT_SCALE as f64,
+        settings::MAX_UI_TEXT_SCALE as f64,
+        5.0,
+        10.0,
+        0.0,
+    );
+    let ui_row = adw::SpinRow::builder()
+        .title("Interface text size")
+        .subtitle("Scales every label, button and menu in Koshi, as a percentage.")
+        .adjustment(&ui_adjustment)
+        .build();
+    ui_row.connect_value_notify(|row| {
+        let percent = row.value() as u32;
+        settings::set_ui_text_scale(percent);
+        apply_ui_text_scale(percent);
+    });
+    group.add(&ui_row);
+
+    group
 }
 
 fn build_replies_group() -> adw::PreferencesGroup {
@@ -924,6 +1197,32 @@ fn build_notifications_group() -> adw::PreferencesGroup {
         .title("Notifications")
         .description("Koshi notifies you of new replies on threads you subscribe to.")
         .build();
+
+    // macOS notifications need the user to grant permission at a one-time
+    // system prompt, easy to dismiss without noticing (and the whole point
+    // of a background poll is that Koshi isn't necessarily in front when it
+    // fires) - denial is otherwise silent, so surface it here whenever it is
+    // actually known to have happened. See watcher::notifications_denied.
+    #[cfg(target_os = "macos")]
+    if watcher::notifications_denied() {
+        let warning = adw::ActionRow::builder()
+            .title("Notifications are turned off for Koshi")
+            .subtitle("New-reply alerts won't show until you allow them in System Settings.")
+            .build();
+        warning.add_prefix(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
+        let open_settings = gtk::Button::builder()
+            .label("Open Settings")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        open_settings.connect_clicked(|_| {
+            let _ = std::process::Command::new("open")
+                .arg("x-apple.systempreferences:com.apple.preference.notifications")
+                .spawn();
+        });
+        warning.add_suffix(&open_settings);
+        group.add(&warning);
+    }
 
     let adjustment = gtk::Adjustment::new(
         settings::poll_interval_minutes() as f64,
